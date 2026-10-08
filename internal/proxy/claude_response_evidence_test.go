@@ -189,3 +189,23 @@ func TestRealClaudeProxyResponseSeedsLaterModelQuotaCache(t *testing.T) {
 		t.Fatalf("real response did not prevent model quota probe: windows=%+v calls=%d err=%v", windows, transport.calls, err)
 	}
 }
+
+func TestPassiveClaudeRepairedGrantWithSameAccessTokenGetsFreshEvidence(t *testing.T) {
+	old := passiveClaudeAccount("shared-access", "grant-v1")
+	ref := &AccountRef{accounts: []accounts.Account{old}}
+	ref.observeClaudeQuotaHeaders(old, passiveClaudeHeader("7d_oi", "0.9"), time.Now().Add(-time.Second))
+	repaired := passiveClaudeAccount("shared-access", "grant-v2")
+	ref.replace(repaired)
+	if _, ok := ref.cachedClaudeSupplemental(repaired, time.Now()); ok {
+		t.Fatal("new refresh grant inherited old model quota because access token matched")
+	}
+	ref.observeClaudeQuotaHeaders(repaired, passiveClaudeHeader("7d_oi", "0.3"), time.Now())
+	windows, ok := ref.cachedClaudeSupplemental(repaired, time.Now())
+	if !ok {
+		t.Fatal("repaired OAuth grant did not acquire fresh model quota")
+	}
+	observed, found := findFeatureWindow(windows, agentclaude.FableFeature)
+	if !found || observed.UsedPercent != 30 {
+		t.Fatalf("repaired grant quota=%+v; want 30%% Fable utilization", windows)
+	}
+}
