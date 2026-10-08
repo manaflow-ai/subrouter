@@ -146,6 +146,38 @@ func TestUsageStatusRefreshQueryKeepsAccountWindowCache(t *testing.T) {
 	}
 }
 
+func TestUsageStatusSnapshotQueryReusesLastSweep(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse(), usageOKResponse()}}
+	ref := cacheTestAccountRef(t, transport)
+	handler := Server{AccountRef: ref}.Handler()
+
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status?snapshot=1", nil))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first snapshot = %d: %s", first.Code, first.Body.String())
+	}
+	callsAfterFirst := transport.calls
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status?snapshot=1", nil))
+	if second.Code != http.StatusOK {
+		t.Fatalf("second snapshot = %d: %s", second.Code, second.Body.String())
+	}
+	if transport.calls != callsAfterFirst {
+		t.Fatalf("snapshot read started another upstream sweep (%d -> %d calls)", callsAfterFirst, transport.calls)
+	}
+	ref.usageStatusMu.Lock()
+	ref.usageStatusAt = time.Now().Add(-time.Hour)
+	ref.usageStatusMu.Unlock()
+	third := httptest.NewRecorder()
+	handler.ServeHTTP(third, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status?snapshot=1", nil))
+	if third.Code != http.StatusOK {
+		t.Fatalf("aged snapshot = %d: %s", third.Code, third.Body.String())
+	}
+	if transport.calls != callsAfterFirst {
+		t.Fatalf("aged snapshot read started another upstream sweep (%d -> %d calls)", callsAfterFirst, transport.calls)
+	}
+}
+
 func TestUsageStatusesRestoresLastGoodOnTransientFailure(t *testing.T) {
 	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse(), usage429Response()}}
 	ref := cacheTestAccountRef(t, transport)

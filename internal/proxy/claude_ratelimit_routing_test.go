@@ -903,6 +903,11 @@ func TestClaudeAccountExhaustedByResponse(t *testing.T) {
 		{"429 allowed_warning", http.StatusTooManyRequests, withStatus("allowed_warning"), false},
 		{"429 allowed", http.StatusTooManyRequests, withStatus("allowed"), false},
 		{"429 no header (transient burst, not quota)", http.StatusTooManyRequests, http.Header{}, false},
+		{"429 explicit weekly window", http.StatusTooManyRequests, func() http.Header {
+			h := http.Header{}
+			h.Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
+			return h
+		}(), true},
 		{"200 healthy", http.StatusOK, withStatus("allowed"), false},
 	}
 	for _, tc := range cases {
@@ -950,6 +955,78 @@ func TestClaudeTransient429FailsOverWithoutPoisoningScore(t *testing.T) {
 	}
 	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("a transient allowed_warning 429 must NOT mark the account exhausted")
+	}
+}
+
+func TestClaudeHeaderless429FailsOverWithoutPoisoningScore(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-plain-429", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(realisticAnthropic429Body))}
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_ok"}`))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-plain-429", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after transient failover", response.StatusCode)
+	}
+	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("a headerless 429 must not mark the account exhausted")
+	}
+}
+
+func TestClaudeRetrySkipsControllerCooldown(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	server.SchedulerRef.MarkWeeklyExhaustedUntil(accounts.ProviderClaude, "fresh@example.com", "", time.Now().Add(time.Hour))
+	_, err := server.oauthRetryCandidate(context.Background(), accounts.ProviderClaude, "claude", "session-cooldown", "", agentclaude.OpusFeature, map[string]struct{}{"cooked@example.com": {}}, false, false)
+	if err == nil || !strings.Contains(err.Error(), "controller cooldown") {
+		t.Fatalf("oauthRetryCandidate error = %v, want controller cooldown", err)
+	}
+}
+
+func TestClaudeExplicitWindow429StopsAtControllerCooldown(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	server.SchedulerRef.MarkWeeklyExhaustedUntil(accounts.ProviderClaude, "fresh@example.com", "", time.Now().Add(time.Hour))
+	stub := &stubRoundTripper{responses: func(*http.Request) *http.Response {
+		header := http.Header{}
+		header.Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
+		header.Set("Anthropic-Ratelimit-Unified-7d-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: header, Body: io.NopCloser(strings.NewReader(realisticAnthropic429Body))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-explicit-429", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests || stub.calls != 1 {
+		t.Fatalf("status=%d upstream_calls=%d, want one bounded attempt", response.StatusCode, stub.calls)
 	}
 }
 
@@ -1081,7 +1158,7 @@ func TestClaudeFailoverExhaustionIsLogged(t *testing.T) {
 	}
 }
 
-func TestClaudeFailoverTriesMarkedExhaustedAlternateWhenScoreMayBeStale(t *testing.T) {
+func TestClaudeFailoverSkipsControllerCooldownAlternate(t *testing.T) {
 	server, store := claudeFailoverServer(t)
 	if _, err := store.Put("claude", "session-exhausted-alt", "cooked@example.com", ""); err != nil {
 		t.Fatal(err)
@@ -1114,8 +1191,8 @@ func TestClaudeFailoverTriesMarkedExhaustedAlternateWhenScoreMayBeStale(t *testi
 	if response.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status=%d, want original 429", response.StatusCode)
 	}
-	if calls != 2 {
-		t.Fatalf("upstream calls=%d, want the stale-scored alternate tried once", calls)
+	if calls != 1 {
+		t.Fatalf("upstream calls=%d, want the controller-held alternate skipped", calls)
 	}
 }
 

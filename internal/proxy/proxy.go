@@ -1483,6 +1483,22 @@ func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
 	}
 }
 
+// UsageStatusSnapshot returns the most recent usage sweep without starting a
+// provider request. Status is an observation of the controller's last known
+// state, while routing refreshes remain responsible for deciding when to fetch
+// live quota. The bool is false until the controller has completed a sweep.
+func (r *AccountRef) UsageStatusSnapshot() ([]AccountUsageStatus, bool) {
+	if r == nil {
+		return nil, false
+	}
+	r.usageStatusMu.Lock()
+	defer r.usageStatusMu.Unlock()
+	if r.usageStatusCache == nil {
+		return nil, false
+	}
+	return append([]AccountUsageStatus(nil), r.usageStatusCache...), true
+}
+
 // usageStatusSweep is one live status sweep shared by concurrent callers.
 type usageStatusSweep struct {
 	done   chan struct{}
@@ -1579,6 +1595,7 @@ func (r *AccountRef) InvalidateUsageStatusCache() {
 	r.usageStatusMu.Lock()
 	defer r.usageStatusMu.Unlock()
 	r.usageStatusAt = time.Time{}
+	r.usageStatusCache = nil
 	r.usageStatusEpoch++
 	r.usageStatusSweep = nil
 }
@@ -2783,25 +2800,37 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.AccountRef != nil {
+		snapshotOnly := parseBoolParam(r, "snapshot")
 		// Interactive status commands opt into a live sweep. Background clients
 		// keep the short shared cache so a dashboard cannot stampede providers.
-		if r.URL.Query().Get("refresh") == "1" {
+		if r.URL.Query().Get("refresh") == "1" && !snapshotOnly {
 			s.AccountRef.InvalidateUsageStatusCache()
 			// Keep the per-account window cache and its credential-scoped
 			// throttle deadlines. A manual status refresh should reassemble the
 			// rows, but must not turn every `sr status` into another burst of
 			// provider quota requests after a 401/429.
 		}
-		scoreRevision := uint64(0)
-		if s.SchedulerRef != nil {
-			scoreRevision = s.SchedulerRef.ScoreRevision()
+		var statuses []AccountUsageStatus
+		if snapshotOnly {
+			var cached bool
+			statuses, cached = s.AccountRef.UsageStatusSnapshot()
+			if !cached {
+				// Seed the controller once when no snapshot exists. Once seeded,
+				// status reads remain read-only and use the last-known state.
+				statuses = s.AccountRef.UsageStatuses(r.Context())
+			}
+		} else {
+			scoreRevision := uint64(0)
+			if s.SchedulerRef != nil {
+				scoreRevision = s.SchedulerRef.ScoreRevision()
+			}
+			statuses = s.AccountRef.UsageStatuses(r.Context())
+			if s.SchedulerRef != nil {
+				loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
+				s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, SchedulerAccounts(loaded))
+			}
+			s.updateSchedulerFromUsageStatusesAtScoreRevision(r.Context(), statuses, scoreRevision)
 		}
-		statuses := s.AccountRef.UsageStatuses(r.Context())
-		if s.SchedulerRef != nil {
-			loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
-			s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, SchedulerAccounts(loaded))
-		}
-		s.updateSchedulerFromUsageStatusesAtScoreRevision(r.Context(), statuses, scoreRevision)
 		writeJSON(w, s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses))))))
 		return
 	}
@@ -9583,7 +9612,7 @@ func claudeAccountExhaustedByResponse(status int, header http.Header) bool {
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		return true
 	}
-	if claudeUnifiedStatus(header) != "rejected" {
+	if !claudeResponseRejected(header) {
 		return false
 	}
 	// A rejection caused solely by a model-scoped window (e.g. the Fable
@@ -9655,7 +9684,18 @@ func claudeUnifiedStatus(header http.Header) string {
 // claudeResponseRejected reports whether Anthropic flagged the account as out of
 // quota for this response, even if it answered 200 via overage.
 func claudeResponseRejected(header http.Header) bool {
-	return claudeUnifiedStatus(header) == "rejected"
+	if claudeUnifiedStatus(header) == "rejected" {
+		return true
+	}
+	// Anthropic sometimes omits the aggregate status on a 429 while still
+	// reporting an authoritative rejected account window. Treat those headers
+	// as quota evidence too, so the controller can stop retrying a cooked pool.
+	for _, prefix := range []string{"5h", "7d", "7d_oi"} {
+		if strings.EqualFold(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-"+prefix+"-status")), "rejected") {
+			return true
+		}
+	}
+	return false
 }
 
 func claudeHeaderGet(header http.Header, key string) string {
@@ -10760,6 +10800,26 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 			}
 		}
 		if account.ID == "" {
+			// A live controller cooldown is stronger evidence than a stale score,
+			// but a stale score alone must remain probeable. Do not spend replay
+			// attempts on accounts the controller has explicitly held out after an
+			// authoritative 429/401; keep an unmarked account available for the
+			// bounded optimistic failover path.
+			if provider == accounts.ProviderClaude && s.SchedulerRef != nil {
+				now := time.Now()
+				eligible := candidates[:0]
+				for _, candidate := range candidates {
+					candidateProvider := schedulerAccountProvider(candidate.Provider)
+					if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(candidateProvider, candidate.ID, poolModel, now); blocked {
+						continue
+					}
+					eligible = append(eligible, candidate)
+				}
+				if len(eligible) == 0 && len(candidates) > 0 {
+					return accounts.Account{}, fmt.Errorf("all %s retry candidates are in controller cooldown", provider)
+				}
+				candidates = eligible
+			}
 			if len(candidates) == 0 {
 				if lastErr != nil {
 					return accounts.Account{}, lastErr
