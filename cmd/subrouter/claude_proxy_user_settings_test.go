@@ -206,6 +206,10 @@ func TestWithClaudeUserSettingsAllowsSharedProjectMemory(t *testing.T) {
 	if err := os.MkdirAll(projects, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	projects, err := filepath.EvalSymlinks(projects)
+	if err != nil {
+		t.Fatal(err)
+	}
 	settings := filepath.Join(root, "settings.json")
 	if err := os.WriteFile(settings, []byte(`{"permissions":{"additionalDirectories":["/tmp/other"]}}`), 0o600); err != nil {
 		t.Fatal(err)
