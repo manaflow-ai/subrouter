@@ -25,7 +25,7 @@ type claudeSupplementalUsage struct {
 
 func claudeSupplementalCacheKey(account accounts.Account) string {
 	// A re-login or access-token rotation bypasses the prior probe result.
-	digest := sha256.Sum256([]byte(account.Token))
+	digest := sha256.Sum256([]byte(account.CredentialIdentity()))
 	return string(account.Provider) + "\x00" + account.ID + "\x00" + hex.EncodeToString(digest[:])
 }
 
