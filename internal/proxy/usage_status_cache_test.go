@@ -15,6 +15,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 type usageRoundTripper struct {
@@ -143,6 +144,80 @@ func TestUsageStatusRefreshQueryKeepsAccountWindowCache(t *testing.T) {
 	}
 	if transport.calls != callsAfterInitial {
 		t.Fatalf("repeated refresh queries made %d upstream calls after initial sweep", transport.calls-callsAfterInitial)
+	}
+}
+
+func TestUsageStatusSnapshotQueryReusesLastSweep(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse(), usageOKResponse()}}
+	ref := cacheTestAccountRef(t, transport)
+	handler := Server{AccountRef: ref}.Handler()
+
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status?snapshot=1", nil))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first snapshot = %d: %s", first.Code, first.Body.String())
+	}
+	callsAfterFirst := transport.calls
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status?snapshot=1", nil))
+	if second.Code != http.StatusOK {
+		t.Fatalf("second snapshot = %d: %s", second.Code, second.Body.String())
+	}
+	if transport.calls != callsAfterFirst {
+		t.Fatalf("snapshot read started another upstream sweep (%d -> %d calls)", callsAfterFirst, transport.calls)
+	}
+	ref.usageStatusMu.Lock()
+	ref.usageStatusAt = time.Now().Add(-time.Hour)
+	ref.usageStatusMu.Unlock()
+	third := httptest.NewRecorder()
+	handler.ServeHTTP(third, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status?snapshot=1", nil))
+	if third.Code != http.StatusOK {
+		t.Fatalf("aged snapshot = %d: %s", third.Code, third.Body.String())
+	}
+	if transport.calls != callsAfterFirst {
+		t.Fatalf("aged snapshot read started another upstream sweep (%d -> %d calls)", callsAfterFirst, transport.calls)
+	}
+}
+
+func TestRefreshUsageStatusSnapshotFromWindowsPublishesResetWindows(t *testing.T) {
+	ref := cacheTestAccountRef(t, &usageRoundTripper{})
+	ref.accounts = []accounts.Account{{
+		ID: "claude@example.com", Provider: accounts.ProviderClaude,
+		AuthMode: accounts.AuthModeOAuth, Email: "claude@example.com",
+	}}
+	observedAt := time.Now().Add(-time.Minute).UTC()
+	ref.usageWindows = map[string]usageWindowsEntry{
+		"claude@example.com\x00claude": {
+			windows: []accounts.UsageWindow{{
+				Name: "7d", UsedPercent: 100, LimitWindowSeconds: 604800,
+				ResetAfterSeconds: 3600,
+			}},
+			at: observedAt,
+		},
+	}
+	ref.RefreshUsageStatusSnapshotFromWindows(selectacct.Score{
+		AccountID: "claude@example.com", Provider: accounts.ProviderClaude, Fresh: true,
+	})
+	statuses, ok := ref.UsageStatusSnapshot()
+	if !ok || len(statuses) != 1 {
+		t.Fatalf("snapshot = (%+v, %v), want one published status", statuses, ok)
+	}
+	if len(statuses[0].Windows) != 1 || statuses[0].Windows[0].Name != "7d" {
+		t.Fatalf("snapshot windows = %+v, want cached weekly window", statuses[0].Windows)
+	}
+	if !statuses[0].UsageFresh || !statuses[0].UsageFetchedAt.Equal(observedAt) {
+		t.Fatalf("snapshot freshness = %v at %s, want fresh at %s", statuses[0].UsageFresh, statuses[0].UsageFetchedAt, observedAt)
+	}
+	ref.usageWindows["claude@example.com\x00claude"] = usageWindowsEntry{
+		windows: []accounts.UsageWindow{{Name: "7d", UsedPercent: 50}},
+		at:      observedAt.Add(-time.Minute),
+	}
+	ref.RefreshUsageStatusSnapshotFromWindows(selectacct.Score{
+		AccountID: "claude@example.com", Provider: accounts.ProviderClaude, Fresh: true,
+	})
+	statuses, _ = ref.UsageStatusSnapshot()
+	if !statuses[0].UsageFetchedAt.Equal(observedAt) || statuses[0].Windows[0].UsedPercent != 100 {
+		t.Fatalf("older score refresh regressed snapshot: %+v", statuses[0])
 	}
 }
 

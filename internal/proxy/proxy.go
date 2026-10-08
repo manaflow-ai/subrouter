@@ -1483,6 +1483,112 @@ func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
 	}
 }
 
+// UsageStatusSnapshot returns the most recent usage sweep without starting a
+// provider request. Status is an observation of the controller's last known
+// state, while routing refreshes remain responsible for deciding when to fetch
+// live quota. The bool is false until the controller has completed a sweep.
+func (r *AccountRef) UsageStatusSnapshot() ([]AccountUsageStatus, bool) {
+	if r == nil {
+		return nil, false
+	}
+	r.usageStatusMu.Lock()
+	defer r.usageStatusMu.Unlock()
+	if r.usageStatusCache == nil {
+		return nil, false
+	}
+	return append([]AccountUsageStatus(nil), r.usageStatusCache...), true
+}
+
+// RefreshUsageStatusSnapshotFromWindows republishes the last usage snapshot
+// from the per-account window cache. Score refreshes already populate that
+// cache, so this keeps status current without starting a second provider sweep.
+func (r *AccountRef) RefreshUsageStatusSnapshotFromWindows(scores ...selectacct.Score) {
+	if r == nil {
+		return
+	}
+	r.usageStatusMu.Lock()
+	publishEpoch := r.usageStatusEpoch
+	r.usageStatusMu.Unlock()
+	accountsSnapshot, _ := r.Snapshot()
+	r.usageWindowsMu.Lock()
+	windows := make(map[string]usageWindowsEntry, len(r.usageWindows))
+	for key, entry := range r.usageWindows {
+		entry.windows = append([]accounts.UsageWindow(nil), entry.windows...)
+		windows[key] = entry
+	}
+	r.usageWindowsMu.Unlock()
+	if len(windows) == 0 {
+		return
+	}
+	freshByKey := make(map[string]struct{}, len(scores))
+	for _, score := range scores {
+		if score.Fresh {
+			freshByKey[selectacct.ScoreKey(score.Provider, score.AccountID)] = struct{}{}
+		}
+	}
+	filterFresh := len(scores) > 0
+
+	r.usageStatusMu.Lock()
+	defer r.usageStatusMu.Unlock()
+	if publishEpoch != r.usageStatusEpoch {
+		return
+	}
+	rows := append([]AccountUsageStatus(nil), r.usageStatusCache...)
+	rowByKey := make(map[string]int, len(rows))
+	for i, row := range rows {
+		rowByKey[row.ID+"\x00"+string(accountProviderFor(row.Provider))] = i
+	}
+	for _, account := range accountsSnapshot {
+		provider := accountProviderFor(accountProviderOrCodex(account))
+		key := account.ID + "\x00" + string(accountProviderOrCodex(account))
+		entry, ok := windows[key]
+		if !ok && provider != accountProviderOrCodex(account) {
+			key = account.ID + "\x00" + string(provider)
+			entry, ok = windows[key]
+		}
+		if !ok {
+			continue
+		}
+		if filterFresh {
+			if _, fresh := freshByKey[selectacct.ScoreKey(provider, account.ID)]; !fresh {
+				continue
+			}
+		}
+		statusKey := account.ID + "\x00" + string(provider)
+		idx, exists := rowByKey[statusKey]
+		if !exists {
+			idx = len(rows)
+			rowByKey[statusKey] = idx
+			rows = append(rows, AccountUsageStatus{AccountStatus: AccountStatus{
+				ID:          account.ID,
+				Provider:    provider,
+				AuthMode:    account.AuthMode,
+				Label:       account.Label,
+				Email:       account.Email,
+				Source:      account.Source,
+				AuthChecked: true,
+				AuthValid:   true,
+			}})
+		}
+		row := rows[idx]
+		if !row.UsageFetchedAt.IsZero() && !entry.at.After(row.UsageFetchedAt) {
+			continue
+		}
+		row.Provider = provider
+		row.Windows = append([]accounts.UsageWindow(nil), entry.windows...)
+		row.UsageFresh = true
+		row.UsageFetchedAt = entry.at
+		row.QuotaUsageKnown = len(entry.windows) > 0
+		row.ExtraUsage = extraUsageFromWindows(entry.windows)
+		row.Error = ""
+		rows[idx] = row
+	}
+	if len(rows) > 0 {
+		r.usageStatusCache = rows
+		r.usageStatusAt = time.Now()
+	}
+}
+
 // usageStatusSweep is one live status sweep shared by concurrent callers.
 type usageStatusSweep struct {
 	done   chan struct{}
@@ -1579,6 +1685,7 @@ func (r *AccountRef) InvalidateUsageStatusCache() {
 	r.usageStatusMu.Lock()
 	defer r.usageStatusMu.Unlock()
 	r.usageStatusAt = time.Time{}
+	r.usageStatusCache = nil
 	r.usageStatusEpoch++
 	r.usageStatusSweep = nil
 }
@@ -2783,25 +2890,37 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.AccountRef != nil {
+		snapshotOnly := parseBoolParam(r, "snapshot")
 		// Interactive status commands opt into a live sweep. Background clients
 		// keep the short shared cache so a dashboard cannot stampede providers.
-		if r.URL.Query().Get("refresh") == "1" {
+		if r.URL.Query().Get("refresh") == "1" && !snapshotOnly {
 			s.AccountRef.InvalidateUsageStatusCache()
 			// Keep the per-account window cache and its credential-scoped
 			// throttle deadlines. A manual status refresh should reassemble the
 			// rows, but must not turn every `sr status` into another burst of
 			// provider quota requests after a 401/429.
 		}
-		scoreRevision := uint64(0)
-		if s.SchedulerRef != nil {
-			scoreRevision = s.SchedulerRef.ScoreRevision()
+		var statuses []AccountUsageStatus
+		if snapshotOnly {
+			var cached bool
+			statuses, cached = s.AccountRef.UsageStatusSnapshot()
+			if !cached {
+				// Seed the controller once when no snapshot exists. Once seeded,
+				// status reads remain read-only and use the last-known state.
+				statuses = s.AccountRef.UsageStatuses(r.Context())
+			}
+		} else {
+			scoreRevision := uint64(0)
+			if s.SchedulerRef != nil {
+				scoreRevision = s.SchedulerRef.ScoreRevision()
+			}
+			statuses = s.AccountRef.UsageStatuses(r.Context())
+			if s.SchedulerRef != nil {
+				loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
+				s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, SchedulerAccounts(loaded))
+			}
+			s.updateSchedulerFromUsageStatusesAtScoreRevision(r.Context(), statuses, scoreRevision)
 		}
-		statuses := s.AccountRef.UsageStatuses(r.Context())
-		if s.SchedulerRef != nil {
-			loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
-			s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, SchedulerAccounts(loaded))
-		}
-		s.updateSchedulerFromUsageStatusesAtScoreRevision(r.Context(), statuses, scoreRevision)
 		writeJSON(w, s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses))))))
 		return
 	}
@@ -7999,7 +8118,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 				return account, sessionID, userEmail, nil
 			}
 			if candidate.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(candidate.Provider), candidate.ID) {
-				if fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts); ok {
+				if fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, availableAccounts, poolModel); ok {
 					candidate = fallback
 				} else {
 					// The whole pool is exhausted: Pick ranks exhausted accounts
@@ -8052,7 +8171,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		}
 	}
 	if account.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
-		fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts)
+		fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, availableAccounts, poolModel)
 		if !ok {
 			return accounts.Account{}, sessionID, userEmail, s.poolExhaustedError(provider, availableAccounts, poolModel)
 		}
@@ -8134,6 +8253,30 @@ func pickClaudeExtraUsageFallback(scheduler selectacct.Scheduler, candidates []a
 		}
 	}
 	return best, seenSubscription && bestRemaining > 0
+}
+
+// pickClaudeExtraUsageFallbackForRequest applies request-time controller
+// exclusions before considering Claude extra usage. A weekly-cooked account
+// can have an extra-usage balance while still being held out by a live
+// upstream rejection; selecting it would bypass the controller's cooldown.
+func (s Server) pickClaudeExtraUsageFallbackForRequest(
+	scheduler selectacct.Scheduler,
+	candidates []accounts.Account,
+	poolModel string,
+) (accounts.Account, bool) {
+	if s.SchedulerRef == nil {
+		return pickClaudeExtraUsageFallback(scheduler, candidates)
+	}
+	now := time.Now()
+	eligible := make([]accounts.Account, 0, len(candidates))
+	for _, candidate := range candidates {
+		provider := schedulerAccountProvider(candidate.Provider)
+		if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(provider, candidate.ID, poolModel, now); blocked {
+			continue
+		}
+		eligible = append(eligible, candidate)
+	}
+	return pickClaudeExtraUsageFallback(scheduler, eligible)
 }
 
 // claudeExtraUsageResponseAllowed is the request-time guard. The current
@@ -8545,6 +8688,12 @@ func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []a
 			s.Logger.Debug("usage score refresh discarded after account reload")
 		}
 		return
+	}
+	if s.AccountRef != nil {
+		// The score sweep already fetched these windows. Publish the same
+		// observations to the controller snapshot so `sr status` can render
+		// reset countdowns without another provider poll.
+		s.AccountRef.RefreshUsageStatusSnapshotFromWindows(scores...)
 	}
 	if s.Logger != nil {
 		s.Logger.Debug("usage scores refreshed", "accounts", len(availableAccounts), "scored", scored)
@@ -9583,7 +9732,7 @@ func claudeAccountExhaustedByResponse(status int, header http.Header) bool {
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		return true
 	}
-	if claudeUnifiedStatus(header) != "rejected" {
+	if !claudeResponseRejected(header) {
 		return false
 	}
 	// A rejection caused solely by a model-scoped window (e.g. the Fable
@@ -9655,7 +9804,18 @@ func claudeUnifiedStatus(header http.Header) string {
 // claudeResponseRejected reports whether Anthropic flagged the account as out of
 // quota for this response, even if it answered 200 via overage.
 func claudeResponseRejected(header http.Header) bool {
-	return claudeUnifiedStatus(header) == "rejected"
+	if claudeUnifiedStatus(header) == "rejected" {
+		return true
+	}
+	// Anthropic sometimes omits the aggregate status on a 429 while still
+	// reporting an authoritative rejected account window. Treat those headers
+	// as quota evidence too, so the controller can stop retrying a cooked pool.
+	for _, prefix := range []string{"5h", "7d", "7d_oi"} {
+		if strings.EqualFold(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-"+prefix+"-status")), "rejected") {
+			return true
+		}
+	}
+	return false
 }
 
 func claudeHeaderGet(header http.Header, key string) string {
@@ -10746,7 +10906,7 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 		}
 		var account accounts.Account
 		if provider == accounts.ProviderClaude {
-			if fallback, ok := pickClaudeExtraUsageFallback(scheduler, allCandidates); ok {
+			if fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, allCandidates, poolModel); ok {
 				_, alreadyTried := tried[fallback.ID]
 				if !alreadyTried || allowTriedClaudeExtraUsage {
 					account = fallback
@@ -10760,6 +10920,26 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 			}
 		}
 		if account.ID == "" {
+			// A live controller cooldown is stronger evidence than a stale score,
+			// but a stale score alone must remain probeable. Do not spend replay
+			// attempts on accounts the controller has explicitly held out after an
+			// authoritative 429/401; keep an unmarked account available for the
+			// bounded optimistic failover path.
+			if provider == accounts.ProviderClaude && s.SchedulerRef != nil {
+				now := time.Now()
+				eligible := candidates[:0]
+				for _, candidate := range candidates {
+					candidateProvider := schedulerAccountProvider(candidate.Provider)
+					if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(candidateProvider, candidate.ID, poolModel, now); blocked {
+						continue
+					}
+					eligible = append(eligible, candidate)
+				}
+				if len(eligible) == 0 && len(candidates) > 0 {
+					return accounts.Account{}, fmt.Errorf("all %s retry candidates are in controller cooldown", provider)
+				}
+				candidates = eligible
+			}
 			if len(candidates) == 0 {
 				if lastErr != nil {
 					return accounts.Account{}, lastErr
