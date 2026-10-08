@@ -398,3 +398,29 @@ func TestMergeUsageStatusesClassifiesPlain429AsTransientThrottle(t *testing.T) {
 		t.Fatalf("401 classification = %+v, want authentication error", authRows[0])
 	}
 }
+
+func TestInvalidatedUsageSweepCannotReviveLastGoodQuota(t *testing.T) {
+	ref := &AccountRef{}
+	oldEpoch := ref.usageStatusEpoch
+	old := AccountUsageStatus{
+		AccountStatus:  AccountStatus{ID: "same-account", Provider: accounts.ProviderClaude},
+		UsageFresh:     true,
+		UsageFetchedAt: time.Now(),
+		Windows: []accounts.UsageWindow{{
+			Name: "7d", UsedPercent: 20,
+		}},
+	}
+	// A newer refresh invalidates an in-flight sweep before it completes.
+	ref.InvalidateUsageStatusCache()
+	_ = ref.mergeUsageStatusesLocked([]AccountUsageStatus{old}, oldEpoch)
+	if len(ref.lastGoodUsage) != 0 || len(ref.usageStatusCache) != 0 {
+		t.Fatal("invalidated sweep published outdated quota history")
+	}
+	failed := old
+	failed.Windows = nil
+	failed.UsageFresh = false
+	got := ref.mergeUsageStatusesLocked([]AccountUsageStatus{failed}, ref.usageStatusEpoch)
+	if len(got) != 1 || len(got[0].Windows) != 0 {
+		t.Fatalf("new sweep inherited superseded credential's quota: %+v", got)
+	}
+}

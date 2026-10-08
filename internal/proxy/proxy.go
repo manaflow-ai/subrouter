@@ -1703,6 +1703,11 @@ func (r *AccountRef) runUsageStatusSweep(ctx context.Context, sweep *usageStatus
 // snapshots and caches the sweep unless the cache was invalidated while it
 // ran. Callers hold usageStatusMu.
 func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch uint64) []AccountUsageStatus {
+	// A superseded sweep may finish after a newer refresh. Let its callers
+	// receive their results without publishing old quota history.
+	if epoch != r.usageStatusEpoch {
+		return out
+	}
 	now := time.Now()
 	if r.lastGoodUsage == nil {
 		r.lastGoodUsage = map[string]usageStatusSnapshot{}
