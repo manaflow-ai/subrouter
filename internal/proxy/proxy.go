@@ -1499,6 +1499,96 @@ func (r *AccountRef) UsageStatusSnapshot() ([]AccountUsageStatus, bool) {
 	return append([]AccountUsageStatus(nil), r.usageStatusCache...), true
 }
 
+// RefreshUsageStatusSnapshotFromWindows republishes the last usage snapshot
+// from the per-account window cache. Score refreshes already populate that
+// cache, so this keeps status current without starting a second provider sweep.
+func (r *AccountRef) RefreshUsageStatusSnapshotFromWindows(scores ...selectacct.Score) {
+	if r == nil {
+		return
+	}
+	r.usageStatusMu.Lock()
+	publishEpoch := r.usageStatusEpoch
+	r.usageStatusMu.Unlock()
+	accountsSnapshot, _ := r.Snapshot()
+	r.usageWindowsMu.Lock()
+	windows := make(map[string]usageWindowsEntry, len(r.usageWindows))
+	for key, entry := range r.usageWindows {
+		entry.windows = append([]accounts.UsageWindow(nil), entry.windows...)
+		windows[key] = entry
+	}
+	r.usageWindowsMu.Unlock()
+	if len(windows) == 0 {
+		return
+	}
+	freshByKey := make(map[string]struct{}, len(scores))
+	for _, score := range scores {
+		if score.Fresh {
+			freshByKey[selectacct.ScoreKey(score.Provider, score.AccountID)] = struct{}{}
+		}
+	}
+	filterFresh := len(scores) > 0
+
+	r.usageStatusMu.Lock()
+	defer r.usageStatusMu.Unlock()
+	if publishEpoch != r.usageStatusEpoch {
+		return
+	}
+	rows := append([]AccountUsageStatus(nil), r.usageStatusCache...)
+	rowByKey := make(map[string]int, len(rows))
+	for i, row := range rows {
+		rowByKey[row.ID+"\x00"+string(accountProviderFor(row.Provider))] = i
+	}
+	for _, account := range accountsSnapshot {
+		provider := accountProviderFor(accountProviderOrCodex(account))
+		key := account.ID + "\x00" + string(accountProviderOrCodex(account))
+		entry, ok := windows[key]
+		if !ok && provider != accountProviderOrCodex(account) {
+			key = account.ID + "\x00" + string(provider)
+			entry, ok = windows[key]
+		}
+		if !ok {
+			continue
+		}
+		if filterFresh {
+			if _, fresh := freshByKey[selectacct.ScoreKey(provider, account.ID)]; !fresh {
+				continue
+			}
+		}
+		statusKey := account.ID + "\x00" + string(provider)
+		idx, exists := rowByKey[statusKey]
+		if !exists {
+			idx = len(rows)
+			rowByKey[statusKey] = idx
+			rows = append(rows, AccountUsageStatus{AccountStatus: AccountStatus{
+				ID:          account.ID,
+				Provider:    provider,
+				AuthMode:    account.AuthMode,
+				Label:       account.Label,
+				Email:       account.Email,
+				Source:      account.Source,
+				AuthChecked: true,
+				AuthValid:   true,
+			}})
+		}
+		row := rows[idx]
+		if !row.UsageFetchedAt.IsZero() && !entry.at.After(row.UsageFetchedAt) {
+			continue
+		}
+		row.Provider = provider
+		row.Windows = append([]accounts.UsageWindow(nil), entry.windows...)
+		row.UsageFresh = true
+		row.UsageFetchedAt = entry.at
+		row.QuotaUsageKnown = len(entry.windows) > 0
+		row.ExtraUsage = extraUsageFromWindows(entry.windows)
+		row.Error = ""
+		rows[idx] = row
+	}
+	if len(rows) > 0 {
+		r.usageStatusCache = rows
+		r.usageStatusAt = time.Now()
+	}
+}
+
 // usageStatusSweep is one live status sweep shared by concurrent callers.
 type usageStatusSweep struct {
 	done   chan struct{}
@@ -8028,7 +8118,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 				return account, sessionID, userEmail, nil
 			}
 			if candidate.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(candidate.Provider), candidate.ID) {
-				if fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts); ok {
+				if fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, availableAccounts, poolModel); ok {
 					candidate = fallback
 				} else {
 					// The whole pool is exhausted: Pick ranks exhausted accounts
@@ -8081,7 +8171,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		}
 	}
 	if account.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
-		fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts)
+		fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, availableAccounts, poolModel)
 		if !ok {
 			return accounts.Account{}, sessionID, userEmail, s.poolExhaustedError(provider, availableAccounts, poolModel)
 		}
@@ -8163,6 +8253,30 @@ func pickClaudeExtraUsageFallback(scheduler selectacct.Scheduler, candidates []a
 		}
 	}
 	return best, seenSubscription && bestRemaining > 0
+}
+
+// pickClaudeExtraUsageFallbackForRequest applies request-time controller
+// exclusions before considering Claude extra usage. A weekly-cooked account
+// can have an extra-usage balance while still being held out by a live
+// upstream rejection; selecting it would bypass the controller's cooldown.
+func (s Server) pickClaudeExtraUsageFallbackForRequest(
+	scheduler selectacct.Scheduler,
+	candidates []accounts.Account,
+	poolModel string,
+) (accounts.Account, bool) {
+	if s.SchedulerRef == nil {
+		return pickClaudeExtraUsageFallback(scheduler, candidates)
+	}
+	now := time.Now()
+	eligible := make([]accounts.Account, 0, len(candidates))
+	for _, candidate := range candidates {
+		provider := schedulerAccountProvider(candidate.Provider)
+		if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(provider, candidate.ID, poolModel, now); blocked {
+			continue
+		}
+		eligible = append(eligible, candidate)
+	}
+	return pickClaudeExtraUsageFallback(scheduler, eligible)
 }
 
 // claudeExtraUsageResponseAllowed is the request-time guard. The current
@@ -8574,6 +8688,12 @@ func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []a
 			s.Logger.Debug("usage score refresh discarded after account reload")
 		}
 		return
+	}
+	if s.AccountRef != nil {
+		// The score sweep already fetched these windows. Publish the same
+		// observations to the controller snapshot so `sr status` can render
+		// reset countdowns without another provider poll.
+		s.AccountRef.RefreshUsageStatusSnapshotFromWindows(scores...)
 	}
 	if s.Logger != nil {
 		s.Logger.Debug("usage scores refreshed", "accounts", len(availableAccounts), "scored", scored)
@@ -10786,7 +10906,7 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 		}
 		var account accounts.Account
 		if provider == accounts.ProviderClaude {
-			if fallback, ok := pickClaudeExtraUsageFallback(scheduler, allCandidates); ok {
+			if fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, allCandidates, poolModel); ok {
 				_, alreadyTried := tried[fallback.ID]
 				if !alreadyTried || allowTriedClaudeExtraUsage {
 					account = fallback

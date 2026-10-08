@@ -2181,7 +2181,7 @@ func TestClaudeRejectedPaidResponseAcceptedOnlyAfterWholePoolCooked(t *testing.T
 	}
 }
 
-func TestClaudeExtraUsageRevisitsFundedAccountAfterLastSubscriptionCooks(t *testing.T) {
+func TestClaudeExtraUsageDoesNotRevisitCooldownAccount(t *testing.T) {
 	server, store := claudeFailoverServer(t)
 	if _, err := store.Put("claude", "session-paid-revisit", "cooked@example.com", ""); err != nil {
 		t.Fatal(err)
@@ -2230,15 +2230,14 @@ func TestClaudeExtraUsageRevisitsFundedAccountAfterLastSubscriptionCooks(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if paidHits != 2 || ordinaryHits != 1 {
-		t.Fatalf("upstream hits paid=%d ordinary=%d, want 2/1", paidHits, ordinaryHits)
+	if paidHits != 1 || ordinaryHits != 1 {
+		t.Fatalf("upstream hits paid=%d ordinary=%d, want one bounded attempt per account", paidHits, ordinaryHits)
 	}
-	if response.Header.Get("X-Subrouter-Claude-Extra-Usage") != "true" ||
-		response.Header.Get("Anthropic-Ratelimit-Unified-Status") != "allowed" {
-		t.Fatalf("paid fallback headers = %v, want normalized allowed extra usage", response.Header)
+	if response.StatusCode != http.StatusTooManyRequests || response.Header.Get("X-Subrouter-Claude-Extra-Usage") != "" {
+		t.Fatalf("cooldown response = status %d headers %v, want bounded 429 without extra-usage retry", response.StatusCode, response.Header)
 	}
-	if !strings.Contains(string(body), `"paid-2"`) {
-		t.Fatalf("body = %q, want second paid attempt", body)
+	if strings.Contains(string(body), `"paid-2"`) {
+		t.Fatalf("body = %q, unexpectedly contains a second paid attempt", body)
 	}
 }
 
