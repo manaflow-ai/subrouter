@@ -1434,6 +1434,7 @@ type remoteServerUsageStatus struct {
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
 	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
+	UsageFetchedAt     time.Time                        `json:"usage_fetched_at,omitzero"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
@@ -1621,6 +1622,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			quotaStatus:        status.QuotaStatus,
 			accountIdentity:    status.AccountIdentity,
 			quotaUsageKnown:    status.QuotaUsageKnown,
+			usageFetchedAt:     status.UsageFetchedAt,
 			windows:            status.Windows,
 			credits:            status.Credits,
 			complimentaryReset: status.ComplimentaryReset,
