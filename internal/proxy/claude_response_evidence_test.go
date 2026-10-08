@@ -160,11 +160,11 @@ func TestRealClaudeProxyResponseSeedsLaterModelQuotaCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := Server{
-		AccountRef: ref,
+		AccountRef:     ref,
 		ClaudeUpstream: upstream,
-		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
-		UsageScoreTTL: 0,
-		MaxBodyBytes: 1 << 20,
+		SchedulerRef:   selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+		UsageScoreTTL:  0,
+		MaxBodyBytes:   1 << 20,
 		RefreshAccountFn: func(_ context.Context, candidate accounts.Account) (accounts.Account, error) {
 			return candidate, nil
 		},
