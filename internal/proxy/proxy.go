@@ -7077,10 +7077,12 @@ func claudeExhaustionExpiryForPool(header http.Header, now time.Time, poolModel 
 	}
 	windowResetKnown := false
 	windowResetMissing := false
+	relevantRejection := false
 	for _, prefix := range prefixes {
 		if !strings.EqualFold(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-"+prefix+"-status")), "rejected") {
 			continue
 		}
+		relevantRejection = true
 		raw := strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-"+prefix+"-reset"))
 		if epoch, err := strconv.ParseInt(raw, 10, 64); err == nil && epoch > 0 {
 			observe(raw)
@@ -7092,7 +7094,8 @@ func claudeExhaustionExpiryForPool(header http.Header, now time.Time, poolModel 
 	// Aggregate reset may refer to a completely different, healthy window.
 	// Only use it when the rejected binding windows did not supply every
 	// reset time; otherwise it could hold a recovered model unnecessarily.
-	if !windowResetKnown || windowResetMissing {
+	if (!windowResetKnown || windowResetMissing) &&
+		(poolModel == "" || relevantRejection || claudeUnifiedStatus(header) == "rejected") {
 		observe(claudeHeaderGet(header, "anthropic-ratelimit-unified-reset"))
 	}
 	if retryAt := parseRetryAfter(strings.TrimSpace(claudeHeaderGet(header, "Retry-After")), now); retryAt.After(until) {
