@@ -145,3 +145,27 @@ func TestRepairedClaudeSnapshotBypassesOldGrantBlock(t *testing.T) {
 		t.Fatalf("repaired account was rejected: selected=%+v err=%v", selected, err)
 	}
 }
+
+func TestClaudeRefreshCandidateRejectsTerminallyFailedReplacement(t *testing.T) {
+	old := accounts.Account{
+		ID:                "claude-personal",
+		Provider:          accounts.ProviderClaude,
+		AuthMode:          accounts.AuthModeOAuth,
+		Token:             "old-access",
+		CredentialVersion: "old-grant",
+	}
+	repaired := old
+	repaired.Token = "new-access"
+	repaired.CredentialVersion = "new-grant"
+	ref := &AccountRef{accounts: []accounts.Account{repaired}}
+	ref.noteCredResult(old, errors.New("invalid_grant"))
+	ref.noteCredResult(repaired, errors.New("invalid_grant"))
+
+	selected, err := ref.claudeRefreshCandidate(old)
+	if selected.CredentialIdentity() != repaired.CredentialIdentity() {
+		t.Fatalf("stale request should report the current replacement: selected=%+v", selected)
+	}
+	if err == nil || !strings.Contains(err.Error(), "invalid_grant") {
+		t.Fatalf("terminally failed replacement was retried: %v", err)
+	}
+}

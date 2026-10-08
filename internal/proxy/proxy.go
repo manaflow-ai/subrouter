@@ -1161,6 +1161,9 @@ func (r *AccountRef) claudeRefreshCandidate(account accounts.Account) (accounts.
 	}
 	current := r.credentialSnapshot(account.Provider, account.ID)
 	if current.Token != "" && current.CredentialIdentity() != account.CredentialIdentity() {
+		if reason, dead := r.terminalCredFailure(current); dead {
+			return current, errors.New(reason)
+		}
 		return current, nil
 	}
 	return account, errors.New(reason)
