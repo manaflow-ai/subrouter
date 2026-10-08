@@ -102,11 +102,11 @@ func TestClaudeOAuthRetryCandidateUsesVerifiedPoolWithoutStatusFetch(t *testing.
 	original := claudeRetryTestAccount("original")
 	refreshes := make([]string, 0, 1)
 	server := Server{
-		Accounts:         []accounts.Account{original, unknown, verified},
-		SchedulerRef:     selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		Accounts: []accounts.Account{original, unknown, verified},
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
 			claudeRetryTestScore("verified", 0.70, true),
 		})),
-		UsageScoreTTL:    0,
+		UsageScoreTTL: 0,
 		RefreshAccountFn: func(_ context.Context, account accounts.Account) (accounts.Account, error) {
 			refreshes = append(refreshes, account.ID)
 			return account, nil
@@ -130,9 +130,9 @@ func TestClaudeOAuthRetryCandidateStopsWhenEveryWindowIsConfirmedCooked(t *testi
 	quota.ExhaustedResetAt = time.Now().Add(time.Hour)
 	refreshes := 0
 	server := Server{
-		Accounts:         []accounts.Account{cooked},
-		SchedulerRef:     selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{quota})),
-		UsageScoreTTL:    0,
+		Accounts: []accounts.Account{cooked},
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{quota})),
+		UsageScoreTTL: 0,
 		RefreshAccountFn: func(_ context.Context, account accounts.Account) (accounts.Account, error) {
 			refreshes++
 			return account, nil
