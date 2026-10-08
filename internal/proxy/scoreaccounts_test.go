@@ -370,14 +370,14 @@ func TestNoteCredResultClearsRememberedFailure(t *testing.T) {
 	ref := &AccountRef{}
 	account := accounts.Account{Provider: accounts.ProviderClaude, ID: "claude@example.com", Token: "credential"}
 
-	ref.noteCredResult(account, errors.New("invalid_grant"))
+	ref.noteCredResult(account, errors.New("unreadable credential"))
 	if _, dead := ref.terminalCredFailure(account); !dead {
 		t.Fatal("terminal credential error was not remembered")
 	}
 
 	ref.noteCredResult(account, nil)
 	if _, dead := ref.terminalCredFailure(account); dead {
-		t.Fatal("a successful refresh must clear the remembered failure")
+		t.Fatal("a successful credential check must clear a bounded remembered failure")
 	}
 
 	// A transient error is not a credential verdict and must not re-arm it.

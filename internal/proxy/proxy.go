@@ -597,8 +597,21 @@ type usageStatusSnapshot struct {
 // errors recover through re-authentication, not by retrying the same refresh
 // request, so repeated status sweeps must not probe the account again.
 type credFailure struct {
-	err string
-	at  time.Time
+	err         string
+	at          time.Time
+	irreparable bool // provider rejected a single-use refresh grant; only re-login changes it
+}
+
+// A rejected single-use OAuth refresh grant cannot become usable merely by
+// waiting. Cache that verdict until the credential identity changes, while
+// keeping the existing TTL for other terminal errors.
+func irreparableClaudeRefreshFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "invalid_grant") ||
+		strings.Contains(message, "refresh_token_reused")
 }
 
 type usageWindowsEntry struct {
@@ -666,12 +679,14 @@ func (r *AccountRef) terminalCredFailure(account accounts.Account) (string, bool
 		return "", false
 	}
 	r.credFailMu.Lock()
-	defer r.credFailMu.Unlock()
 	failure, ok := r.credFail[credFailureKey(account)]
-	if !ok || time.Since(failure.at) > credFailureTTL {
-		return "", false
+	r.credFailMu.Unlock()
+	if ok && (failure.irreparable || time.Since(failure.at) <= credFailureTTL) {
+		return failure.err, true
 	}
-	return failure.err, true
+	// Refresh refusals of single-use grants are durable. After a daemon
+	// restart, do not make a new provider request for the same dead grant.
+	return r.persistedClaudeTerminalFailure(account)
 }
 
 func (r *AccountRef) noteCredResult(account accounts.Account, err error) {
@@ -685,13 +700,25 @@ func (r *AccountRef) noteCredResult(account accounts.Account, err error) {
 	}
 	now := time.Now()
 	for candidate, failure := range r.credFail {
-		if now.Sub(failure.at) > credFailureTTL {
+		if !failure.irreparable && now.Sub(failure.at) > credFailureTTL {
 			delete(r.credFail, candidate)
 		}
 	}
 	key := credFailureKey(account)
+	if prior, exists := r.credFail[key]; exists && prior.irreparable {
+		// A no-op result, a transient failure, or another late terminal result
+		// cannot rehabilitate a single-use grant that was already rejected.
+		// A fresh login has a different credential identity and its own key.
+		return
+	}
 	if isTerminalCredentialError(err) {
-		r.credFail[key] = credFailure{err: err.Error(), at: now}
+		r.credFail[key] = credFailure{
+			err: err.Error(), at: now,
+			irreparable: account.Provider == accounts.ProviderClaude && irreparableClaudeRefreshFailure(err),
+		}
+		if r.credFail[key].irreparable {
+			r.persistClaudeTerminalFailure(account, err)
+		}
 		return
 	}
 	delete(r.credFail, key)
@@ -1231,12 +1258,36 @@ func (r *AccountRef) ReloadSnapshot() ([]accounts.Account, uint64, error) {
 	return append([]accounts.Account(nil), loaded...), r.accountGeneration, nil
 }
 
+// claudeRefreshCandidate skips a previously rejected credential, but accepts
+// a newer in-memory version of the same profile even if the in-flight request
+// still carries the older account snapshot.
+func (r *AccountRef) claudeRefreshCandidate(account accounts.Account) (accounts.Account, error) {
+	reason, knownDead := r.terminalCredFailure(account)
+	if !knownDead {
+		return account, nil
+	}
+	current := r.credentialSnapshot(account.Provider, account.ID)
+	if current.Token != "" && current.CredentialIdentity() != account.CredentialIdentity() {
+		if reason, dead := r.terminalCredFailure(current); dead {
+			return current, errors.New(reason)
+		}
+		return current, nil
+	}
+	return account, errors.New(reason)
+}
+
 func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (accounts.Account, error) {
 	if r == nil || account.AuthMode != accounts.AuthModeOAuth {
 		return account, nil
 	}
 	if account.Provider == accounts.ProviderClaude {
+		var candidateErr error
+		account, candidateErr = r.claudeRefreshCandidate(account)
+		if candidateErr != nil {
+			return account, candidateErr
+		}
 		refreshed, _, err := r.claudeStore.RefreshAccountIfExpired(ctx, r.client, account)
+		r.noteCredResult(account, err)
 		if err != nil {
 			return account, err
 		}
