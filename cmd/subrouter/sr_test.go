@@ -5205,8 +5205,8 @@ func TestCompactPickReasonKeepsUnavailableWithoutCachedWindows(t *testing.T) {
 		provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth,
 		err: errors.New("usage fetch failed: 429 Too Many Requests"),
 	}
-	if got := compactPickReason(row); got != "quota pending" {
-		t.Fatalf("missing quota Use = %q, want quota pending", got)
+	if got := compactPickReason(row); got != "usage throttled" {
+		t.Fatalf("missing quota Use = %q, want usage throttled", got)
 	}
 }
 

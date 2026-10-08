@@ -4000,7 +4000,7 @@ func compactPickReason(row srUsageRow) string {
 			row.usageThrottled = false
 			return compactPickReason(row)
 		}
-		return "quota pending"
+		return "usage throttled"
 	}
 	// A usage refresh can fail after the server has retained a last-known-good
 	// quota snapshot. Keep the reset-aware Use text in that case; State and the
