@@ -73,6 +73,11 @@ func TestClaudeQuotaExpiryUsesLatestBindingWindowReset(t *testing.T) {
 	fable := http.Header{}
 	fable.Set("Anthropic-Ratelimit-Unified-7d_Oi-Status", "rejected")
 	fable.Set("Anthropic-Ratelimit-Unified-7d_Oi-Reset", strconv.FormatInt(now.Add(3*time.Hour).Unix(), 10))
+	fable.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
+	fable.Set("Anthropic-Ratelimit-Unified-7d-Status", "allowed")
+	// The aggregate reset belongs to a healthy window, not the exhausted
+	// Fable-only bucket; it must not extend Fable's real recovery clock.
+	fable.Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(now.Add(7*time.Hour).Unix(), 10))
 	if got := claudeExhaustionExpiryForPool(fable, now, agentclaude.FableFeature); !got.Equal(now.Add(3 * time.Hour)) {
 		t.Fatalf("Fable-specific reset = %v, want +3h", got)
 	}
