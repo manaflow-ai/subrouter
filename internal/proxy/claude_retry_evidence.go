@@ -72,7 +72,6 @@ func claudeRetryCandidatesFromScores(
 	return append(possible, uncertain...)
 }
 
-
 // claudeNewSessionCandidatesFromScores prefers an account with confirmed,
 // model-eligible capacity when assigning a brand-new conversation. The shared
 // scheduler's unknown-account default is optimistically 100% healthy, which
