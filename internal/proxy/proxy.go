@@ -887,9 +887,10 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 							r.usageWindows = map[string]usageWindowsEntry{}
 						}
 						r.usageWindows[cacheKey] = usageWindowsEntry{
-							windows: append([]accounts.UsageWindow(nil), flight.windows...),
-							at: flight.fetchedAt, supplementalFresh: flight.supplementalFresh,
-							credentialKey: credentialKey,
+							windows:           append([]accounts.UsageWindow(nil), flight.windows...),
+							at:                flight.fetchedAt,
+							supplementalFresh: flight.supplementalFresh,
+							credentialKey:     credentialKey,
 						}
 					}
 					delete(r.usageWindowsFailures, failureKey)
