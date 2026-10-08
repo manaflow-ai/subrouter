@@ -185,7 +185,13 @@ describe("tenant isolation", () => {
       3
     )
     expect(sessionsBAfterOverride).toEqual(sessionsB)
-    expect(usageBAfterOverride).toEqual(usageB)
+    const withoutUsageObservation = (statuses: Array<Record<string, any>>) =>
+      statuses.map((status) => {
+        const copy = { ...status }
+        delete copy.usage_fetched_at
+        return copy
+      })
+    expect(withoutUsageObservation(usageBAfterOverride)).toEqual(withoutUsageObservation(usageB))
     expect(transcriptsBAfterOverride).toEqual(transcriptsB)
 
     const rawBAfterOverride = await fetch(

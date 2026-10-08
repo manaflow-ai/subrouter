@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -150,6 +151,33 @@ type codexLimitWindow struct {
 	LimitWindowSeconds int64   `json:"limit_window_seconds"`
 	ResetAfterSeconds  int64   `json:"reset_after_seconds"`
 	ResetAt            int64   `json:"reset_at"`
+	// A missing or null usage value is unknown, not an unused quota window.
+	// Keep this private so programmatically constructed windows retain their
+	// existing meaning, including an explicitly supplied zero percent.
+	unreportedUsedPercent bool
+}
+
+func (w *codexLimitWindow) UnmarshalJSON(data []byte) error {
+	type alias codexLimitWindow
+	var decoded struct {
+		alias
+		UsedPercent *float64 `json:"used_percent"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*w = codexLimitWindow(decoded.alias)
+	w.unreportedUsedPercent = decoded.UsedPercent == nil
+	if decoded.UsedPercent != nil {
+		w.UsedPercent = *decoded.UsedPercent
+	}
+	return nil
+}
+
+func (w *codexLimitWindow) usageKnown() bool {
+	return w != nil && !w.unreportedUsedPercent &&
+		!math.IsNaN(w.UsedPercent) && !math.IsInf(w.UsedPercent, 0) &&
+		w.UsedPercent >= 0 && w.UsedPercent <= 100
 }
 
 type codexCreditsInfo struct {
@@ -216,6 +244,13 @@ func FetchCodexUsageDetails(ctx context.Context, client *http.Client, account Ac
 	var usage codexUsageResponse
 	if err := json.NewDecoder(res.Body).Decode(&usage); err != nil {
 		return CodexUsageDetails{}, err
+	}
+	if !usage.RateLimit.LimitReached {
+		if (usage.RateLimit.PrimaryWindow != nil && !usage.RateLimit.PrimaryWindow.usageKnown()) ||
+			(usage.RateLimit.SecondaryWindow != nil && !usage.RateLimit.SecondaryWindow.usageKnown()) ||
+			(usage.RateLimit.PrimaryWindow == nil && usage.RateLimit.SecondaryWindow == nil) {
+			return CodexUsageDetails{}, fmt.Errorf("Codex usage quota is unknown: account-wide utilization was not reported")
+		}
 	}
 	details := CodexUsageDetails{
 		PlanType:           usage.PlanType,
@@ -428,7 +463,7 @@ func (u codexUsageResponse) windows() []UsageWindow {
 	now := time.Now()
 	var windows []UsageWindow
 	appendDetails := func(prefix string, details codexRateLimitDetails) {
-		if details.PrimaryWindow != nil {
+		if details.PrimaryWindow.usageKnown() {
 			windows = append(windows, UsageWindow{
 				Name:               prefix + "primary",
 				UsedPercent:        details.PrimaryWindow.UsedPercent,
@@ -437,7 +472,7 @@ func (u codexUsageResponse) windows() []UsageWindow {
 				ResetAt:            details.PrimaryWindow.resetAt(now),
 			})
 		}
-		if details.SecondaryWindow != nil {
+		if details.SecondaryWindow.usageKnown() {
 			windows = append(windows, UsageWindow{
 				Name:               prefix + "secondary",
 				UsedPercent:        details.SecondaryWindow.UsedPercent,
@@ -459,7 +494,7 @@ func (u codexUsageResponse) displayWindows() []UsageWindow {
 	windows := u.windows()
 	now := time.Now()
 	appendDetails := func(prefix, feature string, details codexRateLimitDetails) {
-		if details.PrimaryWindow != nil {
+		if details.PrimaryWindow.usageKnown() {
 			windows = append(windows, UsageWindow{
 				Name:               prefix + "primary",
 				Feature:            feature,
@@ -469,7 +504,7 @@ func (u codexUsageResponse) displayWindows() []UsageWindow {
 				ResetAt:            details.PrimaryWindow.resetAt(now),
 			})
 		}
-		if details.SecondaryWindow != nil {
+		if details.SecondaryWindow.usageKnown() {
 			windows = append(windows, UsageWindow{
 				Name:               prefix + "secondary",
 				Feature:            feature,

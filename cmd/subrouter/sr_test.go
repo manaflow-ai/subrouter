@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -4043,6 +4044,34 @@ func TestUsageGridCreditsHidesPlaceholderZero(t *testing.T) {
 	}
 }
 
+func TestUsageRowStaleAgeUsesProviderObservationTime(t *testing.T) {
+	row := srUsageRow{displayAccount: "stale@example.com", usageFetchedAt: time.Now().Add(-3 * time.Minute)}
+	age, ok := usageRowStaleAge(row)
+	if !ok || age != "3m ago" {
+		t.Fatalf("stale age = %q, %v; want 3m ago, true", age, ok)
+	}
+	row.usageFetchedAt = time.Now().Add(-time.Minute)
+	if _, ok := usageRowStaleAge(row); ok {
+		t.Fatal("recent provider observation was marked stale")
+	}
+}
+
+func TestDisplayUsageRowsCallsOutStaleUsage(t *testing.T) {
+	var out bytes.Buffer
+	displayUsageRows(&out, []srUsageRow{{
+		displayAccount: "stale@example.com",
+		provider:       accounts.ProviderCodex,
+		authMode:       accounts.AuthModeOAuth,
+		usageFetchedAt: time.Now().Add(-3 * time.Minute),
+		windows: []accounts.UsageWindow{{
+			Name: "primary", UsedPercent: 50, LimitWindowSeconds: 7 * 24 * 60 * 60,
+		}},
+	}}, false)
+	if got := out.String(); !strings.Contains(got, "usage last fetched 3m ago; showing last known values") {
+		t.Fatalf("stale usage note missing:\n%s", got)
+	}
+}
+
 func TestUsageGridResetCellStates(t *testing.T) {
 	ineligible := false
 	cases := []struct {
@@ -4461,6 +4490,30 @@ func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {
 	}
 	if suffix := exhaustedModelSuffix(windows); !strings.Contains(suffix, "Fable") {
 		t.Fatalf("Use suffix = %q, want it to note Fable is out", suffix)
+	}
+}
+
+func TestClaudeUsageWindowsTagModelWeeklyBuckets(t *testing.T) {
+	windows := claudeUsageWindows(&agentclaude.UsageResponse{
+		SevenDayOpus:   &agentclaude.RateLimit{Utilization: srFloatPtr(80)},
+		SevenDaySonnet: &agentclaude.RateLimit{Utilization: srFloatPtr(20)},
+	})
+	byName := make(map[string]accounts.UsageWindow, len(windows))
+	for _, window := range windows {
+		byName[window.Name] = window
+	}
+	if got := byName["opus-weekly"].Feature; got != agentclaude.OpusFeature {
+		t.Fatalf("opus-weekly Feature = %q, want %q", got, agentclaude.OpusFeature)
+	}
+	if got := byName["sonnet-weekly"].Feature; got != agentclaude.SonnetFeature {
+		t.Fatalf("sonnet-weekly Feature = %q, want %q", got, agentclaude.SonnetFeature)
+	}
+	score := scoreFromWindows("claude@example.com", windows)
+	if got := score.ModelScores[selectacct.ModelKey(agentclaude.OpusFeature)].Headroom; math.Abs(got-0.2) > 1e-9 {
+		t.Fatalf("Opus headroom = %.2f, want 0.20", got)
+	}
+	if got := score.ModelScores[selectacct.ModelKey(agentclaude.SonnetFeature)].Headroom; math.Abs(got-0.8) > 1e-9 {
+		t.Fatalf("Sonnet headroom = %.2f, want 0.80", got)
 	}
 }
 
