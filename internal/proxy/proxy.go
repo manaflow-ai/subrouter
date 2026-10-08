@@ -11175,7 +11175,8 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 	// though healthy accounts remained untried.
 	var lastErr error
 	for {
-		scheduler := s.withCapacityMarks(s.scheduler().ForModel(poolModel), provider, poolModel, codexServiceTierFromContext(ctx))
+		quotaScheduler := s.scheduler()
+		scheduler := s.withCapacityMarks(quotaScheduler.ForModel(poolModel), provider, poolModel, codexServiceTierFromContext(ctx))
 		if s.Sessions != nil {
 			scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
 		}
@@ -11224,6 +11225,14 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 					return accounts.Account{}, fmt.Errorf("all %s retry candidates are in controller cooldown", provider)
 				}
 				candidates = eligible
+			}
+			if provider == accounts.ProviderClaude && len(candidates) > 0 {
+				// Prefer confirmed available model quota over unknown scores,
+				// without fetching another status snapshot before retry.
+				candidates = claudeRetryCandidatesFromScores(quotaScheduler, scheduler, candidates, poolModel, time.Now())
+				if len(candidates) == 0 {
+					return accounts.Account{}, fmt.Errorf("all untried Claude retry candidates have confirmed quota exhaustion or lack model support")
+				}
 			}
 			if len(candidates) == 0 {
 				if lastErr != nil {
