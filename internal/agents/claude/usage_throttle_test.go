@@ -25,6 +25,7 @@ func TestUsageThrottleDeadlineFromProviderHeaders(t *testing.T) {
 	}{
 		{"seconds", "1800", 30 * time.Minute},
 		{"http_date", date, time.Hour},
+		{"http_date_capped", now.Add(31 * 24 * time.Hour).Format(http.TimeFormat), 30 * 24 * time.Hour},
 		{"zero", "0", usageThrottleFallbackWait},
 		{"missing", "", usageThrottleFallbackWait},
 		{"malformed", "oops", usageThrottleFallbackWait},

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -10,6 +11,29 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
+
+func TestFetchUsageWindowsSharedRechecksActiveThrottleBeforeFlight(t *testing.T) {
+	transport := &countingTransport{responses: claudeUsageOK}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	account := accounts.Account{ID: "claude-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "token-a"}
+	cacheKey := account.ID + "\x00" + string(account.Provider)
+	flightKey := usageWindowsFlightKey(cacheKey, account.Token)
+	throttleErr := errors.New("usage fetch failed: 429 Too Many Requests")
+	ref.usageWindowsMu.Lock()
+	ref.usageWindowsFailures = map[string]usageWindowsFailure{
+		flightKey: {err: throttleErr, retryAt: time.Now().Add(time.Hour)},
+	}
+	ref.usageWindowsMu.Unlock()
+
+	windows, err := ref.fetchUsageWindowsShared(context.Background(), client, account, cacheKey)
+	if !errors.Is(err, throttleErr) || windows != nil {
+		t.Fatalf("active throttle was not reused: windows=%v err=%v", windows, err)
+	}
+	if transport.calls != 0 {
+		t.Fatalf("active throttle started an upstream request: calls=%d", transport.calls)
+	}
+}
 
 func TestUsageThrottleAvoidsRepeatedUpstreamRequests(t *testing.T) {
 	transport := &countingTransport{responses: claudeUsage429}

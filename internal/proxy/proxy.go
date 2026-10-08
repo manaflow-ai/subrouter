@@ -784,6 +784,13 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 	r.usageWindowsMu.Lock()
 	flight, joined := r.usageWindowsFlights[flightKey]
 	if !joined {
+		// A completed flight can remove itself just before a concurrent caller
+		// reaches this point. Recheck the credential-scoped throttle while still
+		// holding the same lock so that caller cannot start a duplicate request.
+		if failure, throttled := r.usageWindowsFailures[flightKey]; throttled && time.Now().Before(failure.retryAt) {
+			r.usageWindowsMu.Unlock()
+			return nil, failure.err
+		}
 		flight = &usageWindowsFlight{done: make(chan struct{})}
 		if r.usageWindowsFlights == nil {
 			r.usageWindowsFlights = map[string]*usageWindowsFlight{}

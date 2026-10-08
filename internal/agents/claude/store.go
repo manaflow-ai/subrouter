@@ -4288,6 +4288,10 @@ func usageThrottleRetryAt(raw string, now time.Time) time.Time {
 		return now.Add(30 * 24 * time.Hour)
 	}
 	if deadline, err := http.ParseTime(raw); err == nil && deadline.After(now) {
+		maxDeadline := now.Add(30 * 24 * time.Hour)
+		if deadline.After(maxDeadline) {
+			return maxDeadline
+		}
 		return deadline
 	}
 	// Retry-After: 0 and absent/malformed hints do not mean that a
