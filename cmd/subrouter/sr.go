@@ -4013,7 +4013,14 @@ func compactPickReason(row srUsageRow) string {
 		}
 	}
 	if row.usageThrottled || (row.err != nil && serverUsageThrottleError(row.err.Error())) {
-		if len(row.windows) > 0 {
+		// Model-scoped headers (for example Fable's weekly bucket) can be
+		// present on a plain telemetry 429. They are useful in their own
+		// column, but they do not prove that the account-wide subscription
+		// quota is exhausted or that the account is otherwise unavailable.
+		// Keep the high-signal Use text as "usage throttled" until an
+		// account-wide window or a successful usage read supplies routing
+		// evidence.
+		if len(row.windows) > 0 && hasAccountWideQuotaEvidence(row.windows) {
 			row.err = nil
 			row.usageThrottled = false
 			return compactPickReason(row)
@@ -4081,6 +4088,15 @@ func compactPickReason(row srUsageRow) string {
 		return fmt.Sprintf("%s, 5h reset %s%s", left, formatDuration(row.score.ShortResetAfterSeconds), suffix)
 	}
 	return left + suffix
+}
+
+func hasAccountWideQuotaEvidence(windows []accounts.UsageWindow) bool {
+	for _, window := range windows {
+		if window.Feature == "" && (isShortQuotaWindow(window) || isLongQuotaWindow(window)) {
+			return true
+		}
+	}
+	return false
 }
 
 func compactAntigravityQuota(windows []accounts.UsageWindow) string {
@@ -4222,6 +4238,9 @@ func usageGridWindowStatusCell(window accounts.UsageWindow) usageGridCell {
 func compactWindowStatus(window accounts.UsageWindow) string {
 	left := compactPercentLeft(window.UsedPercent)
 	if window.ResetAfterSeconds <= 0 {
+		if window.UsedPercent >= 100 && !window.ResetAt.IsZero() {
+			return left + "/expired"
+		}
 		return left
 	}
 	return left + "/" + strings.ReplaceAll(formatDuration(window.ResetAfterSeconds), " ", "")
