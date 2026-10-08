@@ -1603,6 +1603,11 @@ func serverUsageDisplayAccount(status remoteServerUsageStatus) string {
 	return ""
 }
 
+func serverUsageThrottleError(message string) bool {
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "429") || strings.Contains(lower, "too many requests")
+}
+
 func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUsageRow {
 	rows := make([]srUsageRow, 0, len(statuses))
 	now := time.Now()
@@ -1637,6 +1642,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			complimentaryReset: status.ComplimentaryReset,
 			extraUsage:         status.ExtraUsage,
 			provider:           status.Provider,
+			usageThrottled:     status.QuotaStatus == "throttled" || serverUsageThrottleError(status.Error),
 			providerHealth:     status.ProviderHealth,
 			authChecked:        status.AuthChecked,
 			authValid:          status.AuthValid,
