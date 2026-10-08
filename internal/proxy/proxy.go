@@ -892,6 +892,10 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 						delete(r.usageWindowsFailures, failureKey)
 					}
 				} else if usageWindowsIsThrottle(flight.err) && flight.epoch == r.usageWindowsEpoch && latest {
+					var throttle *agentclaude.UsageThrottleError
+					if errors.As(flight.err, &throttle) && len(throttle.Windows) > 0 {
+						flight.fetchedAt = time.Now().UTC()
+					}
 					if r.usageWindowsFailures == nil {
 						r.usageWindowsFailures = map[string]usageWindowsFailure{}
 					}
@@ -912,6 +916,13 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 	select {
 	case <-flight.done:
 		if flight.err != nil {
+			var throttle *agentclaude.UsageThrottleError
+			if errors.As(flight.err, &throttle) && len(throttle.Windows) > 0 {
+				// The provider supplied authoritative reset metadata on a
+				// throttled telemetry response. Publish it as stale evidence while
+				// retaining the credential-scoped failure cache.
+				return append([]accounts.UsageWindow(nil), throttle.Windows...), false, flight.fetchedAt, nil
+			}
 			return nil, false, time.Time{}, flight.err
 		}
 		return append([]accounts.UsageWindow(nil), flight.windows...), flight.supplementalFresh, flight.fetchedAt, nil
@@ -1006,15 +1017,19 @@ type AccountStatus struct {
 
 type AccountUsageStatus struct {
 	AccountStatus
-	Active             bool                             `json:"active,omitempty"`
-	KeyFingerprint     string                           `json:"key_fingerprint,omitempty"`
-	AssignedSessions   int                              `json:"assigned_sessions,omitempty"`
-	SessionsKnown      bool                             `json:"sessions_known,omitempty"`
-	PlanType           string                           `json:"plan_type,omitempty"`
-	ProviderHealth     string                           `json:"provider_health,omitempty"`
-	ProviderModels     *int                             `json:"provider_models,omitempty"`
-	ProviderEndpoints  []string                         `json:"provider_endpoints,omitempty"`
-	QuotaStatus        string                           `json:"quota_status,omitempty"`
+	Active            bool     `json:"active,omitempty"`
+	KeyFingerprint    string   `json:"key_fingerprint,omitempty"`
+	AssignedSessions  int      `json:"assigned_sessions,omitempty"`
+	SessionsKnown     bool     `json:"sessions_known,omitempty"`
+	PlanType          string   `json:"plan_type,omitempty"`
+	ProviderHealth    string   `json:"provider_health,omitempty"`
+	ProviderModels    *int     `json:"provider_models,omitempty"`
+	ProviderEndpoints []string `json:"provider_endpoints,omitempty"`
+	QuotaStatus       string   `json:"quota_status,omitempty"`
+	// UsageThrottled means the provider's telemetry endpoint declined this
+	// observation with a transient 429. It says nothing about account quota and
+	// must never be used as a quota exhaustion decision.
+	UsageThrottled     bool                             `json:"usage_throttled,omitempty"`
 	AccountIdentity    string                           `json:"account_identity,omitempty"`
 	QuotaUsageKnown    bool                             `json:"quota_usage_known,omitempty"`
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
@@ -1703,7 +1718,8 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 				// A plain usage-endpoint 429 is a transient observation failure,
 				// not quota exhaustion or an authentication failure.
 				status.Error = ""
-				status.QuotaStatus = "throttled"
+				status.UsageThrottled = true
+				status.QuotaStatus = ""
 				out[i] = status
 			}
 			continue

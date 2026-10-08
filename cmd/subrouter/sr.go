@@ -3799,9 +3799,9 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 func usageGridState(row srUsageRow) string {
 	if row.usageThrottled {
 		if row.active {
-			return "active, throttled"
+			return "active"
 		}
-		return "throttled"
+		return "ready"
 	}
 	if usageProvider(row) == accounts.ProviderAntigravity && row.authMode == accounts.AuthModeOAuth {
 		active := row.active || (row.sessionsKnown && row.assignedSessions > 0)
@@ -4007,7 +4007,7 @@ func compactPickReason(row srUsageRow) string {
 			row.usageThrottled = false
 			return compactPickReason(row)
 		}
-		return "usage throttled"
+		return "quota pending"
 	}
 	// A usage refresh can fail after the server has retained a last-known-good
 	// quota snapshot. Keep the reset-aware Use text in that case; State and the
