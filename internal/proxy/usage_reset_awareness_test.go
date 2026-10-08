@@ -2,7 +2,10 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -12,8 +15,9 @@ import (
 )
 
 type quotaResetCountingTransport struct {
-	mu    sync.Mutex
-	calls map[string]int
+	mu      sync.Mutex
+	calls   map[string]int
+	started chan string
 }
 
 func (c *quotaResetCountingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -23,6 +27,10 @@ func (c *quotaResetCountingTransport) RoundTrip(req *http.Request) (*http.Respon
 	}
 	c.calls[req.Header.Get("Authorization")]++
 	c.mu.Unlock()
+	select {
+	case c.started <- req.Header.Get("Authorization"):
+	default:
+	}
 	return claudeUsageOK(), nil
 }
 
@@ -61,8 +69,8 @@ func TestKnownExhaustedQuotaSuppressesBackgroundUsageFetch(t *testing.T) {
 		t.Fatalf("all-account reset=(%v,%t), want (%v,true)", got, blocked, reset)
 	}
 	delay := server.nextUsageScoreRefreshDelay()
-	if delay < 2*time.Hour+59*time.Minute || delay > 3*time.Hour+time.Minute {
-		t.Fatalf("background wake=%v, want near the provider's 3h quota reset", delay)
+	if delay < 30*time.Second || delay > 35*time.Second {
+		t.Fatalf("background recheck=%v, want a bounded recheck near the 30s score TTL", delay)
 	}
 	for i := 0; i < 5; i++ {
 		scores, fetched := server.scoreAccounts(context.Background(), []accounts.Account{account})
@@ -130,5 +138,55 @@ func TestUnknownOrModelScopedQuotaDoesNotSuppressRefresh(t *testing.T) {
 	expired := futureExhaustedQuota(account, now.Add(-time.Second))
 	if _, ok := knownAccountWideQuotaReset(expired, now); ok {
 		t.Fatal("passed reset must allow fresh provider observation")
+	}
+}
+
+func TestKnownExhaustedQuotaNoticesReplacementCredential(t *testing.T) {
+	transport := &quotaResetCountingTransport{started: make(chan string, 16)}
+	ref, all := multiProfileAccountRef(t, transport, 1)
+	ref.accounts = all
+	account := all[0]
+	scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		futureExhaustedQuota(account, time.Now().Add(3*time.Hour)),
+	}))
+	scheduler.SetUpdatedAt(time.Now().Add(-time.Hour))
+	server := Server{AccountRef: ref, SchedulerRef: scheduler, UsageScoreTTL: 10 * time.Millisecond}
+	ctx := t.Context()
+
+	// Rechecks while the original credential is exhausted stay local and do
+	// not poll its provider quota endpoint.
+	for range 3 {
+		server.refreshUsageScoresForRequest(ctx)
+	}
+	select {
+	case token := <-transport.started:
+		t.Fatalf("exhausted account triggered a provider poll: %q", token)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Simulate a login committed by another supervisor worker. The refresher
+	// has to observe the disk generation before deciding the old quota clock
+	// still applies, then verify the replacement credential immediately.
+	credential := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"replacement-token","refreshToken":"replacement-refresh","expiresAt":%d,"subscriptionType":"max"}}`, time.Now().Add(time.Hour).UnixMilli())
+	err := withAccountDiskMutationPublication(ctx, ref.store, advanceAccountDiskGeneration, func(publish func() error) error {
+		if err := os.WriteFile(filepath.Join(ref.claudeStore.ClaudeConfigDir(account.ID), ".credentials.json"), []byte(credential), 0o600); err != nil {
+			return err
+		}
+		return publish()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.refreshUsageScoresForRequest(ctx)
+	select {
+	case token := <-transport.started:
+		if token != "Bearer replacement-token" {
+			t.Fatalf("usage poll used %q, want the replacement credential", token)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement login remained asleep behind the old 3h quota reset")
+	}
+	if got := transport.count(account.Token); got != 0 {
+		t.Fatalf("known-exhausted credential was polled %d times", got)
 	}
 }

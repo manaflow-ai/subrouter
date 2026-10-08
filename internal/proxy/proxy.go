@@ -8732,8 +8732,12 @@ func (s Server) nextUsageScoreRefreshDelay() time.Duration {
 	if resetAt, blocked := s.allOAuthAccountsWaitingForReset(time.Now()); blocked {
 		// When the entire OAuth pool is exhausted, sleep until the earliest
 		// actual reset instead of waking every 30s to poll the same accounts.
-		// A small safety margin avoids racing the provider's reset clock.
-		return max(time.Duration(0), time.Until(resetAt)) + time.Second + rand.N(floor+1)
+		// Keep a bounded local recheck so a newly published login is noticed
+		// before its replacement credential waits behind the old reset clock.
+		// The recheck only reads account state and scheduler metadata; it does
+		// not start a provider usage request.
+		wait := min(max(time.Duration(0), time.Until(resetAt)), ttl)
+		return wait + time.Second + rand.N(floor+1)
 	}
 	wait := floor
 	if updatedAt := s.SchedulerRef.UpdatedAt(); !updatedAt.IsZero() {
