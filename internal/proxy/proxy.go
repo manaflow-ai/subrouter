@@ -1699,6 +1699,13 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 		}
 		snapshot, ok := r.lastGoodUsage[key]
 		if !ok || now.Sub(snapshot.at) > usageStatusLastGoodTTL {
+			if usageStatusThrottleError(status.Error) {
+				// A plain usage-endpoint 429 is a transient observation failure,
+				// not quota exhaustion or an authentication failure.
+				status.Error = ""
+				status.QuotaStatus = "throttled"
+				out[i] = status
+			}
 			continue
 		}
 		restored := snapshot.status
@@ -1758,6 +1765,11 @@ func authLikeUsageError(message string) bool {
 		}
 	}
 	return false
+}
+
+func usageStatusThrottleError(message string) bool {
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "429") || strings.Contains(lower, "too many requests")
 }
 
 func apiKeyPlanType(provider accounts.Provider) string {

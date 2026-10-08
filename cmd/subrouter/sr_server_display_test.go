@@ -2,9 +2,38 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
+
+func TestServerUsageRowsClassify429AsThrottleAndKeepResetWindows(t *testing.T) {
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID:       "claude@example.com",
+		Provider: accounts.ProviderClaude,
+		AuthMode: accounts.AuthModeOAuth,
+		Error:    "usage fetch failed: 429 Too Many Requests",
+		Windows: []accounts.UsageWindow{{
+			Name: "7d", UsedPercent: 26, ResetAfterSeconds: int64(time.Hour / time.Second),
+		}},
+	}})
+	if len(rows) != 1 || !rows[0].usageThrottled {
+		t.Fatalf("rows = %+v, want one throttled row", rows)
+	}
+	if got := usageGridState(rows[0]); got != "throttled" {
+		t.Fatalf("state = %q, want throttled", got)
+	}
+	if got := compactPickReason(rows[0]); got == "usage unavailable" || got == "usage throttled" {
+		t.Fatalf("cached reset information was discarded: %q", got)
+	}
+
+	rows = usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{
+		{ID: "claude@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Error: "usage fetch failed: 401 Unauthorized"},
+	})
+	if len(rows) != 1 || rows[0].usageThrottled || rows[0].err == nil {
+		t.Fatalf("401 row = %+v, want authentication error", rows)
+	}
+}
 
 func TestServerUsageRowsShowLabelForOwnerKeyedCodexAccounts(t *testing.T) {
 	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{

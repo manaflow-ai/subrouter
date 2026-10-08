@@ -372,3 +372,29 @@ func TestMergeUsageStatusesExpiresFromProviderObservationTime(t *testing.T) {
 		t.Fatalf("expired last-good quota was restored: %+v", got)
 	}
 }
+
+func TestMergeUsageStatusesClassifiesPlain429AsTransientThrottle(t *testing.T) {
+	ref := &AccountRef{}
+	rows := ref.mergeUsageStatusesLocked([]AccountUsageStatus{{
+		AccountStatus: AccountStatus{
+			ID: "claude@example.com", Provider: accounts.ProviderClaude,
+			Error: "usage fetch failed: 429 Too Many Requests",
+		},
+	}}, ref.usageStatusEpoch)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v, want one row", rows)
+	}
+	if rows[0].Error != "" || rows[0].QuotaStatus != "throttled" {
+		t.Fatalf("plain 429 classification = %+v, want transient throttled status", rows[0])
+	}
+
+	authRows := ref.mergeUsageStatusesLocked([]AccountUsageStatus{{
+		AccountStatus: AccountStatus{
+			ID: "claude@example.com", Provider: accounts.ProviderClaude,
+			Error: "usage fetch failed: 401 Unauthorized",
+		},
+	}}, ref.usageStatusEpoch)
+	if authRows[0].Error == "" || authRows[0].QuotaStatus == "throttled" {
+		t.Fatalf("401 classification = %+v, want authentication error", authRows[0])
+	}
+}
