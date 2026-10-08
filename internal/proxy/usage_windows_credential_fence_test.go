@@ -107,9 +107,10 @@ func TestUsageWindowCacheDoesNotFallbackToPreviousCredentialOnThrottle(t *testin
 			return codexUsageResponseForTest(10)
 		}
 		return &http.Response{
-			StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests",
-			Header: http.Header{},
-			Body: io.NopCloser(strings.NewReader("{}")),
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429 Too Many Requests",
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("{}")),
 		}
 	}
 	ref := &AccountRef{}
