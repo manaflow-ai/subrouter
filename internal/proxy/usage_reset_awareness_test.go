@@ -49,11 +49,11 @@ func TestKnownExhaustedQuotaSuppressesBackgroundUsageFetch(t *testing.T) {
 	transport := &quotaResetCountingTransport{}
 	ref := &AccountRef{
 		accounts: []accounts.Account{account},
-		client: &http.Client{Transport: transport},
+		client:   &http.Client{Transport: transport},
 	}
 	server := Server{
-		AccountRef: ref,
-		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{futureExhaustedQuota(account, reset)})),
+		AccountRef:    ref,
+		SchedulerRef:  selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{futureExhaustedQuota(account, reset)})),
 		UsageScoreTTL: 30 * time.Second,
 	}
 	got, blocked := server.allOAuthAccountsWaitingForReset(time.Now())
@@ -81,7 +81,7 @@ func TestKnownExhaustionDoesNotStarveOtherHealthyAccounts(t *testing.T) {
 	ref.accounts = append([]accounts.Account(nil), accountsList...)
 	exhausted, healthy := accountsList[0], accountsList[1]
 	scheduler := selectacct.NewScheduler([]selectacct.Score{
-		futureExhaustedQuota(exhausted, time.Now().Add(4 * time.Hour)),
+		futureExhaustedQuota(exhausted, time.Now().Add(4*time.Hour)),
 		{AccountID: healthy.ID, Provider: healthy.Provider, Headroom: 0.9, ShortHeadroom: 0.9},
 	})
 	server := Server{AccountRef: ref, SchedulerRef: selectacct.NewSchedulerRef(scheduler), UsageScoreTTL: 30 * time.Second}
@@ -110,13 +110,13 @@ func TestUnknownOrModelScopedQuotaDoesNotSuppressRefresh(t *testing.T) {
 		AccountID: account.ID, Provider: account.Provider,
 		Headroom: 0.8, ShortHeadroom: 0.8,
 		ModelScores: map[string]selectacct.Score{
-			selectacct.ModelKey("claude-fable"): futureExhaustedQuota(account, now.Add(4 * time.Hour)),
+			selectacct.ModelKey("claude-fable"): futureExhaustedQuota(account, now.Add(4*time.Hour)),
 		},
 	}
 	if _, ok := knownAccountWideQuotaReset(modelOnly, now); ok {
 		t.Fatal("model-specific exhaustion must not suppress all account usage checks")
 	}
-	unknown := futureExhaustedQuota(account, now.Add(4 * time.Hour))
+	unknown := futureExhaustedQuota(account, now.Add(4*time.Hour))
 	unknown.ExhaustedResetUnknown = true
 	if _, ok := knownAccountWideQuotaReset(unknown, now); ok {
 		t.Fatal("unknown reset must not be treated as a certain wake deadline")
