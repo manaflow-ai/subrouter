@@ -950,5 +950,5 @@ func probeFrontBackend(parent context.Context, backend frontproxy.Backend, timeo
 }
 
 func frontBuildIdentity() (version, revision string) {
-	return buildversion.Version(), buildversion.Get().Commit
+	return buildversion.Version(), buildversion.Get().Revision
 }

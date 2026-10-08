@@ -20,7 +20,7 @@ func TestGetPrefersLinkerStamp(t *testing.T) {
 		Settings: []debug.BuildSetting{{Key: "vcs.revision", Value: "ffff"}, {Key: "vcs.modified", Value: "true"}},
 	})
 	info := Get()
-	if info.Version != "v1.2.3" || info.Commit != "0123456789ab" || info.BuildDate != "2026-01-02T03:04:05Z" || info.Modified {
+	if info.Version != "v1.2.3" || info.Commit != "0123456789ab" || info.Revision != "0123456789abcdef0123" || info.BuildDate != "2026-01-02T03:04:05Z" || info.Modified {
 		t.Fatalf("Get() = %+v", info)
 	}
 	if got := Version(); got != "v1.2.3" {
@@ -38,13 +38,13 @@ func TestGetFallsBackToBuildInfo(t *testing.T) {
 		},
 	})
 	info := Get()
-	if info.Version != "devel" || info.Commit != "abcdef012345" || info.BuildDate != "2026-09-01T00:00:00Z" || !info.Modified {
+	if info.Version != "devel" || info.Commit != "abcdef012345" || info.Revision != "abcdef0123456789" || info.BuildDate != "2026-09-01T00:00:00Z" || !info.Modified {
 		t.Fatalf("Get() = %+v", info)
 	}
 	if got := Version(); got != "devel+abcdef012345-dirty" {
 		t.Fatalf("Version() = %q", got)
 	}
-	if s := info.String(); !strings.Contains(s, "abcdef012345-dirty") || !strings.HasPrefix(s, "devel ") {
+	if s := info.String(); !strings.Contains(s, "abcdef0123456789-dirty") || !strings.HasPrefix(s, "devel ") {
 		t.Fatalf("String() = %q", s)
 	}
 }

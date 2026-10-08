@@ -528,13 +528,10 @@ wait_until_idle
 take_backup
 
 # 5. hot swap -------------------------------------------------------------
-# The live worker may come from a deploy branch that the target does not
-# contain, so the lineage check cannot pass; the reason is logged, and the
-# target's commit is recorded afterwards so the next install is checked.
-# A deploy script without the lineage guard takes neither flag nor the record.
-reason="upgrade-host to ${REF}@${SHA:0:12} from ${LIVE_REV:-unrecorded}"
-lineage=()
-if grep -q -- '--allow-unrelated' "$DEPLOY"; then lineage=(--allow-unrelated "$reason"); fi
+# The candidate must be a full commit reachable from origin/main and must
+# contain the recorded live worker revision. The deploy script records the
+# candidate after the verified hot swap.
+lineage=(--revision "$SHA")
 # Pin first. /etc/subrouter-version is about to name a main build, which
 # subrouter-autoupdate.sh would replace with the latest release. deploy.sh
 # borrows an existing pin and puts it back when it exits, so the pin holds
