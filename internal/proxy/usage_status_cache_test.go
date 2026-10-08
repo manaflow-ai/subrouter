@@ -292,6 +292,32 @@ func TestUsageStatusSnapshotPersistsAcrossAccountRefRestart(t *testing.T) {
 	if !got[0].UsageFetchedAt.Equal(statuses[0].UsageFetchedAt) {
 		t.Fatalf("restarted observation time = %s, want %s", got[0].UsageFetchedAt, statuses[0].UsageFetchedAt)
 	}
+	second.usageWindowsMu.Lock()
+	_, cached := second.usageWindows["claude@example.com\x00claude"]
+	second.usageWindowsMu.Unlock()
+	if !cached {
+		t.Fatal("restarted snapshot did not seed the per-account fallback cache")
+	}
+}
+
+func TestUsageStatusesFreshKeepsSnapshotWindowsOn429(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{
+		usageOKResponse(), // primary usage
+		usageOKResponse(), // synthetic Fable probe
+		usage429Response(),
+	}}
+	ref := cacheTestAccountRef(t, transport)
+	first := ref.UsageStatusesFresh(context.Background())
+	if len(first) != 1 || len(first[0].Windows) == 0 {
+		t.Fatalf("initial fresh status = %+v, want usage windows", first)
+	}
+	second := ref.UsageStatusesFresh(context.Background())
+	if len(second) != 1 || len(second[0].Windows) == 0 {
+		t.Fatalf("429 fresh status erased last-known windows: %+v", second)
+	}
+	if !second[0].UsageFetchedAt.Equal(first[0].UsageFetchedAt) {
+		t.Fatalf("429 fresh status re-anchored observation time: %s vs %s", second[0].UsageFetchedAt, first[0].UsageFetchedAt)
+	}
 }
 
 func TestUsageStatusSnapshotRejectsCredentialRotation(t *testing.T) {
