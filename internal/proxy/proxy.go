@@ -7071,13 +7071,26 @@ func claudeExhaustionExpiryForPool(header http.Header, now time.Time, poolModel 
 	if prefix := claudeQuotaWindowPrefixForPool(poolModel); prefix != "" {
 		prefixes = append(prefixes, prefix)
 	}
+	windowResetKnown := false
+	windowResetMissing := false
 	for _, prefix := range prefixes {
-		if strings.EqualFold(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-"+prefix+"-status")), "rejected") {
-			observe(claudeHeaderGet(header, "anthropic-ratelimit-unified-"+prefix+"-reset"))
+		if !strings.EqualFold(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-"+prefix+"-status")), "rejected") {
+			continue
+		}
+		raw := strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-"+prefix+"-reset"))
+		if epoch, err := strconv.ParseInt(raw, 10, 64); err == nil && epoch > 0 {
+			observe(raw)
+			windowResetKnown = true
+		} else {
+			windowResetMissing = true
 		}
 	}
-	// The aggregate reset may be the only clock returned by older endpoints.
-	observe(claudeHeaderGet(header, "anthropic-ratelimit-unified-reset"))
+	// Aggregate reset may refer to a completely different, healthy window.
+	// Only use it when the rejected binding windows did not supply every
+	// reset time; otherwise it could hold a recovered model unnecessarily.
+	if !windowResetKnown || windowResetMissing {
+		observe(claudeHeaderGet(header, "anthropic-ratelimit-unified-reset"))
+	}
 	if retryAt := parseRetryAfter(strings.TrimSpace(claudeHeaderGet(header, "Retry-After")), now); retryAt.After(until) {
 		until = retryAt
 	}
