@@ -116,19 +116,33 @@ func TestUsageStatusesPreservesProviderObservationTimeOnWindowCacheHit(t *testin
 	}
 }
 
-func TestUsageStatusRefreshQueryInvalidatesCache(t *testing.T) {
+func TestUsageStatusRefreshQueryKeepsAccountWindowCache(t *testing.T) {
 	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse(), usageOKResponse(), usageOKResponse(), usageOKResponse()}}
 	ref := cacheTestAccountRef(t, transport)
 	handler := Server{AccountRef: ref}.Handler()
-	for _, target := range []string{"/_subrouter/usage-status", "/_subrouter/usage-status?refresh=1"} {
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("initial usage status = %d: %s", response.Code, response.Body.String())
+	}
+	callsAfterInitial := transport.calls
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status?refresh=1", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("refreshed usage status = %d: %s", response.Code, response.Body.String())
+	}
+	if transport.calls != callsAfterInitial {
+		t.Fatalf("refresh query discarded account window cache and made %d new upstream calls", transport.calls-callsAfterInitial)
+	}
+	for _, target := range []string{"/_subrouter/usage-status?refresh=1", "/_subrouter/usage-status?refresh=1"} {
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, target, nil))
 		if response.Code != http.StatusOK {
 			t.Fatalf("GET %s = %d: %s", target, response.Code, response.Body.String())
 		}
 	}
-	if transport.calls != 4 {
-		t.Fatalf("refresh query made %d upstream calls, want 4", transport.calls)
+	if transport.calls != callsAfterInitial {
+		t.Fatalf("repeated refresh queries made %d upstream calls after initial sweep", transport.calls-callsAfterInitial)
 	}
 }
 

@@ -2787,7 +2787,10 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		// keep the short shared cache so a dashboard cannot stampede providers.
 		if r.URL.Query().Get("refresh") == "1" {
 			s.AccountRef.InvalidateUsageStatusCache()
-			s.AccountRef.InvalidateUsageWindowsCache()
+			// Keep the per-account window cache and its credential-scoped
+			// throttle deadlines. A manual status refresh should reassemble the
+			// rows, but must not turn every `sr status` into another burst of
+			// provider quota requests after a 401/429.
 		}
 		scoreRevision := uint64(0)
 		if s.SchedulerRef != nil {
