@@ -96,13 +96,17 @@ func TestPassiveClaudePartialFeatureHeadersKeepOlderBucketsAged(t *testing.T) {
 	earlier := time.Now().Add(-2 * time.Minute)
 	later := earlier.Add(time.Minute)
 	ref.observeClaudeQuotaHeaders(account, passiveClaudeHeader("7d_opus", "0.6"), earlier)
+	_, firstObservedAt, ok := ref.cachedClaudeSupplementalWithObservation(account, time.Now())
+	if !ok {
+		t.Fatal("first model window was not observed")
+	}
 	ref.observeClaudeQuotaHeaders(account, passiveClaudeHeader("7d_oi", "0.4"), later)
 	windows, observedAt, ok := ref.cachedClaudeSupplementalWithObservation(account, time.Now())
 	if !ok || len(windows) != 2 {
 		t.Fatalf("partial headers were not merged: %+v observed=%s ok=%t", windows, observedAt, ok)
 	}
-	if observedAt.After(earlier) {
-		t.Fatalf("partial header refreshed older Opus evidence without a new observation: %s > %s", observedAt, earlier)
+	if observedAt.After(firstObservedAt) {
+		t.Fatalf("partial header refreshed older Opus evidence without a new observation: %s > %s", observedAt, firstObservedAt)
 	}
 	opus, okOpus := findFeatureWindow(windows, agentclaude.OpusFeature)
 	fable, okFable := findFeatureWindow(windows, agentclaude.FableFeature)
@@ -120,5 +124,16 @@ func TestPassiveClaudeUncertainExhaustionNotCached(t *testing.T) {
 	ref.observeClaudeQuotaHeaders(account, h, time.Now())
 	if windows, ok := ref.cachedClaudeSupplemental(account, time.Now()); ok {
 		t.Fatalf("exhaustion without reset was incorrectly reused: %+v", windows)
+	}
+}
+
+func TestPassiveClaudeLongRequestStillPublishesFreshArrivingHeaders(t *testing.T) {
+	account := passiveClaudeAccount("token", "grant-v1")
+	ref := &AccountRef{accounts: []accounts.Account{account}}
+	requestStarted := time.Now().Add(-20 * time.Minute)
+	ref.observeClaudeQuotaHeaders(account, passiveClaudeHeader("7d_oi", "0.4"), requestStarted)
+	_, observedAt, ok := ref.cachedClaudeSupplementalWithObservation(account, time.Now())
+	if !ok || time.Since(observedAt) > time.Second {
+		t.Fatalf("long model request produced incorrectly stale quota observation: ok=%t at=%s", ok, observedAt)
 	}
 }
