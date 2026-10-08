@@ -117,36 +117,73 @@ func TestUsageStatusesPreservesProviderObservationTimeOnWindowCacheHit(t *testin
 	}
 }
 
-func TestUsageStatusRefreshQueryKeepsAccountWindowCache(t *testing.T) {
-	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse(), usageOKResponse(), usageOKResponse(), usageOKResponse()}}
-	ref := cacheTestAccountRef(t, transport)
-	handler := Server{AccountRef: ref}.Handler()
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status", nil))
-	if response.Code != http.StatusOK {
-		t.Fatalf("initial usage status = %d: %s", response.Code, response.Body.String())
-	}
-	callsAfterInitial := transport.calls
-	response = httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status?refresh=1", nil))
-	if response.Code != http.StatusOK {
-		t.Fatalf("refreshed usage status = %d: %s", response.Code, response.Body.String())
-	}
-	if transport.calls != callsAfterInitial {
-		t.Fatalf("refresh query discarded account window cache and made %d new upstream calls", transport.calls-callsAfterInitial)
-	}
-	for _, target := range []string{"/_subrouter/usage-status?refresh=1", "/_subrouter/usage-status?refresh=1"} {
-		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, target, nil))
-		if response.Code != http.StatusOK {
-			t.Fatalf("GET %s = %d: %s", target, response.Code, response.Body.String())
-		}
-	}
-	if transport.calls != callsAfterInitial {
-		t.Fatalf("repeated refresh queries made %d upstream calls after initial sweep", transport.calls-callsAfterInitial)
-	}
+func claudeFullUsageResponse(used float64) *http.Response {
+	body := fmt.Sprintf(`{"five_hour":{"utilization":%.1f,"resets_at":"2030-01-01T00:00:00+00:00"},"seven_day":{"utilization":5.0,"resets_at":"2030-01-02T00:00:00+00:00"},"seven_day_oauth_apps":{"utilization":20.0,"resets_at":"2030-01-03T00:00:00+00:00"}}`, used)
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}
 }
 
+func TestUsageStatusRefreshChecksProviderAfterCachedThrottle(t *testing.T) {
+	// A prior 429 may carry a long Retry-After. An explicit user-requested
+	// status read must check the provider again and recover actual utilization.
+	transport := &usageRoundTripper{responses: []*http.Response{
+		{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429 Too Many Requests",
+			Header:     http.Header{"Retry-After": []string{"1800"}},
+			Body:       io.NopCloser(strings.NewReader("{}")),
+		},
+		claudeFullUsageResponse(22),
+		claudeFullUsageResponse(55),
+	}}
+	ref := cacheTestAccountRef(t, transport)
+	handler := Server{AccountRef: ref}.Handler()
+	read := func(path string) AccountUsageStatus {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET %s: %d %s", path, response.Code, response.Body.String())
+		}
+		var statuses []AccountUsageStatus
+		if err := json.Unmarshal(response.Body.Bytes(), &statuses); err != nil {
+			t.Fatal(err)
+		}
+		if len(statuses) != 1 {
+			t.Fatalf("GET %s returned %d statuses", path, len(statuses))
+		}
+		return statuses[0]
+	}
+	first := read("/_subrouter/usage-status")
+	if !first.UsageThrottled || transport.calls != 1 {
+		t.Fatalf("initial throttle: status=%+v calls=%d", first, transport.calls)
+	}
+	second := read("/_subrouter/usage-status?refresh=1")
+	if second.UsageThrottled || len(second.Windows) == 0 || transport.calls != 2 {
+		t.Fatalf("live refresh retained cached 429: status=%+v calls=%d", second, transport.calls)
+	}
+	for _, w := range second.Windows {
+		if w.Name == "5h" && w.UsedPercent != 22 {
+			t.Fatalf("refresh returned old utilization: %+v", second.Windows)
+		}
+	}
+	third := read("/_subrouter/usage-status?refresh=1")
+	if third.UsageThrottled || transport.calls != 3 {
+		t.Fatalf("second explicit refresh skipped provider: status=%+v calls=%d", third, transport.calls)
+	}
+	sawUpdated := false
+	for _, w := range third.Windows {
+		if w.Name == "5h" && w.UsedPercent == 55 {
+			sawUpdated = true
+		}
+	}
+	if !sawUpdated {
+		t.Fatalf("latest provider utilization missing: %+v", third.Windows)
+	}
+	_ = read("/_subrouter/usage-status?snapshot=1")
+	if transport.calls != 3 {
+		t.Fatalf("snapshot unexpectedly fetched upstream, calls=%d", transport.calls)
+	}
+}
 func TestUsageStatusSnapshotQueryReusesLastSweep(t *testing.T) {
 	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse(), usageOKResponse()}}
 	ref := cacheTestAccountRef(t, transport)
