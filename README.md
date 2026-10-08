@@ -200,7 +200,7 @@ GET /_subrouter/dashboard
 GET /_subrouter/transcripts
 ```
 
-`/_subrouter/health` is liveness. `/_subrouter/ready` returns 503 while the process is draining. `/_subrouter/drain` is loopback-only and tells the process to reject new proxy sessions while allowing active sessions to continue. `GET /_subrouter/account-status` validates only expired OAuth tokens; `POST /_subrouter/account-status` force-refreshes token chains and should be reserved for explicit diagnostics. `GET /_subrouter/usage-status` returns the read-only account usage data rendered by `sr server status <name>`. Add `?snapshot=1` for that command's last controller snapshot; it does not update routing or start another provider usage sweep after the snapshot has been seeded.
+`/_subrouter/health` is liveness. `/_subrouter/ready` returns 503 while the process is draining. `/_subrouter/drain` is loopback-only and tells the process to reject new proxy sessions while allowing active sessions to continue. `GET /_subrouter/account-status` validates only expired OAuth tokens; `POST /_subrouter/account-status` force-refreshes token chains and should be reserved for explicit diagnostics. `GET /_subrouter/usage-status` returns account usage data. `sr server status <name>` uses `?refresh=1` to check current provider usage for the stored accounts, including after a previously cached telemetry 429. Use `?snapshot=1` for a read-only historical controller snapshot without another provider usage sweep.
 
 For servers that listen on a non-loopback address, set an admin token before exposing account, session, dashboard, or transcript endpoints:
 

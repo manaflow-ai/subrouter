@@ -1315,6 +1315,7 @@ func (r *AccountRef) ReloadSnapshot() ([]accounts.Account, uint64, error) {
 		return nil, 0, err
 	}
 	r.mu.Lock()
+	previous := append([]accounts.Account(nil), r.accounts...)
 	r.accounts = append([]accounts.Account(nil), loaded...)
 	r.accountGeneration++
 	r.credentialRevision++
@@ -1322,6 +1323,7 @@ func (r *AccountRef) ReloadSnapshot() ([]accounts.Account, uint64, error) {
 	generation := r.accountGeneration
 	out := append([]accounts.Account(nil), loaded...)
 	r.mu.Unlock()
+	r.invalidateReplacedAccountUsage(previous, loaded)
 	r.invalidateUsageStatusSnapshotPersistence()
 	return out, generation, nil
 }
@@ -1551,6 +1553,50 @@ func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
 	}
 }
 
+// UsageStatusesFresh starts a live status sweep for an explicit user request.
+// A sweep already in progress is shared instead of being invalidated and
+// restarted, so concurrent `sr status` callers cannot stampede the provider.
+func (r *AccountRef) UsageStatusesFresh(ctx context.Context) []AccountUsageStatus {
+	if r == nil {
+		return nil
+	}
+	r.usageStatusMu.Lock()
+	sweep := r.usageStatusSweep
+	if sweep == nil {
+		r.usageStatusAt = time.Time{}
+		r.usageStatusCache = nil
+		r.usageStatusEpoch++
+		// The status lock is held while clearing the per-account observation so
+		// the sweep cannot start between invalidation and the live request.
+		r.usageWindowsMu.Lock()
+		staleAt := time.Now().Add(-usageWindowsTTL - time.Second)
+		for key, entry := range r.usageWindows {
+			// Force the next read to contact the provider, but retain the last
+			// windows so a transient 429 can still render reset metadata.
+			entry.at = staleAt
+			r.usageWindows[key] = entry
+		}
+		r.usageWindowsLatest = nil
+		r.usageWindowsFailures = nil
+		r.usageWindowsEpoch++
+		r.usageWindowsMu.Unlock()
+		sweep = &usageStatusSweep{done: make(chan struct{}), epoch: r.usageStatusEpoch}
+		r.usageStatusSweep = sweep
+		sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageStatusSweepTimeout)
+		go func() {
+			defer cancel()
+			r.runUsageStatusSweep(sweepCtx, sweep)
+		}()
+	}
+	r.usageStatusMu.Unlock()
+	select {
+	case <-sweep.done:
+		return append([]AccountUsageStatus(nil), sweep.result...)
+	case <-ctx.Done():
+		return nil
+	}
+}
+
 // UsageStatusSnapshot returns the most recent usage sweep without starting a
 // provider request. Status is an observation of the controller's last known
 // state, while routing refreshes remain responsible for deciding when to fetch
@@ -1643,11 +1689,33 @@ func (r *AccountRef) RefreshUsageStatusSnapshotFromWindows(scores ...selectacct.
 			continue
 		}
 		row.Provider = provider
-		row.Windows = append([]accounts.UsageWindow(nil), entry.windows...)
+		// A score refresh can observe only Claude's model-specific buckets
+		// (the supplemental probe deliberately caches those separately). Keep
+		// account-wide 5h/7d and other previously observed buckets when a newer
+		// partial observation arrives, while letting matching keys from the new
+		// observation replace the old values. This prevents a feature-only
+		// refresh from erasing the reset windows sr status needs to display.
+		mergedWindows := append([]accounts.UsageWindow(nil), entry.windows...)
+		if len(row.Windows) > 0 && len(entry.windows) > 0 {
+			mergedWindows = mergeUsageWindows(row.Windows, entry.windows)
+		}
+		row.Windows = mergedWindows
 		row.UsageFresh = true
-		row.UsageFetchedAt = entry.at
-		row.QuotaUsageKnown = len(entry.windows) > 0
-		row.ExtraUsage = extraUsageFromWindows(entry.windows)
+		// One timestamp describes the account-wide reset cells rendered by
+		// sr status. A feature-only refresh must not re-anchor older relative
+		// reset durations as if the account-wide endpoint had just answered.
+		accountWideObserved := false
+		for _, window := range entry.windows {
+			if window.Feature == "" && window.ExtraUsage == nil {
+				accountWideObserved = true
+				break
+			}
+		}
+		if accountWideObserved || row.UsageFetchedAt.IsZero() {
+			row.UsageFetchedAt = entry.at
+		}
+		row.QuotaUsageKnown = len(mergedWindows) > 0
+		row.ExtraUsage = extraUsageFromWindows(mergedWindows)
 		row.Error = ""
 		rows[idx] = row
 	}
@@ -1703,6 +1771,11 @@ func (r *AccountRef) runUsageStatusSweep(ctx context.Context, sweep *usageStatus
 // snapshots and caches the sweep unless the cache was invalidated while it
 // ran. Callers hold usageStatusMu.
 func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch uint64) []AccountUsageStatus {
+	// A superseded sweep may finish after a newer refresh. Let its callers
+	// receive their results without publishing old quota history.
+	if epoch != r.usageStatusEpoch {
+		return out
+	}
 	now := time.Now()
 	if r.lastGoodUsage == nil {
 		r.lastGoodUsage = map[string]usageStatusSnapshot{}
@@ -1776,10 +1849,8 @@ func (r *AccountRef) InvalidateUsageStatusCache() {
 	r.usageStatusSweep = nil
 }
 
-// InvalidateUsageWindowsCache drops per-account usage windows as well as the
-// aggregate status snapshot. Interactive `sr status` calls use this so a
-// refresh really reaches the provider instead of reusing the two-minute
-// scheduler cache.
+// InvalidateUsageWindowsCache drops cached quota windows, including model
+// supplements, while retaining the normal background 429 failure cache.
 func (r *AccountRef) InvalidateUsageWindowsCache() {
 	if r == nil {
 		return
@@ -2025,7 +2096,10 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	// account. Status latency must stay bounded as pools grow; entries that do
 	// not acquire a slot retain the identity/status seeded below and are retried
 	// by the next sweep instead of extending this request by another batch.
-	sweepCtx, cancelSweep := context.WithTimeout(ctx, usageStatusFetchTimeout)
+	// The status sweep covers all accounts. The short score-fetch deadline
+	// previously expired before many profiles even reached the provider.
+	// An interactive status check gets the full status-sweep budget.
+	sweepCtx, cancelSweep := context.WithTimeout(ctx, usageStatusSweepTimeout)
 	defer cancelSweep()
 	var wg sync.WaitGroup
 	width := accountFetchConcurrencyFor(len(storedAccounts) + len(claudeProfiles))
@@ -2989,15 +3063,6 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			// generation published by another worker before serving cached rows.
 			s.accountListSnapshotContext(r.Context())
 		}
-		// Interactive status commands opt into a live sweep. Background clients
-		// keep the short shared cache so a dashboard cannot stampede providers.
-		if r.URL.Query().Get("refresh") == "1" && !snapshotOnly {
-			s.AccountRef.InvalidateUsageStatusCache()
-			// Keep the per-account window cache and its credential-scoped
-			// throttle deadlines. A manual status refresh should reassemble the
-			// rows, but must not turn every `sr status` into another burst of
-			// provider quota requests after a 401/429.
-		}
 		var statuses []AccountUsageStatus
 		if snapshotOnly {
 			var cached bool
@@ -3012,7 +3077,11 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			if s.SchedulerRef != nil {
 				scoreRevision = s.SchedulerRef.ScoreRevision()
 			}
-			statuses = s.AccountRef.UsageStatuses(r.Context())
+			if r.URL.Query().Get("refresh") == "1" {
+				statuses = s.AccountRef.UsageStatusesFresh(r.Context())
+			} else {
+				statuses = s.AccountRef.UsageStatuses(r.Context())
+			}
 			if s.SchedulerRef != nil {
 				loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
 				s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, SchedulerAccounts(loaded))
@@ -7052,13 +7121,38 @@ func (s Server) markAccountExhaustedFromResponseForAccount(account accounts.Acco
 		)
 		return
 	}
-	if claudeResponseCooksWeeklyWindow(header) {
-		// Only weekly-cooked evidence may authorize paid fallback later; a
-		// session-level rejection leaves WeeklyHeadroom intact.
-		s.SchedulerRef.MarkWeeklyExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, poolKey, claudeExhaustionExpiry(header, time.Now()))
+	if account.Provider == accounts.ProviderClaude &&
+		claudeRejectionIsExplicitlyAccountWide(status, header) {
+		// A rejected 5h/7d window applies to every Claude model family.
+		// Do not leave an apparently healthy sibling pool selectable, but keep
+		// a later model-specific reset from extending the account-wide hold.
+		now := time.Now()
+		accountResetAt := claudeExhaustionExpiryForPool(header, now, "")
+		poolResetAt := claudeExhaustionExpiryForPool(header, now, poolKey)
+		if claudeResponseCooksWeeklyWindow(header) {
+			s.SchedulerRef.MarkWeeklyExhaustedUntil(
+				schedulerAccountProvider(account.Provider), account.ID, "", accountResetAt,
+			)
+		} else {
+			s.SchedulerRef.MarkExhaustedUntil(
+				schedulerAccountProvider(account.Provider), account.ID, "", accountResetAt,
+			)
+		}
+		if poolKey != "" && poolResetAt.After(accountResetAt) {
+			s.SchedulerRef.MarkExhaustedUntil(
+				schedulerAccountProvider(account.Provider), account.ID, poolKey, poolResetAt,
+			)
+		}
 		return
 	}
-	s.SchedulerRef.MarkExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, poolKey, claudeExhaustionExpiry(header, time.Now()))
+	resetAt := claudeExhaustionExpiryForPool(header, time.Now(), poolKey)
+	if claudeResponseCooksWeeklyWindow(header) {
+		// Only confirmed account-wide weekly exhaustion authorizes the paid
+		// fallback; an isolated Fable/Opus/Sonnet quota is model-scoped.
+		s.SchedulerRef.MarkWeeklyExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, poolKey, resetAt)
+		return
+	}
+	s.SchedulerRef.MarkExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, poolKey, resetAt)
 }
 
 // claudeResponseCooksWeeklyWindow reports that the rejected response proves
@@ -7070,7 +7164,11 @@ func claudeResponseCooksWeeklyWindow(header http.Header) bool {
 		return true
 	}
 	if raw := strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-7d-utilization")); raw != "" {
-		if utilization, err := strconv.ParseFloat(raw, 64); err == nil && utilization >= 1 {
+		// The ordinary provider header is fractional (1 means fully used),
+		// while some compatible gateways use percentages (100 means fully
+		// used). A raw 81 is 81%, not 8100%: it must never cook the weekly
+		// pool or authorize fallback spending.
+		if utilization, err := strconv.ParseFloat(raw, 64); err == nil && (utilization == 1 || utilization == 100) {
 			return true
 		}
 	}
@@ -7136,14 +7234,60 @@ func (s Server) markAccountExhaustedRefreshFailure(account accounts.Account, err
 // Clamped to [now+1m, now+8d]: the floor guards clock skew / already-passed
 // resets, the ceiling guards a nonsense far-future header pinning an account
 // out forever.
+// claudeExhaustionExpiry keeps the account-wide legacy behavior for callers
+// without a request model (for example a broker lease report).
 func claudeExhaustionExpiry(header http.Header, now time.Time) time.Time {
-	until := now.Add(selectacct.DefaultExhaustedTTL)
-	if raw := strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-reset")); raw != "" {
-		if epoch, err := strconv.ParseInt(raw, 10, 64); err == nil && epoch > 0 {
-			until = time.Unix(epoch, 0)
+	return claudeExhaustionExpiryForPool(header, now, "")
+}
+
+// claudeExhaustionExpiryForPool uses the reset of the *binding rejected*
+// quota windows, rather than an arbitrary cooldown. Account-wide 5h and 7d
+// windows always bind. Model-specific windows only bind matching requests.
+// When two windows reject, the later reset wins: both must recover.
+// Aggregate reset and Retry-After remain fallbacks when the per-window
+// headers are absent.
+func claudeExhaustionExpiryForPool(header http.Header, now time.Time, poolModel string) time.Time {
+	until := time.Time{}
+	observe := func(raw string) {
+		if seconds, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64); err == nil && seconds > 0 {
+			candidate := time.Unix(seconds, 0)
+			if candidate.After(until) {
+				until = candidate
+			}
 		}
-	} else if retryAt := parseRetryAfter(strings.TrimSpace(claudeHeaderGet(header, "Retry-After")), now); !retryAt.IsZero() {
+	}
+	prefixes := []string{"5h", "7d"}
+	if prefix := claudeQuotaWindowPrefixForPool(poolModel); prefix != "" {
+		prefixes = append(prefixes, prefix)
+	}
+	windowResetKnown := false
+	windowResetMissing := false
+	relevantRejection := false
+	for _, prefix := range prefixes {
+		if !strings.EqualFold(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-"+prefix+"-status")), "rejected") {
+			continue
+		}
+		relevantRejection = true
+		raw := strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-"+prefix+"-reset"))
+		if epoch, err := strconv.ParseInt(raw, 10, 64); err == nil && epoch > 0 {
+			observe(raw)
+			windowResetKnown = true
+		} else {
+			windowResetMissing = true
+		}
+	}
+	// Aggregate reset may refer to a completely different, healthy window.
+	// Only use it when the rejected binding windows did not supply every
+	// reset time; otherwise it could hold a recovered model unnecessarily.
+	if (!windowResetKnown || windowResetMissing) &&
+		(poolModel == "" || relevantRejection || claudeUnifiedStatus(header) == "rejected") {
+		observe(claudeHeaderGet(header, "anthropic-ratelimit-unified-reset"))
+	}
+	if retryAt := parseRetryAfter(strings.TrimSpace(claudeHeaderGet(header, "Retry-After")), now); retryAt.After(until) {
 		until = retryAt
+	}
+	if until.IsZero() {
+		until = now.Add(selectacct.DefaultExhaustedTTL)
 	}
 	if min := now.Add(time.Minute); until.Before(min) {
 		return min
@@ -7603,13 +7747,13 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 	// account is depleted (served via overage) and Claude Code hard-blocks the
 	// user on that header even though the request "succeeded".
 	claudeUnusable := provider == accounts.ProviderClaude && accountID != "" &&
-		(claudeAccountUnusableStatus(response.StatusCode) || claudeResponseRejected(response.Header))
+		(claudeAccountUnusableStatus(response.StatusCode) || claudeResponseRejectedForPool(response.Header, poolModel))
 	if claudeUnusable {
 		// Only poison the routing score when the account is genuinely out of
 		// quota (401, a 429 the upstream marks "rejected", or any response with
 		// the rejected header). A transient "allowed"/"allowed_warning" 429 still
 		// fails over for this request but must not mark a healthy account exhausted.
-		if claudeAccountExhaustedByResponse(response.StatusCode, response.Header) {
+		if claudeAccountExhaustedByResponseForPool(response.StatusCode, response.Header, poolModel) {
 			s.markAccountExhaustedFromResponseForAccount(account, poolModel, response.StatusCode, response.Header)
 		}
 		// Surface the genuine upstream rate-limit signal (headers now, body
@@ -9590,8 +9734,8 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 		// 200, but Claude Code reads anthropic-ratelimit-unified-status=rejected
 		// and hard-blocks the user, so a 200 from a rejected account is unusable
 		// from the client's view and must be rerouted to a healthy account.
-		limited = claudeAccountUnusableStatus(response.StatusCode) || claudeResponseRejected(response.Header)
-		return limited, limited && claudeAccountExhaustedByResponse(response.StatusCode, response.Header),
+		limited = claudeAccountUnusableStatus(response.StatusCode) || claudeResponseRejectedForPool(response.Header, t.poolModel)
+		return limited, limited && claudeAccountExhaustedByResponseForPool(response.StatusCode, response.Header, t.poolModel),
 			response.StatusCode == http.StatusUnauthorized, nil
 	}
 	if response == nil {
@@ -9916,6 +10060,49 @@ func claudeResponseRejected(header http.Header) bool {
 	return false
 }
 
+// claudeQuotaWindowPrefixForPool maps the requested Claude model family to
+// exactly one optional weekly quota window. Versioned models, aliases and
+// extended-context names are normalized by the existing pool classifier.
+func claudeQuotaWindowPrefixForPool(poolModel string) string {
+	switch claudePoolModel(poolModel) {
+	case agentclaude.FableFeature:
+		return "7d_oi"
+	case agentclaude.OpusFeature:
+		return "7d_opus"
+	case agentclaude.SonnetFeature:
+		return "7d_sonnet"
+	default:
+		return ""
+	}
+}
+
+// claudeResponseRejectedForPool never treats a *different model family's*
+// rejected weekly bucket as failure of this request. In contrast, the
+// account-wide windows and aggregate rejection always apply to the request.
+// Provider status 429 is handled separately by claudeAccountUnusableStatus.
+func claudeResponseRejectedForPool(header http.Header, poolModel string) bool {
+	if claudeUnifiedStatus(header) == "rejected" {
+		return true
+	}
+	for _, prefix := range []string{"5h", "7d"} {
+		if strings.EqualFold(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-"+prefix+"-status")), "rejected") {
+			return true
+		}
+	}
+	prefix := claudeQuotaWindowPrefixForPool(poolModel)
+	return prefix != "" && strings.EqualFold(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-"+prefix+"-status")), "rejected")
+}
+
+// A model-specific 429 should quarantine the affected model pool until its
+// actual reset, without exhausting unrelated Claude model families. The
+// original model-blind classifier is preserved for legacy callers and tests.
+func claudeAccountExhaustedByResponseForPool(status int, header http.Header, poolModel string) bool {
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return true
+	}
+	return claudeResponseRejectedForPool(header, poolModel)
+}
+
 func claudeHeaderGet(header http.Header, key string) string {
 	if header == nil {
 		return ""
@@ -10089,7 +10276,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// A 200 SSE stream whose first decisive event is overloaded_error is the
 		// same overload arriving after the headers; nothing has reached the
 		// client yet, so it is retried exactly like a 529.
-		claudeOverload := t.provider == accounts.ProviderClaude && !claudeResponseRejected(response.Header) &&
+		claudeOverload := t.provider == accounts.ProviderClaude && !claudeResponseRejectedForPool(response.Header, t.poolModel) &&
 			(claudeOverloadStatus(response.StatusCode) || claudeStreamOverloaded(response))
 		kimiOverload := t.provider == accounts.ProviderKimi && response.StatusCode == http.StatusTooManyRequests
 		if claudeOverload || kimiOverload {
@@ -10186,7 +10373,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// response only after the pool-wide fallback guard proves every ordinary
 		// subscription is cooked and this account has enabled, positive balance.
 		if t.provider == accounts.ProviderClaude && response.StatusCode >= 200 && response.StatusCode < 300 &&
-			claudeResponseRejected(response.Header) &&
+			claudeResponseRejectedForPool(response.Header, t.poolModel) &&
 			strings.EqualFold(strings.TrimSpace(claudeHeaderGet(response.Header, "Anthropic-Ratelimit-Unified-Overage-In-Use")), "true") &&
 			t.server != nil && t.server.claudeExtraUsageResponseAllowed(req.Context(), accountID, t.poolModel) {
 			response.Header.Set("Anthropic-Ratelimit-Unified-Status", "allowed")
@@ -10296,7 +10483,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.logClaudeUnusableResponse(response, accountID)
 			// Only poison the score on genuine quota exhaustion; a transient
 			// "allowed"/"allowed_warning" 429 still fails over for this request.
-			exhausted = claudeAccountExhaustedByResponse(response.StatusCode, response.Header)
+			exhausted = claudeAccountExhaustedByResponseForPool(response.StatusCode, response.Header, t.poolModel)
 			if exhausted && claudeRejectionIsExplicitlyAccountWide(response.StatusCode, response.Header) {
 				// Account-wide Claude windows apply across every model pool. The
 				// direct retry path sees the headers before passive response

@@ -49,8 +49,8 @@ func TestServerUsageRowsTreatHeaderlessThrottleAsUsableWithoutQuotaEvidence(t *t
 	if !usableForNewSession(rows[0].score) {
 		t.Fatalf("headerless telemetry throttle should remain score-eligible: %+v", rows[0])
 	}
-	if got := compactPickReason(rows[0]); got != "quota pending" {
-		t.Fatalf("Use = %q, want quota pending", got)
+	if got := compactPickReason(rows[0]); got != "usage throttled" {
+		t.Fatalf("Use = %q, want usage throttled", got)
 	}
 }
 
