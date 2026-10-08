@@ -5183,6 +5183,33 @@ func TestAntigravityLegacyModelQuotaUseDoesNotClaimBaseHundredPercent(t *testing
 	}
 }
 
+func TestCompactPickReasonUsesCachedWindowsWhenUsageRefreshFails(t *testing.T) {
+	row := srUsageRow{
+		provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth,
+		err: errors.New("usage fetch failed: 429 Too Many Requests"),
+		windows: []accounts.UsageWindow{{
+			Name: "5h", UsedPercent: 26, ResetAfterSeconds: 3600,
+		}},
+		score: selectacct.Score{
+			AccountID: "claude@example.com", Headroom: .74, ShortHeadroom: .74,
+			ShortResetAfterSeconds: 3600,
+		},
+	}
+	if got := compactPickReason(row); got != "74% left, session reset 1h" {
+		t.Fatalf("cached quota Use = %q, want reset-aware value", got)
+	}
+}
+
+func TestCompactPickReasonKeepsUnavailableWithoutCachedWindows(t *testing.T) {
+	row := srUsageRow{
+		provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth,
+		err: errors.New("usage fetch failed: 429 Too Many Requests"),
+	}
+	if got := compactPickReason(row); got != "usage unavailable" {
+		t.Fatalf("missing quota Use = %q, want usage unavailable", got)
+	}
+}
+
 func TestAntigravityUnknownModelQuotaDoesNotPrintPlaceholderLabel(t *testing.T) {
 	row := srUsageRow{
 		provider: accounts.ProviderAntigravity, authMode: accounts.AuthModeOAuth,
