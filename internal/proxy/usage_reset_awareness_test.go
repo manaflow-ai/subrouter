@@ -73,6 +73,12 @@ func TestKnownExhaustedQuotaSuppressesBackgroundUsageFetch(t *testing.T) {
 	if got := transport.count(account.Token); got != 0 {
 		t.Fatalf("known-exhausted subscription triggered %d unnecessary upstream requests", got)
 	}
+	// A re-login/account generation change invalidates measured scores.
+	// Old quota clocks must not suppress fresh credential verification.
+	server.SchedulerRef.SetUpdatedAt(time.Time{})
+	if _, blocked := server.allOAuthAccountsWaitingForReset(time.Now()); blocked {
+		t.Fatal("invalidated score generation retained its old provider reset hold")
+	}
 }
 
 func TestKnownExhaustionDoesNotStarveOtherHealthyAccounts(t *testing.T) {
