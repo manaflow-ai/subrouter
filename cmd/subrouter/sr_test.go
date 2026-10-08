@@ -3960,6 +3960,51 @@ func TestSRRankRowsGroupsProvidersSeparately(t *testing.T) {
 	}
 }
 
+func TestSRRankRowsMovesClaudeTelemetryThrottlesToBottom(t *testing.T) {
+	rows := []srUsageRow{
+		{
+			email: "throttled@example.com", provider: accounts.ProviderClaude,
+			authMode: accounts.AuthModeOAuth, usageThrottled: true,
+			score: selectacct.Score{AccountID: "throttled@example.com", Headroom: 1, ShortHeadroom: 1},
+		},
+		{
+			email: "healthy@example.com", provider: accounts.ProviderClaude,
+			authMode: accounts.AuthModeOAuth,
+			score:    selectacct.Score{AccountID: "healthy@example.com", Headroom: 0.5, ShortHeadroom: 0.5},
+		},
+	}
+
+	rankUsageRows(rows)
+	got := []string{rows[0].email, rows[1].email}
+	want := []string{"healthy@example.com", "throttled@example.com"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ranked rows = %#v, want %#v", got, want)
+	}
+}
+
+func TestSRRankRowsMovesReauthRowsToLowSignalGroup(t *testing.T) {
+	rows := []srUsageRow{
+		{
+			email: "needs-reauth@example.com", provider: accounts.ProviderCodex,
+			authMode: accounts.AuthModeOAuth, err: errors.New("401 Unauthorized"),
+			score: selectacct.Score{AccountID: "needs-reauth@example.com", Headroom: 1, ShortHeadroom: 1},
+		},
+		{
+			email: "healthy@example.com", provider: accounts.ProviderCodex,
+			authMode: accounts.AuthModeOAuth,
+			score:    selectacct.Score{AccountID: "healthy@example.com", Headroom: 0.5, ShortHeadroom: 0.5},
+		},
+	}
+
+	rankUsageRows(rows)
+	if rows[0].email != "healthy@example.com" || rows[1].email != "needs-reauth@example.com" {
+		t.Fatalf("ranked rows = %#v, want healthy then reauth", rows)
+	}
+	if usageRowStatusTier(rows[1]) != usageRowStatusTier((srUsageRow{usageThrottled: true})) {
+		t.Fatal("reauth and telemetry-throttled rows should share the low-signal tier")
+	}
+}
+
 func TestScoreFromWindowsUsesAllDisplayedRateLimits(t *testing.T) {
 	score := scoreFromWindows("a@example.com", []accounts.UsageWindow{
 		{Name: "primary", UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64((3 * time.Hour) / time.Second)},
@@ -4056,7 +4101,7 @@ func TestUsageRowStaleAgeUsesProviderObservationTime(t *testing.T) {
 	}
 }
 
-func TestDisplayUsageRowsCallsOutStaleUsage(t *testing.T) {
+func TestDisplayUsageRowsDoesNotPrintStaleUsageNote(t *testing.T) {
 	var out bytes.Buffer
 	displayUsageRows(&out, []srUsageRow{{
 		displayAccount: "stale@example.com",
@@ -4067,8 +4112,8 @@ func TestDisplayUsageRowsCallsOutStaleUsage(t *testing.T) {
 			Name: "primary", UsedPercent: 50, LimitWindowSeconds: 7 * 24 * 60 * 60,
 		}},
 	}}, false)
-	if got := out.String(); !strings.Contains(got, "usage last fetched 3m ago; showing last known values") {
-		t.Fatalf("stale usage note missing:\n%s", got)
+	if got := out.String(); strings.Contains(got, "usage last fetched") || strings.Contains(got, "showing last known values") {
+		t.Fatalf("stale usage note should be omitted:\n%s", got)
 	}
 }
 
@@ -5205,8 +5250,8 @@ func TestCompactPickReasonKeepsUnavailableWithoutCachedWindows(t *testing.T) {
 		provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth,
 		err: errors.New("usage fetch failed: 429 Too Many Requests"),
 	}
-	if got := compactPickReason(row); got != "quota pending" {
-		t.Fatalf("missing quota Use = %q, want quota pending", got)
+	if got := compactPickReason(row); got != "usage throttled" {
+		t.Fatalf("missing quota Use = %q, want usage throttled", got)
 	}
 }
 

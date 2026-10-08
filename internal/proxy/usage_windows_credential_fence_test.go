@@ -201,3 +201,29 @@ func TestSupersededUsage429CannotThrottleRepairedCredential(t *testing.T) {
 		t.Fatalf("provider calls=%d, want 3 without spurious retries", got)
 	}
 }
+
+func TestUsageThrottleSameAccessTokenWithRepairedGrant(t *testing.T) {
+	// A failed quota check belongs to the complete OAuth grant. Repairing
+	// only the refresh grant must allow one fresh check immediately.
+	transport := &countingTransport{}
+	transport.responses = func() *http.Response {
+		if transport.calls == 1 {
+			return claudeUsage429()
+		}
+		return codexUsageResponseForTest(30)
+	}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	old := usageCredentialForTest("same-access-token", "rejected-grant")
+	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, old); err == nil {
+		t.Fatal("first credential should receive the upstream throttle")
+	}
+	repaired := usageCredentialForTest("same-access-token", "repaired-grant")
+	windows, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, repaired)
+	if err != nil || !fresh || len(windows) != 1 || windows[0].UsedPercent != 30 {
+		t.Fatalf("new grant inherited old throttle: windows=%+v fresh=%t err=%v", windows, fresh, err)
+	}
+	if transport.calls != 2 {
+		t.Fatalf("expected one quota check per distinct grant, got %d", transport.calls)
+	}
+}
