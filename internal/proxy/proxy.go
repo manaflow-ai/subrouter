@@ -451,10 +451,11 @@ type AccountRef struct {
 	qwenConsoleRoot                    string
 	apiKeyUpstreams                    map[accounts.Provider]string
 
-	usageStatusMu    sync.Mutex
-	usageStatusCache []AccountUsageStatus
-	usageStatusAt    time.Time
-	lastGoodUsage    map[string]usageStatusSnapshot
+	usageStatusMu        sync.Mutex
+	usageStatusPersistMu sync.Mutex
+	usageStatusCache     []AccountUsageStatus
+	usageStatusAt        time.Time
+	lastGoodUsage        map[string]usageStatusSnapshot
 	// usageStatusSweep is the in-flight live sweep concurrent callers join;
 	// usageStatusEpoch advances on invalidation so a sweep that started
 	// before it is not cached.
@@ -464,6 +465,7 @@ type AccountRef struct {
 	usageWindowsMu       sync.Mutex
 	usageWindows         map[string]usageWindowsEntry
 	usageWindowsFlights  map[string]*usageWindowsFlight
+	usageWindowsLatest   map[string]string
 	usageWindowsFailures map[string]usageWindowsFailure
 	claudeSupplemental   map[string]claudeSupplementalUsage
 	usageWindowsEpoch    uint64
@@ -618,6 +620,10 @@ type usageWindowsEntry struct {
 	windows           []accounts.UsageWindow
 	at                time.Time
 	supplementalFresh bool
+	// credentialKey binds an observation to the credential that produced it.
+	// Account IDs survive re-login, so ID-only quota data cannot cross a
+	// credential rotation.
+	credentialKey string
 }
 
 // A temporary upstream usage throttle has a short-lived, credential-scoped
@@ -627,6 +633,10 @@ type usageWindowsFailure struct {
 	err     error
 	at      time.Time
 	retryAt time.Time
+	// windows preserve provider-supplied reset metadata across the throttle
+	// cache window so repeated status reads remain display-only.
+	windows   []accounts.UsageWindow
+	fetchedAt time.Time
 }
 
 // Used only if a provider reports 429 without a typed retry deadline.
@@ -755,7 +765,7 @@ func (r *AccountRef) credentialSnapshot(provider accounts.Provider, id string) a
 // windows as a confident exhaustion signal: stale cooked data was overwriting
 // healthy accounts' scores and routing traffic to dead accounts.
 func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, error) {
-	windows, fresh, _, err := r.FetchUsageWindowsCachedWithObservation(ctx, client, account)
+	windows, fresh, _, _, err := r.FetchUsageWindowsCachedWithObservation(ctx, client, account)
 	return windows, fresh, err
 }
 
@@ -763,41 +773,50 @@ func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.C
 // provider observation time represented by the returned windows. The time is
 // captured with the same cache/flight result, so a concurrent refresh cannot
 // pair old windows with an unrelated timestamp.
-func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, time.Time, error) {
+func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, time.Time, bool, error) {
 	if r == nil {
 		windows, err := fetchAccountUsageWindowsLive(ctx, client, account)
 		if err != nil {
-			return windows, false, time.Time{}, err
+			return windows, false, time.Time{}, false, err
 		}
-		return windows, true, time.Now().UTC(), nil
+		return windows, true, time.Now().UTC(), false, nil
 	}
 	key := account.ID + "\x00" + string(account.Provider)
-	failureKey := usageWindowsFailureKey(key, account.Token)
+	credentialKey := usageWindowsCredentialKey(account)
+	failureKey := usageWindowsFailureKey(key, account.CredentialIdentity())
 	now := time.Now()
 	r.usageWindowsMu.Lock()
 	entry, ok := r.usageWindows[key]
+	entryMatchesCredential := ok && (entry.credentialKey == "" || entry.credentialKey == credentialKey)
 	failure, throttled := r.usageWindowsFailures[failureKey]
 	r.usageWindowsMu.Unlock()
-	if ok && now.Sub(entry.at) < usageWindowsTTL {
-		return append([]accounts.UsageWindow(nil), entry.windows...), entry.supplementalFresh, entry.at, nil
+	if entryMatchesCredential && now.Sub(entry.at) < usageWindowsTTL {
+		return append([]accounts.UsageWindow(nil), entry.windows...), entry.supplementalFresh, entry.at, false, nil
 	}
 	// A quota-status poll should never turn one upstream 429 into a storm of
 	// identical follow-up 429s. No waiting: serve last-good or return the
 	// already-known failure. Actual model requests use their normal route.
 	if throttled && now.Before(failure.retryAt) {
-		if ok && now.Sub(entry.at) < usageWindowsLastGoodTTL {
-			return append([]accounts.UsageWindow(nil), entry.windows...), false, entry.at, nil
+		if entryMatchesCredential && now.Sub(entry.at) < usageWindowsLastGoodTTL {
+			return append([]accounts.UsageWindow(nil), entry.windows...), false, entry.at, true, nil
 		}
-		return nil, false, time.Time{}, failure.err
+		if len(failure.windows) > 0 {
+			return append([]accounts.UsageWindow(nil), failure.windows...), false, failure.fetchedAt, true, nil
+		}
+		return nil, false, time.Time{}, true, failure.err
 	}
 	windows, supplementalFresh, fetchedAt, err := r.fetchUsageWindowsShared(ctx, client, account, key)
 	if err == nil {
-		return windows, supplementalFresh, fetchedAt, nil
+		r.usageWindowsMu.Lock()
+		failure, throttled = r.usageWindowsFailures[failureKey]
+		throttleActive := throttled && now.Before(failure.retryAt)
+		r.usageWindowsMu.Unlock()
+		return windows, supplementalFresh, fetchedAt, throttleActive, nil
 	}
-	if !authLikeUsageError(err.Error()) && ok && now.Sub(entry.at) < usageWindowsLastGoodTTL {
-		return append([]accounts.UsageWindow(nil), entry.windows...), false, entry.at, nil
+	if !authLikeUsageError(err.Error()) && entryMatchesCredential && now.Sub(entry.at) < usageWindowsLastGoodTTL {
+		return append([]accounts.UsageWindow(nil), entry.windows...), false, entry.at, throttled && now.Before(failure.retryAt), nil
 	}
-	return nil, false, time.Time{}, err
+	return nil, false, time.Time{}, throttled && now.Before(failure.retryAt), err
 }
 
 // usageWindowsFlight is one in-flight upstream usage fetch shared by every
@@ -819,24 +838,36 @@ type usageWindowsFlight struct {
 // it, bounded by usageStatusFetchTimeout, so that caller disconnecting does
 // not fail every other waiter. Each caller still stops waiting when its own
 // context ends.
-func usageWindowsFailureKey(cacheKey, token string) string {
-	tokenHash := sha256.Sum256([]byte(token))
-	return cacheKey + "\x00" + hex.EncodeToString(tokenHash[:])
+func usageWindowsFailureKey(cacheKey, credential string) string {
+	credentialHash := sha256.Sum256([]byte(credential))
+	return cacheKey + "\x00" + hex.EncodeToString(credentialHash[:])
+}
+
+// CredentialVersion changes when only the refresh grant is repaired. Hashing
+// it keeps usage failures credential-scoped without retaining the secret.
+func usageWindowsCredentialKey(account accounts.Account) string {
+	fingerprint := sha256.Sum256([]byte(account.CredentialIdentity()))
+	return hex.EncodeToString(fingerprint[:])
 }
 
 func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.Client, account accounts.Account, cacheKey string) ([]accounts.UsageWindow, bool, time.Time, error) {
-	tokenHash := sha256.Sum256([]byte(account.Token))
+	credentialKey := usageWindowsCredentialKey(account)
 	r.usageWindowsMu.Lock()
 	epoch := r.usageWindowsEpoch
-	flightKey := cacheKey + "\x00" + hex.EncodeToString(tokenHash[:]) + "\x00" + strconv.FormatUint(epoch, 10)
-	failureKey := usageWindowsFailureKey(cacheKey, account.Token)
+	flightKey := cacheKey + "\x00" + credentialKey + "\x00" + strconv.FormatUint(epoch, 10)
+	failureKey := usageWindowsFailureKey(cacheKey, account.CredentialIdentity())
 	flight, joined := r.usageWindowsFlights[flightKey]
 	if !joined {
 		// A completed flight can remove itself just before a concurrent caller
 		// reaches this point. Recheck the credential-scoped throttle while still
 		// holding the same lock so that caller cannot start a duplicate request.
 		if failure, throttled := r.usageWindowsFailures[failureKey]; throttled && time.Now().Before(failure.retryAt) {
+			windows := append([]accounts.UsageWindow(nil), failure.windows...)
+			fetchedAt := failure.fetchedAt
 			r.usageWindowsMu.Unlock()
+			if len(windows) > 0 {
+				return windows, false, fetchedAt, nil
+			}
 			return nil, false, time.Time{}, failure.err
 		}
 		flight = &usageWindowsFlight{done: make(chan struct{}), epoch: epoch}
@@ -844,6 +875,10 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 			r.usageWindowsFlights = map[string]*usageWindowsFlight{}
 		}
 		r.usageWindowsFlights[flightKey] = flight
+		if r.usageWindowsLatest == nil {
+			r.usageWindowsLatest = map[string]string{}
+		}
+		r.usageWindowsLatest[cacheKey] = flightKey
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageStatusFetchTimeout)
 		go func() {
 			defer cancel()
@@ -859,22 +894,35 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 						delete(r.usageWindowsFailures, key)
 					}
 				}
+				latest := r.usageWindowsLatest[cacheKey] == flightKey
 				if flight.err == nil {
 					flight.fetchedAt = time.Now().UTC()
-					if flight.epoch == r.usageWindowsEpoch {
+					if flight.epoch == r.usageWindowsEpoch && latest {
 						if r.usageWindows == nil {
 							r.usageWindows = map[string]usageWindowsEntry{}
 						}
-						r.usageWindows[cacheKey] = usageWindowsEntry{windows: append([]accounts.UsageWindow(nil), flight.windows...), at: flight.fetchedAt, supplementalFresh: flight.supplementalFresh}
+						r.usageWindows[cacheKey] = usageWindowsEntry{
+							windows: append([]accounts.UsageWindow(nil), flight.windows...), at: flight.fetchedAt,
+							supplementalFresh: flight.supplementalFresh, credentialKey: credentialKey,
+						}
+						delete(r.usageWindowsFailures, failureKey)
 					}
-					delete(r.usageWindowsFailures, failureKey)
-				} else if usageWindowsIsThrottle(flight.err) {
+				} else if usageWindowsIsThrottle(flight.err) && flight.epoch == r.usageWindowsEpoch && latest {
+					var throttle *agentclaude.UsageThrottleError
+					if errors.As(flight.err, &throttle) && len(throttle.Windows) > 0 {
+						flight.fetchedAt = time.Now().UTC()
+					}
 					if r.usageWindowsFailures == nil {
 						r.usageWindowsFailures = map[string]usageWindowsFailure{}
 					}
-					r.usageWindowsFailures[failureKey] = usageWindowsFailure{
+					failure := usageWindowsFailure{
 						err: flight.err, at: now, retryAt: usageWindowsThrottleUntil(flight.err, now),
 					}
+					if errors.As(flight.err, &throttle) && len(throttle.Windows) > 0 {
+						failure.windows = append([]accounts.UsageWindow(nil), throttle.Windows...)
+						failure.fetchedAt = flight.fetchedAt
+					}
+					r.usageWindowsFailures[failureKey] = failure
 				}
 				if r.usageWindowsFlights[flightKey] == flight {
 					delete(r.usageWindowsFlights, flightKey)
@@ -889,6 +937,13 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 	select {
 	case <-flight.done:
 		if flight.err != nil {
+			var throttle *agentclaude.UsageThrottleError
+			if errors.As(flight.err, &throttle) && len(throttle.Windows) > 0 {
+				// The provider supplied authoritative reset metadata on a
+				// throttled telemetry response. Publish it as stale evidence while
+				// retaining the credential-scoped failure cache.
+				return append([]accounts.UsageWindow(nil), throttle.Windows...), false, flight.fetchedAt, nil
+			}
 			return nil, false, time.Time{}, flight.err
 		}
 		return append([]accounts.UsageWindow(nil), flight.windows...), flight.supplementalFresh, flight.fetchedAt, nil
@@ -983,15 +1038,19 @@ type AccountStatus struct {
 
 type AccountUsageStatus struct {
 	AccountStatus
-	Active             bool                             `json:"active,omitempty"`
-	KeyFingerprint     string                           `json:"key_fingerprint,omitempty"`
-	AssignedSessions   int                              `json:"assigned_sessions,omitempty"`
-	SessionsKnown      bool                             `json:"sessions_known,omitempty"`
-	PlanType           string                           `json:"plan_type,omitempty"`
-	ProviderHealth     string                           `json:"provider_health,omitempty"`
-	ProviderModels     *int                             `json:"provider_models,omitempty"`
-	ProviderEndpoints  []string                         `json:"provider_endpoints,omitempty"`
-	QuotaStatus        string                           `json:"quota_status,omitempty"`
+	Active            bool     `json:"active,omitempty"`
+	KeyFingerprint    string   `json:"key_fingerprint,omitempty"`
+	AssignedSessions  int      `json:"assigned_sessions,omitempty"`
+	SessionsKnown     bool     `json:"sessions_known,omitempty"`
+	PlanType          string   `json:"plan_type,omitempty"`
+	ProviderHealth    string   `json:"provider_health,omitempty"`
+	ProviderModels    *int     `json:"provider_models,omitempty"`
+	ProviderEndpoints []string `json:"provider_endpoints,omitempty"`
+	QuotaStatus       string   `json:"quota_status,omitempty"`
+	// UsageThrottled means the provider's telemetry endpoint declined this
+	// observation with a transient 429. It says nothing about account quota and
+	// must never be used as a quota exhaustion decision.
+	UsageThrottled     bool                             `json:"usage_throttled,omitempty"`
 	AccountIdentity    string                           `json:"account_identity,omitempty"`
 	QuotaUsageKnown    bool                             `json:"quota_usage_known,omitempty"`
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
@@ -1044,11 +1103,13 @@ func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client
 	}
 	transactionLock, err := lockAccountImportTransaction(context.Background(), store.StoreDir())
 	if err != nil {
+		ref.restoreUsageStatusSnapshot()
 		return ref
 	}
 	defer transactionLock.Close()
 	diskGeneration, err := readAccountDiskGeneration(store.StoreDir())
 	if err != nil {
+		ref.restoreUsageStatusSnapshot()
 		return ref
 	}
 	// A generation marker means an HTTP import has occurred. Reload while the
@@ -1060,9 +1121,11 @@ func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client
 			ref.accounts = loaded
 			ref.diskGeneration = diskGeneration
 		}
+		ref.restoreUsageStatusSnapshot()
 		return ref
 	}
 	ref.diskGeneration = diskGeneration
+	ref.restoreUsageStatusSnapshot()
 	return ref
 }
 
@@ -1161,7 +1224,7 @@ func OpenAccountRefWithSources(ctx context.Context, store accounts.CodexStore, c
 	if err != nil {
 		return nil, err
 	}
-	return &AccountRef{
+	ref := &AccountRef{
 		accounts:        loaded,
 		diskGeneration:  diskGeneration,
 		store:           store,
@@ -1169,7 +1232,9 @@ func OpenAccountRefWithSources(ctx context.Context, store accounts.CodexStore, c
 		oauthSources:    configuredSources,
 		client:          client,
 		qwenConsoleRoot: agentqwen.ConsoleRootForStore(store),
-	}, nil
+	}
+	ref.restoreUsageStatusSnapshot()
+	return ref, nil
 }
 
 func loadAccountRefAccounts(store accounts.CodexStore, claudeStore agentclaude.Store, sources []OAuthAccountSource) ([]accounts.Account, error) {
@@ -1250,12 +1315,15 @@ func (r *AccountRef) ReloadSnapshot() ([]accounts.Account, uint64, error) {
 		return nil, 0, err
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.accounts = append([]accounts.Account(nil), loaded...)
 	r.accountGeneration++
 	r.credentialRevision++
 	r.diskGeneration = diskGeneration
-	return append([]accounts.Account(nil), loaded...), r.accountGeneration, nil
+	generation := r.accountGeneration
+	out := append([]accounts.Account(nil), loaded...)
+	r.mu.Unlock()
+	r.invalidateUsageStatusSnapshotPersistence()
+	return out, generation, nil
 }
 
 // claudeRefreshCandidate skips a previously rejected credential, but accepts
@@ -1529,8 +1597,8 @@ func (r *AccountRef) RefreshUsageStatusSnapshotFromWindows(scores ...selectacct.
 	filterFresh := len(scores) > 0
 
 	r.usageStatusMu.Lock()
-	defer r.usageStatusMu.Unlock()
 	if publishEpoch != r.usageStatusEpoch {
+		r.usageStatusMu.Unlock()
 		return
 	}
 	rows := append([]AccountUsageStatus(nil), r.usageStatusCache...)
@@ -1587,6 +1655,10 @@ func (r *AccountRef) RefreshUsageStatusSnapshotFromWindows(scores ...selectacct.
 		r.usageStatusCache = rows
 		r.usageStatusAt = time.Now()
 	}
+	r.usageStatusMu.Unlock()
+	if len(rows) > 0 {
+		r.persistUsageStatusSnapshot(rows)
+	}
 }
 
 // usageStatusSweep is one live status sweep shared by concurrent callers.
@@ -1618,8 +1690,13 @@ func (r *AccountRef) runUsageStatusSweep(ctx context.Context, sweep *usageStatus
 	}()
 	out := r.usageStatusesLive(ctx)
 	r.usageStatusMu.Lock()
-	defer r.usageStatusMu.Unlock()
 	sweep.result = r.mergeUsageStatusesLocked(out, sweep.epoch)
+	persist := sweep.epoch == r.usageStatusEpoch && len(sweep.result) > 0
+	result := append([]AccountUsageStatus(nil), sweep.result...)
+	r.usageStatusMu.Unlock()
+	if persist {
+		r.persistUsageStatusSnapshot(result)
+	}
 }
 
 // mergeUsageStatusesLocked backfills transient failures from last-known-good
@@ -1658,6 +1735,14 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 		}
 		snapshot, ok := r.lastGoodUsage[key]
 		if !ok || now.Sub(snapshot.at) > usageStatusLastGoodTTL {
+			if usageStatusThrottleError(status.Error) {
+				// A plain usage-endpoint 429 is a transient observation failure,
+				// not quota exhaustion or an authentication failure.
+				status.Error = ""
+				status.UsageThrottled = true
+				status.QuotaStatus = ""
+				out[i] = status
+			}
 			continue
 		}
 		restored := snapshot.status
@@ -1665,6 +1750,7 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 		restored.Refreshed = status.Refreshed
 		restored.Error = ""
 		restored.UsageFresh = false
+		restored.UsageThrottled = status.UsageThrottled
 		out[i] = restored
 	}
 	if epoch == r.usageStatusEpoch {
@@ -1700,6 +1786,7 @@ func (r *AccountRef) InvalidateUsageWindowsCache() {
 	}
 	r.usageWindowsMu.Lock()
 	r.usageWindows = nil
+	r.usageWindowsLatest = nil
 	r.claudeSupplemental = nil
 	// A manual status/cache refresh must not defeat the provider's explicit
 	// usage-endpoint Retry-After. The throttle cache is keyed by credential
@@ -1716,6 +1803,11 @@ func authLikeUsageError(message string) bool {
 		}
 	}
 	return false
+}
+
+func usageStatusThrottleError(message string) bool {
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "429") || strings.Contains(lower, "too many requests")
 }
 
 func apiKeyPlanType(provider accounts.Provider) string {
@@ -2095,7 +2187,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.AuthValid = true
 			next.PlanType = details.PlanType()
 			r.replace(account)
-			windows, fresh, fetchedAt, err := r.FetchUsageWindowsCachedWithObservation(sweepCtx, r.client, account)
+			windows, fresh, fetchedAt, throttled, err := r.FetchUsageWindowsCachedWithObservation(sweepCtx, r.client, account)
 			if err != nil {
 				next.Error = err.Error()
 				out[i] = next
@@ -2105,6 +2197,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.ExtraUsage = extraUsageFromWindows(windows)
 			next.UsageFresh = fresh
 			next.UsageFetchedAt = fetchedAt
+			next.UsageThrottled = throttled
 			if next.UsageFetchedAt.IsZero() && fresh {
 				next.UsageFetchedAt = time.Now().UTC()
 			}
@@ -2891,6 +2984,11 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.AccountRef != nil {
 		snapshotOnly := parseBoolParam(r, "snapshot")
+		if snapshotOnly {
+			// A snapshot read stays upstream-free, but still notices an account
+			// generation published by another worker before serving cached rows.
+			s.accountListSnapshotContext(r.Context())
+		}
 		// Interactive status commands opt into a live sweep. Background clients
 		// keep the short shared cache so a dashboard cannot stampede providers.
 		if r.URL.Query().Get("refresh") == "1" && !snapshotOnly {

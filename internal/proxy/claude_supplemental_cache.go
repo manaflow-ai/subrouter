@@ -25,7 +25,7 @@ type claudeSupplementalUsage struct {
 
 func claudeSupplementalCacheKey(account accounts.Account) string {
 	// A re-login or access-token rotation bypasses the prior probe result.
-	digest := sha256.Sum256([]byte(account.Token))
+	digest := sha256.Sum256([]byte(account.CredentialIdentity()))
 	return string(account.Provider) + "\x00" + account.ID + "\x00" + hex.EncodeToString(digest[:])
 }
 
@@ -150,7 +150,8 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
 		// The provider's usage endpoint supplied an explicit retry deadline.
 		// Do not immediately issue the synthetic Messages probe as a fallback;
 		// that would double traffic while the account is already throttled.
-		return nil, false, err
+		// Keep any unified reset headers from that same response for status.
+		return append([]accounts.UsageWindow(nil), throttle.Windows...), false, err
 	}
 	if usageWindowNamed(windows, agentclaude.FableWindowName) {
 		// The ordinary endpoint's model bucket is newer than our probe cache.
