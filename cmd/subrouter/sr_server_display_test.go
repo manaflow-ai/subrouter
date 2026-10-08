@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 func TestServerUsageRowsClassify429AsThrottleAndKeepResetWindows(t *testing.T) {
@@ -51,6 +52,32 @@ func TestServerUsageRowsTreatHeaderlessThrottleAsUsableWithoutQuotaEvidence(t *t
 	}
 	if got := compactPickReason(rows[0]); got != "usage throttled" {
 		t.Fatalf("Use = %q, want usage throttled", got)
+	}
+}
+
+func TestCompactPickReasonDoesNotCallModelScopedThrottleFableOut(t *testing.T) {
+	row := srUsageRow{
+		provider:       accounts.ProviderClaude,
+		authMode:       accounts.AuthModeOAuth,
+		usageThrottled: true,
+		windows: []accounts.UsageWindow{{
+			Name: "oauth-apps-weekly", Feature: "claude-fable-5", UsedPercent: 100,
+			LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second), ResetAfterSeconds: 30 * 60,
+		}},
+		score: selectacct.Score{AccountID: "claude@example.com", Headroom: 1, ShortHeadroom: 1},
+	}
+	if got := compactPickReason(row); got != "usage throttled" {
+		t.Fatalf("model-scoped throttle Use = %q, want usage throttled", got)
+	}
+}
+
+func TestCompactWindowStatusMarksExpiredExhaustion(t *testing.T) {
+	window := accounts.UsageWindow{
+		Name: "5h", UsedPercent: 100, LimitWindowSeconds: int64(5 * time.Hour / time.Second),
+		ResetAt: time.Now().Add(-time.Minute),
+	}
+	if got := compactWindowStatus(window); got != "0%/expired" {
+		t.Fatalf("expired window = %q, want 0%%/expired", got)
 	}
 }
 
