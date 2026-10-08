@@ -14,6 +14,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 func passiveClaudeAccount(token, version string) accounts.Account {
@@ -159,8 +160,13 @@ func TestRealClaudeProxyResponseSeedsLaterModelQuotaCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sessionStore, err := session.NewStore(t.TempDir() + "/sessions.json")
+	if err != nil {
+		t.Fatal(err)
+	}
 	s := Server{
 		AccountRef:     ref,
+		Sessions:       sessionStore,
 		ClaudeUpstream: upstream,
 		SchedulerRef:   selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
 		UsageScoreTTL:  0,
