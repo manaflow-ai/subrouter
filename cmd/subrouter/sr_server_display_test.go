@@ -20,8 +20,8 @@ func TestServerUsageRowsClassify429AsThrottleAndKeepResetWindows(t *testing.T) {
 	if len(rows) != 1 || !rows[0].usageThrottled {
 		t.Fatalf("rows = %+v, want one throttled row", rows)
 	}
-	if got := usageGridState(rows[0]); got != "ready" {
-		t.Fatalf("state = %q, want ready", got)
+	if got := usageGridState(rows[0]); got != "error" {
+		t.Fatalf("state = %q, want error", got)
 	}
 	if got := compactPickReason(rows[0]); got == "usage unavailable" || got == "usage throttled" {
 		t.Fatalf("cached reset information was discarded: %q", got)

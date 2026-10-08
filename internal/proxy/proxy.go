@@ -633,6 +633,10 @@ type usageWindowsFailure struct {
 	err     error
 	at      time.Time
 	retryAt time.Time
+	// windows preserve provider-supplied reset metadata across the throttle
+	// cache window so repeated status reads remain display-only.
+	windows   []accounts.UsageWindow
+	fetchedAt time.Time
 }
 
 // Used only if a provider reports 429 without a typed retry deadline.
@@ -796,6 +800,9 @@ func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context,
 		if entryMatchesCredential && now.Sub(entry.at) < usageWindowsLastGoodTTL {
 			return append([]accounts.UsageWindow(nil), entry.windows...), false, entry.at, nil
 		}
+		if len(failure.windows) > 0 {
+			return append([]accounts.UsageWindow(nil), failure.windows...), false, failure.fetchedAt, nil
+		}
 		return nil, false, time.Time{}, failure.err
 	}
 	windows, supplementalFresh, fetchedAt, err := r.fetchUsageWindowsShared(ctx, client, account, key)
@@ -851,7 +858,12 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 		// reaches this point. Recheck the credential-scoped throttle while still
 		// holding the same lock so that caller cannot start a duplicate request.
 		if failure, throttled := r.usageWindowsFailures[failureKey]; throttled && time.Now().Before(failure.retryAt) {
+			windows := append([]accounts.UsageWindow(nil), failure.windows...)
+			fetchedAt := failure.fetchedAt
 			r.usageWindowsMu.Unlock()
+			if len(windows) > 0 {
+				return windows, false, fetchedAt, nil
+			}
 			return nil, false, time.Time{}, failure.err
 		}
 		flight = &usageWindowsFlight{done: make(chan struct{}), epoch: epoch}
@@ -899,9 +911,14 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 					if r.usageWindowsFailures == nil {
 						r.usageWindowsFailures = map[string]usageWindowsFailure{}
 					}
-					r.usageWindowsFailures[failureKey] = usageWindowsFailure{
+					failure := usageWindowsFailure{
 						err: flight.err, at: now, retryAt: usageWindowsThrottleUntil(flight.err, now),
 					}
+					if errors.As(flight.err, &throttle) && len(throttle.Windows) > 0 {
+						failure.windows = append([]accounts.UsageWindow(nil), throttle.Windows...)
+						failure.fetchedAt = flight.fetchedAt
+					}
+					r.usageWindowsFailures[failureKey] = failure
 				}
 				if r.usageWindowsFlights[flightKey] == flight {
 					delete(r.usageWindowsFlights, flightKey)

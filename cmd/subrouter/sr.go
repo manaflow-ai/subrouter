@@ -3798,6 +3798,9 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 
 func usageGridState(row srUsageRow) string {
 	if row.usageThrottled {
+		if row.err != nil {
+			return "error"
+		}
 		if row.active {
 			return "active"
 		}

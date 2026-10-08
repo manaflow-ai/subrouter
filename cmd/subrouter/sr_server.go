@@ -1686,11 +1686,16 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 				row.score = selectacct.Score{AccountID: email, Headroom: 0, ShortHeadroom: 0}
 			}
 		} else if status.UsageThrottled || status.QuotaStatus == "throttled" {
-			// A telemetry 429 has no quota meaning. Keep the account eligible
-			// with an optimistic display score while the controller retains the
-			// last known windows (when there are any). The Use column still says
-			// "usage throttled" so this uncertainty is visible.
-			row.score = selectacct.Score{AccountID: email, Headroom: 1, ShortHeadroom: 1}
+			// A telemetry 429 has no quota meaning. Preserve authoritative reset
+			// windows when supplied; only headerless throttles get an optimistic
+			// display score while the controller suppresses another poll.
+			if len(status.Windows) > 0 {
+				row.score = scoreFromWindows(email, status.Windows)
+				row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
+				row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
+			} else {
+				row.score = selectacct.Score{AccountID: email, Headroom: 1, ShortHeadroom: 1}
+			}
 		} else if status.AuthMode == accounts.AuthModeAPIKey && status.QuotaUsageKnown {
 			row.score = scoreFromWindows(email, status.Windows)
 			row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
