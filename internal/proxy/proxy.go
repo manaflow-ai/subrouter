@@ -6979,7 +6979,11 @@ func claudeResponseCooksWeeklyWindow(header http.Header) bool {
 		return true
 	}
 	if raw := strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-7d-utilization")); raw != "" {
-		if utilization, err := strconv.ParseFloat(raw, 64); err == nil && utilization >= 1 {
+		// The ordinary provider header is fractional (1 means fully used),
+		// while some compatible gateways use percentages (100 means fully
+		// used). A raw 81 is 81%, not 8100%: it must never cook the weekly
+		// pool or authorize fallback spending.
+		if utilization, err := strconv.ParseFloat(raw, 64); err == nil && (utilization == 1 || utilization == 100) {
 			return true
 		}
 	}
