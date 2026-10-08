@@ -2,12 +2,16 @@ package proxy
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 func claudeRetryTestAccount(id string) accounts.Account {
@@ -185,5 +189,107 @@ func TestClaudeRetrySkipsKnownUnsupportedModelButAllowsUnknownEvidence(t *testin
 		[]accounts.Account{claudeRetryTestAccount("unsupported")}, model, time.Now())
 	if len(got) != 0 {
 		t.Fatalf("known unsupported model must not receive a futile retry: %+v", got)
+	}
+}
+
+func TestClaudeNewSessionPrefersVerifiedQuota(t *testing.T) {
+	unknown := claudeRetryTestAccount("unknown")
+	verified := claudeRetryTestAccount("verified")
+	base := selectacct.NewScheduler([]selectacct.Score{
+		claudeRetryTestScore(verified.ID, 0.7, true),
+	})
+	got := claudeNewSessionCandidatesFromScores(
+		base, base, []accounts.Account{unknown, verified}, "",
+	)
+	if len(got) != 1 || got[0].ID != verified.ID {
+		t.Fatalf("new-session candidates = %+v, want the measured healthy account", got)
+	}
+}
+
+func TestClaudeNewSessionKeepsUnknownFallbackWhenNoVerifiedAdmission(t *testing.T) {
+	unknown := claudeRetryTestAccount("unknown")
+	low := claudeRetryTestAccount("low")
+	stale := claudeRetryTestAccount("stale")
+	base := selectacct.NewScheduler([]selectacct.Score{
+		claudeRetryTestScore(low.ID, 0.2, true),
+		claudeRetryTestScore(stale.ID, 0.9, false),
+	})
+	candidates := []accounts.Account{unknown, low, stale}
+	got := claudeNewSessionCandidatesFromScores(base, base, candidates, "")
+	if len(got) != len(candidates) {
+		t.Fatalf("low/stale scores improperly disabled optimistic fallback: %+v", got)
+	}
+	for i := range candidates {
+		if got[i].ID != candidates[i].ID {
+			t.Fatalf("candidate order changed without verified headroom: %+v", got)
+		}
+	}
+}
+
+func TestClaudeNewSessionNeedsMeasuredModelPoolEvidence(t *testing.T) {
+	modelName := "claude-opus"
+	unknownModel := claudeRetryTestAccount("wide-only")
+	verifiedModel := claudeRetryTestAccount("opus-confirmed")
+	wide := claudeRetryTestScore(unknownModel.ID, 0.95, true)
+	opus := claudeRetryTestScore(verifiedModel.ID, 0.7, true)
+	opus.ModelScores = map[string]selectacct.Score{
+		selectacct.ModelKey(modelName): claudeRetryTestScore(verifiedModel.ID, 0.6, true),
+	}
+	base := selectacct.NewScheduler([]selectacct.Score{wide, opus})
+	got := claudeNewSessionCandidatesFromScores(
+		base, base.ForModel(modelName),
+		[]accounts.Account{unknownModel, verifiedModel}, modelName,
+	)
+	if len(got) != 1 || got[0].ID != verifiedModel.ID {
+		t.Fatalf("new-session placement treated missing model quota as verified: %+v", got)
+	}
+}
+
+func TestClaudeFirstPlacementPrefersVerifiedQuotaAndKeepsAffinity(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown := claudeRetryTestAccount("unknown")
+	verified := claudeRetryTestAccount("verified")
+	base := selectacct.NewScheduler([]selectacct.Score{
+		claudeRetryTestScore(verified.ID, 0.7, true),
+	})
+	server := Server{
+		Accounts:      []accounts.Account{unknown, verified},
+		Sessions:      store,
+		SchedulerRef:  selectacct.NewSchedulerRef(base),
+		UsageScoreTTL: time.Hour,
+		MaxBodyBytes:  1 << 20,
+	}
+	newRequest := func() *http.Request {
+		return httptest.NewRequest(http.MethodPost, "/v1/messages",
+			strings.NewReader(`{"model":"claude-sonnet-4-6","messages":[]}`))
+	}
+	first, _, _, err := server.accountForSessionProvider(
+		accounts.ProviderClaude, "claude", "session-first-placement", newRequest(),
+	)
+	if err != nil || first.ID != verified.ID {
+		t.Fatalf("initial placement=%+v err=%v, want confirmed quota", first, err)
+	}
+	// A healthy sticky session keeps its serving account even when the
+	// other account receives better quota evidence after initial placement.
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		claudeRetryTestScore(unknown.ID, 0.95, true),
+		claudeRetryTestScore(verified.ID, 0.65, true),
+	}))
+	sticky, _, _, err := server.accountForSessionProvider(
+		accounts.ProviderClaude, "claude", "session-first-placement", newRequest(),
+	)
+	if err != nil || sticky.ID != verified.ID {
+		t.Fatalf("sticky placement=%+v err=%v, should retain existing account", sticky, err)
+	}
+	// An explicit user preference remains authoritative for a fresh session.
+	preferred, _, _, err := server.accountForSessionProviderWithOptions(
+		accounts.ProviderClaude, "claude", "session-explicit-preference", newRequest(),
+		accountSelectionOptions{preferredAccountID: verified.ID},
+	)
+	if err != nil || preferred.ID != verified.ID {
+		t.Fatalf("preferred placement=%+v err=%v, requested preference lost", preferred, err)
 	}
 }

@@ -8444,7 +8444,14 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		account = *picked
 	} else {
 		var err error
-		account, err = pickRoutingAccount(scheduler, availableAccounts)
+		placementCandidates := availableAccounts
+		if provider == accounts.ProviderClaude && previousAccountID == "" {
+			// Use the quota information already in the scheduler for NEW
+			// sessions. Preserve forced/preferred picks and all sticky
+			// reassignment decisions made above.
+			placementCandidates = claudeNewSessionCandidatesFromScores(base, scheduler, availableAccounts, poolModel)
+		}
+		account, err = pickRoutingAccount(scheduler, placementCandidates)
 		if err != nil {
 			return accounts.Account{}, sessionID, userEmail, err
 		}
