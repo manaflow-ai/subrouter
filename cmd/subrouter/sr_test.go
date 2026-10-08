@@ -4056,7 +4056,7 @@ func TestUsageRowStaleAgeUsesProviderObservationTime(t *testing.T) {
 	}
 }
 
-func TestDisplayUsageRowsCallsOutStaleUsage(t *testing.T) {
+func TestDisplayUsageRowsDoesNotPrintStaleUsageNote(t *testing.T) {
 	var out bytes.Buffer
 	displayUsageRows(&out, []srUsageRow{{
 		displayAccount: "stale@example.com",
@@ -4067,8 +4067,8 @@ func TestDisplayUsageRowsCallsOutStaleUsage(t *testing.T) {
 			Name: "primary", UsedPercent: 50, LimitWindowSeconds: 7 * 24 * 60 * 60,
 		}},
 	}}, false)
-	if got := out.String(); !strings.Contains(got, "usage last fetched 3m ago; showing last known values") {
-		t.Fatalf("stale usage note missing:\n%s", got)
+	if got := out.String(); strings.Contains(got, "usage last fetched") || strings.Contains(got, "showing last known values") {
+		t.Fatalf("stale usage note should be omitted:\n%s", got)
 	}
 }
 
@@ -5205,8 +5205,8 @@ func TestCompactPickReasonKeepsUnavailableWithoutCachedWindows(t *testing.T) {
 		provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth,
 		err: errors.New("usage fetch failed: 429 Too Many Requests"),
 	}
-	if got := compactPickReason(row); got != "quota pending" {
-		t.Fatalf("missing quota Use = %q, want quota pending", got)
+	if got := compactPickReason(row); got != "usage throttled" {
+		t.Fatalf("missing quota Use = %q, want usage throttled", got)
 	}
 }
 

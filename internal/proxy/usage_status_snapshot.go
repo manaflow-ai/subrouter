@@ -132,6 +132,13 @@ func (r *AccountRef) restoreUsageStatusSnapshot() {
 		// Keep the provider observation time so reset windows remain visible.
 		status.UsageFresh = false
 		status.Error = ""
+		// Older durable snapshots did not persist UsageFetchedAt. Their rows
+		// still contain the provider windows, so use the snapshot write time as
+		// the best available observation time instead of dropping those windows
+		// from last-good recovery (and rendering blank reset cells after a 429).
+		if status.UsageFetchedAt.IsZero() && len(status.Windows) > 0 {
+			status.UsageFetchedAt = snapshot.SavedAt
+		}
 		status.Active = (status.Provider == accounts.ProviderClaude && status.ID == activeClaude) ||
 			(status.Provider != accounts.ProviderClaude && status.ID == activeCodex)
 		rows = append(rows, status)
@@ -154,6 +161,29 @@ func (r *AccountRef) restoreUsageStatusSnapshot() {
 		r.lastGoodUsage[key] = usageStatusSnapshot{status: status, at: status.UsageFetchedAt}
 	}
 	r.usageStatusMu.Unlock()
+	// Rehydrate the per-account fallback cache as well as the rendered rows.
+	// An explicit live refresh must be able to retain these windows when the
+	// provider answers with a transient 429 after a restart.
+	r.usageWindowsMu.Lock()
+	if r.usageWindows == nil {
+		r.usageWindows = make(map[string]usageWindowsEntry, len(rows))
+	}
+	for _, status := range rows {
+		if status.UsageFetchedAt.IsZero() || len(status.Windows) == 0 {
+			continue
+		}
+		key := status.ID + "\x00" + string(status.Provider)
+		account, ok := accountByKey[string(status.Provider)+"\x00"+status.ID]
+		if !ok {
+			continue
+		}
+		r.usageWindows[key] = usageWindowsEntry{
+			windows:       append([]accounts.UsageWindow(nil), status.Windows...),
+			at:            status.UsageFetchedAt,
+			credentialKey: usageWindowsCredentialKey(account),
+		}
+	}
+	r.usageWindowsMu.Unlock()
 }
 
 func (r *AccountRef) persistUsageStatusSnapshot(statuses []AccountUsageStatus) {

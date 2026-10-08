@@ -3118,16 +3118,6 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 		}
 		fmt.Fprintln(out)
 	}
-	for _, row := range rows {
-		if age, ok := usageRowStaleAge(row); ok {
-			fmt.Fprintf(out, "  %s: usage last fetched %s; showing last known values\n",
-				style(colored, ansiBold+ansiWhite, displayUsageAccountName(row)),
-				style(colored, ansiYellow, age))
-		}
-	}
-	if usageRowsHaveStaleUsage(rows) {
-		fmt.Fprintln(out)
-	}
 }
 
 const srStatusStaleAfter = 2 * time.Minute
@@ -4010,7 +4000,7 @@ func compactPickReason(row srUsageRow) string {
 			row.usageThrottled = false
 			return compactPickReason(row)
 		}
-		return "quota pending"
+		return "usage throttled"
 	}
 	// A usage refresh can fail after the server has retained a last-known-good
 	// quota snapshot. Keep the reset-aware Use text in that case; State and the
