@@ -5391,7 +5391,8 @@ func TestQwenValidatedKeyStaysReadyWhenConsoleLoginExpires(t *testing.T) {
 	row := srUsageRow{
 		provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey,
 		providerHealth: "auth ok", quotaStatus: "login needed",
-		err: errors.New("Qwen console login needed"),
+		err:     errors.New("Qwen console login needed"),
+		windows: []accounts.UsageWindow{{Name: "7d", UsedPercent: 20, ResetAfterSeconds: 3600}},
 	}
 	if !displayRecommendedForNewSession(row) {
 		t.Fatal("valid Qwen routing key became ineligible when optional telemetry expired")

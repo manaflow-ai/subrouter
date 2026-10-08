@@ -3982,6 +3982,14 @@ func usageGridError(row srUsageRow) string {
 }
 
 func compactPickReason(row srUsageRow) string {
+	if qwenTelemetryOnlyFailure(row) {
+		switch row.quotaStatus {
+		case "login needed":
+			return "quota login needed"
+		case "error":
+			return "quota unavailable"
+		}
+	}
 	// A usage refresh can fail after the server has retained a last-known-good
 	// quota snapshot. Keep the reset-aware Use text in that case; State and the
 	// error footer still make the failed refresh visible. Returning only
@@ -3990,14 +3998,6 @@ func compactPickReason(row srUsageRow) string {
 	if row.err != nil && len(row.windows) > 0 {
 		row.err = nil
 		return compactPickReason(row)
-	}
-	if qwenTelemetryOnlyFailure(row) {
-		switch row.quotaStatus {
-		case "login needed":
-			return "quota login needed"
-		case "error":
-			return "quota unavailable"
-		}
 	}
 	if row.err != nil {
 		return "usage unavailable"
