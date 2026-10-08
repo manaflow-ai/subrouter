@@ -20,14 +20,29 @@ import (
 func claudeRetryCandidatesFromScores(
 	base, model selectacct.Scheduler,
 	candidates []accounts.Account,
+	poolModel string,
 	now time.Time,
 ) []accounts.Account {
+	modelKey := selectacct.ModelKey(poolModel)
+	hasDedicatedPool := modelKey != "" && base.HasModelPool(poolModel)
 	verified := make([]accounts.Account, 0, len(candidates))
 	possible := make([]accounts.Account, 0, len(candidates))
 	for _, candidate := range candidates {
 		provider := schedulerAccountProvider(candidate.Provider)
 		baseScore := base.ScoreFor(provider, candidate.ID)
 		modelScore := model.ScoreFor(provider, candidate.ID)
+		if baseScore.Fresh && hasDedicatedPool {
+			_, hasModelBucket := baseScore.ModelScores[modelKey]
+			support := baseScore.MissingModelSupport
+			if support == selectacct.ModelSupportProviderDefault {
+				support = selectacct.DefaultMissingModelSupport(provider)
+			}
+			if !hasModelBucket && support == selectacct.ModelSupportUnsupported {
+				// A fresh reading with a known-absent model bucket is
+				// stronger evidence than an optimistic retry fallback.
+				continue
+			}
+		}
 		if baseScore.Fresh && model.Exhausted(provider, candidate.ID) {
 			if resetAt, known := modelScore.ExhaustionClearsAt(); known && resetAt.After(now) {
 				// A measured quota window is still exhausted. Avoid sending
