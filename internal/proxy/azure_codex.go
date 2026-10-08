@@ -220,6 +220,15 @@ func (b *attemptBudget) consume() bool {
 	}
 }
 
+// replenish restores the bounded per-pass allowance for the outer autonomous
+// loop. The outer loop itself has no attempt count; cancellation is its bound.
+func (b *attemptBudget) replenish(retries int) {
+	if b == nil || retries <= 0 {
+		return
+	}
+	b.remaining.Add(int64(retries))
+}
+
 // azureCodexSticky pins a Codex session to an Azure endpoint. Prompt caching is
 // per-deployment and keyed on an identical prefix, so a session that has fallen
 // back must keep going to the same place: alternating providers turn by turn

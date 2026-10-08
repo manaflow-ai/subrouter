@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -314,10 +315,10 @@ func formatSessionResetTime(reset, now time.Time) string {
 	return local.Format("Mon 15:04")
 }
 
-// compactQuotaResetPercent is where the compact status line starts naming a
-// window's reset time: below it the reset is noise, near the limit it is the
-// one thing worth knowing.
-const compactQuotaResetPercent = 80
+// compactQuotaResetLeftPercent is where the compact status line starts naming
+// a window's reset time: with more left the reset is noise, near the limit it
+// is the one thing worth knowing.
+const compactQuotaResetLeftPercent = 20
 
 func formatQuotaWindow(name string, window *accounts.UsageWindow, fetchedAt, now time.Time) string {
 	return formatQuotaWindowWith(name, window, fetchedAt, now, false)
@@ -327,13 +328,17 @@ func formatQuotaWindowWith(name string, window *accounts.UsageWindow, fetchedAt,
 	if window == nil {
 		return ""
 	}
-	text := fmt.Sprintf("%s %.0f%%", name, window.UsedPercent)
-	if compact && window.UsedPercent < compactQuotaResetPercent {
+	// Percent left, the convention sr status uses: an untouched account
+	// reads "100% left" in both places.
+	// Rounded first so the threshold agrees with the number shown.
+	left := math.Round(100 - clampUsagePercent(window.UsedPercent))
+	text := fmt.Sprintf("%s %.0f%% left", name, left)
+	if compact && left > compactQuotaResetLeftPercent {
 		return text
 	}
 	if reset := window.ResetTime(fetchedAt); !reset.IsZero() {
 		if reset.After(now) {
-			text += " resets " + formatSessionResetTime(reset, now)
+			text += ", resets " + formatSessionResetTime(reset, now)
 		}
 	}
 	return text

@@ -16,17 +16,18 @@ import (
 // tokenUsageStatusSummary is one provider's token usage over the status
 // window, summed from /_subrouter/token-usage rows.
 type tokenUsageStatusSummary struct {
-	provider          string
-	requests          int64
-	inputTokens       int64
-	cachedInputTokens int64
-	switches          int64
-	switchInputTokens int64
-	switchesInRequest int64
-	ttfbBuckets       []int64
-	ttfbMaxMs         int64
-	ttfbCount         int64
-	upstreamErrors    int64
+	provider              string
+	requests              int64
+	inputTokens           int64
+	cachedInputTokens     int64
+	cacheWriteInputTokens int64
+	switches              int64
+	switchInputTokens     int64
+	switchesInRequest     int64
+	ttfbBuckets           []int64
+	ttfbMaxMs             int64
+	ttfbCount             int64
+	upstreamErrors        int64
 }
 
 // tokenUsageStatusLines renders one sr status line per provider: turns,
@@ -45,6 +46,7 @@ func tokenUsageStatusLines(rows []proxy.TokenUsageRow, window string) []string {
 		summary.requests += row.Requests
 		summary.inputTokens += row.InputTokens
 		summary.cachedInputTokens += row.CachedInputTokens
+		summary.cacheWriteInputTokens += row.CacheWriteInputTokens
 		summary.switches += row.AccountSwitches
 		summary.switchInputTokens += row.AccountSwitchInputTokens
 		summary.switchesInRequest += row.AccountSwitchesInRequest
@@ -75,8 +77,20 @@ func tokenUsageStatusLines(rows []proxy.TokenUsageRow, window string) []string {
 		}
 		parts := []string{fmt.Sprintf("%s %d turns", provider, summary.requests)}
 		if summary.inputTokens > 0 {
-			parts = append(parts, fmt.Sprintf("%s in, %.0f%% cached", fmtTokens(summary.inputTokens),
-				100*float64(summary.cachedInputTokens)/float64(summary.inputTokens)))
+			cacheText := fmt.Sprintf("%s in, %.0f%% cached", fmtTokens(summary.inputTokens),
+				100*float64(summary.cachedInputTokens)/float64(summary.inputTokens))
+			if summary.cacheWriteInputTokens > 0 {
+				uncached := summary.inputTokens - summary.cachedInputTokens - summary.cacheWriteInputTokens
+				if uncached < 0 {
+					uncached = 0
+				}
+				cacheText = fmt.Sprintf("%s in, %.1f%% cache reads · %.1f%% cache writes · %.1f%% uncached",
+					fmtTokens(summary.inputTokens),
+					100*float64(summary.cachedInputTokens)/float64(summary.inputTokens),
+					100*float64(summary.cacheWriteInputTokens)/float64(summary.inputTokens),
+					100*float64(uncached)/float64(summary.inputTokens))
+			}
+			parts = append(parts, cacheText)
 		}
 		// Latency counts mean the daemon also reports switches, so zero
 		// switches is a measurement rather than an old daemon.

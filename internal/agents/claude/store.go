@@ -289,24 +289,108 @@ type ProfileInfo struct {
 }
 
 func DefaultStore() Store {
-	home, _ := os.UserHomeDir()
-	shared := ""
-	if home != "" {
-		shared = filepath.Join(home, ".claude")
-	}
-	return Store{Dir: storepath.CodexDir(), SharedStateDir: shared}
+	dir := storepath.CodexDir()
+	return Store{Dir: dir, SharedStateDir: callerClaudeConfigDir(dir)}
 }
 
 // DefaultStoreForReadOnlyInspection uses the same effective account root as
 // DefaultStore without importing the legacy Codex store. Serving processes use
 // this constructor so daemon startup cannot copy interactive credentials.
 func DefaultStoreForReadOnlyInspection() Store {
+	dir := storepath.CodexDirForReadOnlyInspection()
+	return Store{Dir: dir, SharedStateDir: callerClaudeConfigDir(dir)}
+}
+
+// DefaultClaudeConfigDir is the directory Claude Code uses when
+// CLAUDE_CONFIG_DIR is unset, or "" without a home directory.
+func DefaultClaudeConfigDir() string {
 	home, _ := os.UserHomeDir()
-	shared := ""
-	if home != "" {
-		shared = filepath.Join(home, ".claude")
+	if home == "" {
+		return ""
 	}
-	return Store{Dir: storepath.CodexDirForReadOnlyInspection(), SharedStateDir: shared}
+	return filepath.Join(home, ".claude")
+}
+
+// callerClaudeConfigDir is the Claude config directory the caller's own
+// `claude` would use: $CLAUDE_CONFIG_DIR when set, else ~/.claude. Subrouter
+// shares history, user config and settings with that directory, so a caller
+// with a custom config dir keeps it under sr.
+//
+// A CLAUDE_CONFIG_DIR inside Subrouter's account store is a proxy or profile
+// directory inherited from an sr launch, never a user directory. A pooled
+// launch exports the shared root it attached to as
+// CLAUDE_CODE_REMOTE_MEMORY_DIR, so a nested sr resolves the same root; other
+// managed launches fall back to ~/.claude.
+func callerClaudeConfigDir(storeDir string) string {
+	fallback := DefaultClaudeConfigDir()
+	dir := absClaudeConfigDir(os.Getenv("CLAUDE_CONFIG_DIR"))
+	if dir == "" {
+		return fallback
+	}
+	if !isManagedClaudeConfigDir(storeDir, dir) {
+		return dir
+	}
+	if inherited := absClaudeConfigDir(os.Getenv("CLAUDE_CODE_REMOTE_MEMORY_DIR")); inherited != "" && !isManagedClaudeConfigDir(storeDir, inherited) {
+		return inherited
+	}
+	return fallback
+}
+
+func absClaudeConfigDir(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return ""
+	}
+	return abs
+}
+
+// isManagedClaudeConfigDir reports whether dir lies inside the account store
+// or its legacy ~/.codex-accounts spelling, under either path spelling.
+func isManagedClaudeConfigDir(storeDir, dir string) bool {
+	roots := []string{storeDir, storepath.LegacyCodexDir()}
+	for _, root := range roots {
+		if strings.TrimSpace(root) == "" {
+			continue
+		}
+		root = absClaudeConfigDir(root)
+		if pathWithinDir(dir, root) {
+			return true
+		}
+		resolvedRoot, rootErr := filepath.EvalSymlinks(root)
+		resolvedDir, dirErr := evalExistingPrefix(dir)
+		if rootErr == nil && dirErr == nil && pathWithinDir(resolvedDir, resolvedRoot) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathWithinDir(path, dir string) bool {
+	rel, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(path))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
+}
+
+// evalExistingPrefix resolves symlinks in the longest existing prefix of path
+// and appends the missing remainder, so a not-yet-created proxy directory
+// still compares by its physical location.
+func evalExistingPrefix(path string) (string, error) {
+	path = filepath.Clean(path)
+	rest := ""
+	for {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			return filepath.Join(resolved, rest), nil
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return "", os.ErrNotExist
+		}
+		rest = filepath.Join(filepath.Base(path), rest)
+		path = parent
+	}
 }
 
 func (s Store) ProfilesPath() string {

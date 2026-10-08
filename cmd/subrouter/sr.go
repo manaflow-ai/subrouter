@@ -73,7 +73,7 @@ Usage:
   sr gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
-  sr status             Show usage across all configured providers (non-interactive)
+  sr status [--json]    Show usage across all configured providers (non-interactive)
   sr recover list [--json] [--query TEXT] [--limit N]
                         Find interrupted local Claude sessions and task artifacts
   sr recover show --session ID [--json]
@@ -368,6 +368,11 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 
 func (r srRunner) runCommand(ctx context.Context, args []string) error {
 	args = normalizeProviderAddArgs(args)
+	// Bare sr prints the status table when a server answers, so `sr --json`
+	// is the machine-readable form of that same view.
+	if len(args) == 1 && args[0] == "--json" {
+		args = []string{"status", "--json"}
+	}
 	// Keep recovery commands available when cloud.json is malformed. Login can
 	// replace it after a successful device flow, while help, doctor, and cleanup
 	// need no valid cloud state to explain or remove the broken installation.
@@ -544,7 +549,11 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 		}
 		return r.remove(ctx, args[1])
 	case "status":
-		return r.status(ctx)
+		opts, err := r.parseStatusArgs(args[1:])
+		if err != nil {
+			return err
+		}
+		return r.status(ctx, opts)
 	case "sessions", "whoami":
 		return r.sessions(ctx, args[1:])
 	case "recover":
@@ -732,7 +741,16 @@ func (r srRunner) runTeamCredentialCommand(
 			return true, r.cloudAccount(ctx, []string{"list"})
 		}
 		return true, r.cloudStatus(ctx)
-	case "status", "usage":
+	case "status":
+		opts, err := r.parseStatusArgs(args[1:])
+		if err != nil {
+			return true, err
+		}
+		if opts.json {
+			return true, r.cloudStatusJSON(ctx)
+		}
+		return true, r.cloudStatus(ctx)
+	case "usage":
 		return true, r.cloudStatus(ctx)
 	case "add":
 		_, _, client, err := loadCloudClient(true)
@@ -811,6 +829,13 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 	case "list", "ls":
 		return r.listServerAccounts(ctx, server, args[1:])
 	case "status":
+		opts, err := r.parseStatusArgs(args[1:])
+		if err != nil {
+			return err
+		}
+		if opts.json {
+			return r.serverStatusJSONFor(ctx, server)
+		}
 		return r.serverStatusFor(ctx, server)
 	case "usage":
 		if len(args) > 1 {
@@ -1200,7 +1225,11 @@ func (r srRunner) list(args []string) error {
 		if duplicateNames[localAccountNameKey(account)] > 1 && !showIDs {
 			needsIDsHint = true
 		}
-		fmt.Fprintf(r.out, "  %s%s (added %s)\n", name, marker, formatDate(account.AddedAt))
+		plan := ""
+		if planType := account.PlanType(); planType != "" {
+			plan = "  " + planType
+		}
+		fmt.Fprintf(r.out, "  %s%s%s (added %s)\n", name, marker, plan, formatDate(account.AddedAt))
 	}
 	fmt.Fprintln(r.out)
 	if needsIDsHint {
@@ -1318,14 +1347,21 @@ func appendKV(parts *[]string, key, value string) {
 	*parts = append(*parts, key+"="+strconv.Quote(value))
 }
 
-func (r srRunner) status(ctx context.Context) error {
+func (r srRunner) status(ctx context.Context, opts srStatusOptions) error {
 	config, err := cloudModeConfig()
 	if err != nil {
 		return err
 	}
+	serverStatus := r.serverStatusFor
+	if opts.json {
+		serverStatus = r.serverStatusJSONFor
+	}
 	source := config.EffectiveCredentialSource()
 	switch source {
 	case broker.CredentialSourceTeam:
+		if opts.json {
+			return r.cloudStatusJSON(ctx)
+		}
 		return r.cloudStatus(ctx)
 	case broker.CredentialSourceLegacy:
 		if explicitLocalStateAuthority() {
@@ -1334,7 +1370,7 @@ func (r srRunner) status(ctx context.Context) error {
 		if server, ok, err := r.defaultRemoteServer(); err != nil {
 			return err
 		} else if ok {
-			return r.serverStatusFor(ctx, server)
+			return serverStatus(ctx, server)
 		}
 		if !r.useServingAPI {
 			break
@@ -1343,7 +1379,7 @@ func (r srRunner) status(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		return r.serverStatusFor(ctx, server)
+		return serverStatus(ctx, server)
 	case broker.CredentialSourceLocal:
 		if explicitLocalStateAuthority() || !r.useServingAPI {
 			break
@@ -1352,7 +1388,10 @@ func (r srRunner) status(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		return r.serverStatusFor(ctx, server)
+		return serverStatus(ctx, server)
+	}
+	if opts.json {
+		return r.localStatusJSON(ctx)
 	}
 	if err := printCodexIsolationStatus(r.out, r.store); err != nil {
 		return err
@@ -3358,7 +3397,6 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 		{Key: "Opus wk", Title: "Opus wk"},
 		{Key: "Sonnet wk", Title: "Sonnet wk"},
 		{Key: "Extra", Title: "Extra usage"},
-		{Key: "ExtraSpend", Title: "$"},
 		{Key: "ExtraAutoReload", Title: "Auto-reload"},
 	} {
 		if !usageGridRowsHaveValue(rows, candidate.Key) {
@@ -3367,11 +3405,10 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 		capWidth := 12
 		switch candidate.Key {
 		case "Extra":
-			// "off · out of credits" is the widest cell.
-			capWidth = 20
-		case "ExtraSpend":
-			// "$21.99/$50.00" is the widest cell.
-			capWidth = 13
+			// "off · spend limit reached" is the widest cell Anthropic's
+			// known reasons produce; dollar cells such as "$21.99/$50.00"
+			// are narrower.
+			capWidth = runewidth.StringWidth("off · spend limit reached")
 		case "ExtraAutoReload":
 			capWidth = 11
 		}
@@ -3452,7 +3489,6 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Opus wk":         usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
 		"Sonnet wk":       usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
 		"Extra":           usageGridClaudeExtraCell(row),
-		"ExtraSpend":      usageGridClaudeExtraSpendCell(row),
 		"ExtraAutoReload": usageGridClaudeExtraAutoReloadCell(row),
 		"AG Gemini 5h": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
 			return isAntigravityFamilyWindow(window, "gemini", false)
@@ -3489,6 +3525,13 @@ func claudeExtraUsageForRow(row srUsageRow) *accounts.ExtraUsageInfo {
 	return nil
 }
 
+// usageGridClaudeExtraCell is the Claude table's one "Extra usage" cell. A
+// known-off account says so (with Anthropic's reason). Otherwise the cell
+// shows the most useful dollar figure sr knows: the prepaid balance the local
+// claude.ai web enrichment resolved, over the monthly cap when known
+// ("$3.74/$50.00"; the OAuth usage API never returns a balance), or Claude's
+// "Monthly spend limit: $X of $Y" metered spend. "on" means enabled with no
+// figures, and "?" is reserved for knowing nothing at all.
 func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
 	extra := claudeExtraUsageForRow(row)
 	if extra == nil {
@@ -3501,28 +3544,12 @@ func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
 		}
 		return usageGridCell{}
 	}
-	if extra.EnablementUnknown {
-		return usageGridCell{Text: "?", Style: ansiYellow}
-	}
-	if !extra.IsEnabled {
+	if !extra.EnablementUnknown && !extra.IsEnabled {
 		text := "off"
 		if reason := humanizeClaudeExtraDisabledReason(extra.DisabledReason); reason != "" {
 			text = "off · " + reason
 		}
 		return usageGridCell{Text: text, Style: ansiDim}
-	}
-	return usageGridCell{Text: "on", Style: ansiGreen}
-}
-
-// usageGridClaudeExtraSpendCell renders the prepaid extra-usage balance over
-// the monthly cap ("$3.74/$50.00") when the local claude.ai web enrichment
-// resolved a balance; the OAuth usage API never returns one. Without a known
-// balance it falls back to Claude's "Monthly spend limit: $X of $Y" line:
-// metered spend used over the cap.
-func usageGridClaudeExtraSpendCell(row srUsageRow) usageGridCell {
-	extra := claudeExtraUsageForRow(row)
-	if extra == nil || (!extra.IsEnabled && extra.CreditsBalance == nil) {
-		return usageGridCell{}
 	}
 	if extra.CreditsBalance != nil {
 		balance := *extra.CreditsBalance / 100
@@ -3535,19 +3562,19 @@ func usageGridClaudeExtraSpendCell(row srUsageRow) usageGridCell {
 		}
 		return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", balance, *extra.MonthlyLimit/100), Style: styleName}
 	}
-	if extra.MonthlyLimit == nil {
-		return usageGridCell{Text: "?", Style: ansiYellow}
+	if extra.MonthlyLimit != nil && extra.UsedCredits != nil {
+		limit := *extra.MonthlyLimit / 100
+		used := *extra.UsedCredits / 100
+		styleName := ansiGreen
+		if limit-used <= 0 {
+			styleName = ansiYellow
+		}
+		return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", used, limit), Style: styleName}
 	}
-	limit := *extra.MonthlyLimit / 100
-	if extra.UsedCredits == nil {
-		return usageGridCell{Text: "?", Style: ansiYellow}
+	if extra.IsEnabled {
+		return usageGridCell{Text: "on", Style: ansiGreen}
 	}
-	used := *extra.UsedCredits / 100
-	styleName := ansiGreen
-	if limit-used <= 0 {
-		styleName = ansiYellow
-	}
-	return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", used, limit), Style: styleName}
+	return usageGridCell{Text: "?", Style: ansiYellow}
 }
 
 func usageGridClaudeExtraAutoReloadCell(row srUsageRow) usageGridCell {

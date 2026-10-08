@@ -308,3 +308,57 @@ func TestClaudeProxyMemoryDirectoryResolvesSymlinksAndDeduplicates(t *testing.T)
 		t.Fatalf("memory root env missing: %s", body)
 	}
 }
+
+func TestManagedClaudeLaunchCarriesUserSettings(t *testing.T) {
+	userPath := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(userPath, []byte(`{
+		"env": {
+			"CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "200",
+			"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "5",
+			"ANTHROPIC_BASE_URL": "https://not-the-router.example"
+		},
+		"forceLoginMethod": "console",
+		"includeCoAuthoredBy": false
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := managedClaudeLaunchSettings("https://router.example", "/tmp/profile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		body    []byte
+		baseURL string
+	}{
+		{name: "routed", body: launch, baseURL: "https://router.example"},
+		{name: "unrouted", body: nil, baseURL: "https://not-the-router.example"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := withManagedClaudeUserSettings(tc.body, userPath, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var settings map[string]any
+			if err := json.Unmarshal(body, &settings); err != nil {
+				t.Fatal(err)
+			}
+			env, _ := settings["env"].(map[string]any)
+			if env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] != "200" || env["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] != "5" {
+				t.Fatalf("user env missing: %v", env)
+			}
+			if env["ANTHROPIC_BASE_URL"] != tc.baseURL {
+				t.Fatalf("ANTHROPIC_BASE_URL = %v, want %s", env["ANTHROPIC_BASE_URL"], tc.baseURL)
+			}
+			if _, ok := settings["forceLoginMethod"]; ok {
+				t.Fatal("credential-source setting must be dropped")
+			}
+			if settings["includeCoAuthoredBy"] != false {
+				t.Fatalf("non-env user setting missing: %v", settings)
+			}
+		})
+	}
+	if body, err := withManagedClaudeUserSettings(nil, "", nil); err != nil || body != nil {
+		t.Fatalf("disabled merge must leave an unrouted launch without settings, got %s, %v", body, err)
+	}
+}

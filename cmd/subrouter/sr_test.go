@@ -2429,7 +2429,7 @@ func TestStatusHelpCoversEveryConfiguredProvider(t *testing.T) {
 		"sr":        srHelp,
 		"subrouter": usageText("subrouter"),
 	} {
-		if !strings.Contains(help, "status             Show usage across all configured providers") {
+		if !strings.Contains(help, "status [--json]    Show usage across all configured providers") {
 			t.Errorf("%s help does not describe provider-wide status", name)
 		}
 		if strings.Contains(help, "status             Show Codex and Claude usage") {

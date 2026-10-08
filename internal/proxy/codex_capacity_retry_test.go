@@ -81,6 +81,9 @@ func codexCapacityPost(ctx context.Context, t *testing.T, proxyURL, sessionID, m
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(CodexCapacityRetryableHeader, "1")
+	// Exercise the bounded ladder; an unset policy would make this legacy
+	// header retry silently until cancellation.
+	req.Header.Set(AgentRetryPolicyHeader, "bounded")
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}

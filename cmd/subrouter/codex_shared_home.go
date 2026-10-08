@@ -182,19 +182,19 @@ func codexSharedHomeDir(source string) string {
 	return filepath.Join(storepath.StateDir(), name)
 }
 
-func prepareCodexSharedHomeForLaunch(baseURL string, recovery ...bool) (string, error) {
+func prepareCodexSharedHomeForLaunch(baseURL string) (string, error) {
 	source, err := codexSourceHome()
 	if err != nil {
 		return "", err
 	}
 	target := codexSharedHomeDir(source)
 	notify := codexSharedNotifyArgs(accounts.DefaultCodexStore().StoreDir())
-	return target, prepareCodexSharedHome(source, target, baseURL, notify, recovery...)
+	return target, prepareCodexSharedHome(source, target, baseURL, notify)
 }
 
 // prepareCodexSharedHome brings target in line with source and merges the
 // generated config. Concurrent launches serialize on a lock file.
-func prepareCodexSharedHome(source, target, baseURL string, notify []string, recovery ...bool) error {
+func prepareCodexSharedHome(source, target, baseURL string, notify []string) error {
 	if canonicalPath(source) == canonicalPath(target) || isCodexSharedHome(source) {
 		return fmt.Errorf("refusing to mirror the shared Codex home %s into itself", target)
 	}
@@ -220,7 +220,7 @@ func prepareCodexSharedHome(source, target, baseURL string, notify []string, rec
 	if err := ensureCodexSharedDaemonPackage(source, target); err != nil {
 		return err
 	}
-	return mergeCodexSharedHomeConfig(source, target, baseURL, notify, recovery...)
+	return mergeCodexSharedHomeConfig(source, target, baseURL, notify)
 }
 
 func lockCodexSharedHome(target string) (func(), error) {
@@ -396,12 +396,12 @@ func readTomlFile(path string) ([]byte, map[string]any, error) {
 // inside sr codex (/model, notices, trust); the new generation is the user's
 // config now. A setting only Codex changed keeps Codex's value; anything the
 // user changed, including revoking trust, follows the user's config.
-func mergeCodexSharedHomeConfig(source, target, baseURL string, notify []string, recovery ...bool) error {
+func mergeCodexSharedHomeConfig(source, target, baseURL string, notify []string) error {
 	_, user, err := readTomlFile(filepath.Join(source, "config.toml"))
 	if err != nil {
 		return fmt.Errorf("read %s: %w", filepath.Join(source, "config.toml"), err)
 	}
-	generated := codexSharedGeneratedConfig(user, source, target, baseURL, notify, recovery...)
+	generated := codexSharedGeneratedConfig(user, source, target, baseURL, notify)
 	_, base, err := readTomlFile(filepath.Join(target, codexSharedBaseFile))
 	if err != nil {
 		base = nil
@@ -437,39 +437,22 @@ func mergeCodexSharedHomeConfig(source, target, baseURL string, notify []string,
 }
 
 // codexSharedGeneratedConfig is the user's config routed through Subrouter.
-func codexSharedGeneratedConfig(user map[string]any, source, target, baseURL string, notify []string, recovery ...bool) map[string]any {
+func codexSharedGeneratedConfig(user map[string]any, source, target, baseURL string, notify []string) map[string]any {
 	out := deepCopyToml(user).(map[string]any)
 	out["model_provider"] = "subrouter"
 	providers := mapOrNew(out["model_providers"])
-	provider := map[string]any{
+	providers["subrouter"] = map[string]any{
 		"name":                      "Subrouter",
 		"base_url":                  baseURL,
 		"experimental_bearer_token": "subrouter",
 		"wire_api":                  "responses",
 		"supports_websockets":       true,
-		"request_max_retries":       codexProviderRequestMaxRetries,
-		"stream_max_retries":        codexProviderStreamMaxRetries,
-		"http_headers":              map[string]any{"X-Subrouter-Agent": "codex"},
+		"stream_idle_timeout_ms":    autonomousAgentClientTimeoutMS,
+		"http_headers": map[string]any{
+			"X-Subrouter-Agent":        "codex",
+			"X-Subrouter-Retry-Policy": "autonomous",
+		},
 	}
-	// Calls without the optional argument predate goal recovery and retain the
-	// existing retryable-capacity provider defaults for compatibility. The
-	// launcher passes false explicitly to disable the feature.
-	legacyDefaults := len(recovery) == 0
-	recoveryEnabled := len(recovery) > 0 && recovery[0]
-	if legacyDefaults || recoveryEnabled {
-		headers := provider["http_headers"].(map[string]any)
-		headers["X-Subrouter-Capacity-Retryable"] = "1"
-	}
-	if recoveryEnabled {
-		headers := provider["http_headers"].(map[string]any)
-		headers["X-Subrouter-Capacity-Retry"] = "persist"
-		provider["request_max_retries"] = 100
-		provider["stream_max_retries"] = 100
-		features := mapOrNew(out["features"])
-		features["goals"] = true
-		out["features"] = features
-	}
-	providers["subrouter"] = provider
 	out["model_providers"] = providers
 	// Codex's own sandbox refuses writable roots under a CODEX_HOME that has
 	// symlinked components (memories, worktrees) unless this is set. It is

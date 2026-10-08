@@ -81,8 +81,16 @@ func withClaudeUserSettings(settingsBody []byte, userSettingsPath, proxySettings
 			merged = own
 		}
 	}
+	return overlayClaudeLaunchSettings(merged, launch)
+}
+
+// overlayClaudeLaunchSettings applies sr's launch settings over a lower
+// precedence settings object. Credential-source settings are dropped from the
+// base, every launch env key wins (case-insensitively), and launch maps merge
+// into the base so collections such as hooks keep both sides.
+func overlayClaudeLaunchSettings(base, launch map[string]any) ([]byte, error) {
 	for _, key := range claudeProxyUserSettingsDropped {
-		delete(merged, key)
+		delete(base, key)
 	}
 	launchEnv, _ := launch["env"].(map[string]any)
 	owned := make(map[string]bool, len(launchEnv))
@@ -90,9 +98,9 @@ func withClaudeUserSettings(settingsBody []byte, userSettingsPath, proxySettings
 		owned[strings.ToUpper(key)] = true
 	}
 	env := map[string]any{}
-	if userEnv, ok := merged["env"].(map[string]any); ok {
-		for key, value := range userEnv {
-			// Windows environment names are case-insensitive: a user entry
+	if baseEnv, ok := base["env"].(map[string]any); ok {
+		for key, value := range baseEnv {
+			// Windows environment names are case-insensitive: a base entry
 			// that differs from a routing key only in case must not survive
 			// beside it.
 			if !owned[strings.ToUpper(key)] {
@@ -105,17 +113,17 @@ func withClaudeUserSettings(settingsBody []byte, userSettingsPath, proxySettings
 	}
 	for key, value := range launch {
 		if launchMap, ok := value.(map[string]any); ok {
-			if existing, ok := merged[key].(map[string]any); ok {
+			if existing, ok := base[key].(map[string]any); ok {
 				mergeClaudeSettingsMap(existing, launchMap)
 				continue
 			}
 		}
-		merged[key] = value
+		base[key] = value
 	}
 	if len(env) > 0 {
-		merged["env"] = env
+		base["env"] = env
 	}
-	return json.Marshal(merged)
+	return json.Marshal(base)
 }
 
 // The grant is independent of user settings opt-out and missing/invalid JSON.

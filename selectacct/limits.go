@@ -1,12 +1,18 @@
 package selectacct
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 type LimitWindow struct {
 	Name               string
 	UsedPercent        float64
 	LimitWindowSeconds int64
 	ResetAfterSeconds  int64
+	// ResetAt is the absolute reset time when the upstream reported one. It
+	// only feeds ExhaustionClearsAt; zero means unknown.
+	ResetAt time.Time
 	// Feature is the upstream limit_name of the model-specific quota pool this
 	// window belongs to (e.g. "GPT-5.3-Codex-Spark"); empty for account-wide
 	// windows.
@@ -99,8 +105,20 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 	// counts when the weekly window is the one holding the account back.
 	otherHeadroom := 1.0
 	floorSurplus, hasFloorSurplus := 0.0, false
+	// exhaustedResetAt is when every window at zero headroom has reset: the
+	// latest of their resets, since the account stays exhausted until the
+	// last one clears.
+	var exhaustedResetAt time.Time
+	exhaustedResetUnknown := false
 	for _, window := range windows {
 		remaining := 1 - clampPercent(window.UsedPercent)/100
+		if remaining <= 0 {
+			if window.ResetAt.IsZero() {
+				exhaustedResetUnknown = true
+			} else if window.ResetAt.After(exhaustedResetAt) {
+				exhaustedResetAt = window.ResetAt
+			}
+		}
 		if remaining < headroom {
 			headroom = remaining
 		}
@@ -165,6 +183,8 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 		ShortResetAfterSeconds: shortResetAfterSeconds,
 		ExpiryPressure:         pressure,
 		Sessions:               sessions,
+		ExhaustedResetAt:       exhaustedResetAt,
+		ExhaustedResetUnknown:  exhaustedResetUnknown,
 	}
 }
 

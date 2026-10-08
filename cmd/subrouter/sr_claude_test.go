@@ -1003,8 +1003,10 @@ func TestRunClaudeUsesAuthoritativeSettingsOverrideAndPreservesResumeArgs(t *tes
 	if err := json.Unmarshal(overrideBody, &override); err != nil {
 		t.Fatalf("settings override = %q: %v", overrideBody, err)
 	}
-	if got := override.Env["ANTHROPIC_AUTH_TOKEN"]; got != "" {
-		t.Fatalf("settings override retained an unintended credential: %+v", override)
+	// Claude does not fall through an empty override to the profile settings,
+	// so the private override must restate the profile's own credential.
+	if got := override.Env["ANTHROPIC_AUTH_TOKEN"]; got != "secret" {
+		t.Fatalf("settings override dropped the profile credential: %+v", override)
 	}
 	if got := override.Env["ANTHROPIC_BASE_URL"]; got != "http://127.0.0.1:"+port {
 		t.Fatalf("settings override base URL = %q", got)
@@ -2411,5 +2413,83 @@ func TestProxyClaudeEnablesUpstreamModelDiscovery(t *testing.T) {
 	}
 	if directSettings.Env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] != "" {
 		t.Fatal("direct profile discovery was changed")
+	}
+}
+
+// Claude treats an explicitly empty --settings env value as authoritative, so
+// the managed launch override must restate the profile's own credential rather
+// than blank it and hope the profile settings.json fills the gap. Claude Code
+// 2.1.281 stopped falling through and every managed launch hit "Not logged in".
+func TestManagedClaudeLaunchSettingsCarriesProfileCredential(t *testing.T) {
+	dir := t.TempDir()
+	profileSettings := `{"env":{` +
+		`"ANTHROPIC_BASE_URL":"http://127.0.0.1:1",` +
+		`"ANTHROPIC_AUTH_TOKEN":"subrouter",` +
+		`"ANTHROPIC_CUSTOM_HEADERS":"X-Subrouter-Agent: claude",` +
+		`"CLAUDE_CODE_USE_BEDROCK":"1",` +
+		`"SUBROUTER_CLAUDE_SERVER_URL":"http://router.example:31415"}}`
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(profileSettings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body, err := managedClaudeLaunchSettings("http://100.64.0.1:31415", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"ANTHROPIC_BASE_URL":       "http://100.64.0.1:31415",
+		"ANTHROPIC_AUTH_TOKEN":     "subrouter",
+		"ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude",
+		"CLAUDE_CODE_USE_BEDROCK":  "",
+		"CLAUDE_CONFIG_DIR":        dir,
+	}
+	for key, value := range want {
+		if got, ok := settings.Env[key]; !ok || got != value {
+			t.Fatalf("launch override %s = %q (present %v), want %q", key, got, ok, value)
+		}
+	}
+}
+
+// A caller that runs many short `claude -p` processes for one conversation
+// (the cmux Home Chief: one fresh process per turn) names the conversation
+// with SUBROUTER_SESSION_KEY. The proxy sends it as X-Subrouter-Session, so
+// the server keeps those processes on one sticky account and the prompt
+// cache they share stays readable. Without the variable nothing changes.
+func TestProxyClaudeLaunchSettingsSendsTheCallersSessionKey(t *testing.T) {
+	headers := func(t *testing.T) string {
+		t.Helper()
+		body, err := proxyClaudeLaunchSettings("https://subrouter.example/v1", "route-token", t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var settings struct {
+			Env map[string]string `json:"env"`
+		}
+		if err := json.Unmarshal(body, &settings); err != nil {
+			t.Fatal(err)
+		}
+		return settings.Env["ANTHROPIC_CUSTOM_HEADERS"]
+	}
+	previous := srClientName
+	srClientName = func() string { return "" }
+	t.Cleanup(func() { srClientName = previous })
+	t.Setenv(claudeProxySessionKeyEnv, "")
+	if got := headers(t); strings.Contains(got, "X-Subrouter-Session") {
+		t.Fatalf("no key set, headers %q", got)
+	}
+	t.Setenv(claudeProxySessionKeyEnv, "optchat-c0eb90ed-turn")
+	if got := headers(t); !strings.Contains(got, "\nX-Subrouter-Session: optchat-c0eb90ed-turn") {
+		t.Fatalf("headers %q lack the session key", got)
+	}
+	for _, bad := range []string{"two\nlines", "has space", strings.Repeat("k", 129)} {
+		t.Setenv(claudeProxySessionKeyEnv, bad)
+		if got := headers(t); strings.Contains(got, "X-Subrouter-Session") {
+			t.Fatalf("invalid key %q was sent: %q", bad, got)
+		}
 	}
 }
