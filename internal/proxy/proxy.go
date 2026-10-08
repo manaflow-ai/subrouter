@@ -1553,6 +1553,44 @@ func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
 	}
 }
 
+// UsageStatusesFresh starts a live status sweep for an explicit user request.
+// A sweep already in progress is shared instead of being invalidated and
+// restarted, so concurrent `sr status` callers cannot stampede the provider.
+func (r *AccountRef) UsageStatusesFresh(ctx context.Context) []AccountUsageStatus {
+	if r == nil {
+		return nil
+	}
+	r.usageStatusMu.Lock()
+	sweep := r.usageStatusSweep
+	if sweep == nil {
+		r.usageStatusAt = time.Time{}
+		r.usageStatusCache = nil
+		r.usageStatusEpoch++
+		// The status lock is held while clearing the per-account observation so
+		// the sweep cannot start between invalidation and the live request.
+		r.usageWindowsMu.Lock()
+		r.usageWindows = nil
+		r.usageWindowsLatest = nil
+		r.usageWindowsFailures = nil
+		r.usageWindowsEpoch++
+		r.usageWindowsMu.Unlock()
+		sweep = &usageStatusSweep{done: make(chan struct{}), epoch: r.usageStatusEpoch}
+		r.usageStatusSweep = sweep
+		sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageStatusSweepTimeout)
+		go func() {
+			defer cancel()
+			r.runUsageStatusSweep(sweepCtx, sweep)
+		}()
+	}
+	r.usageStatusMu.Unlock()
+	select {
+	case <-sweep.done:
+		return append([]AccountUsageStatus(nil), sweep.result...)
+	case <-ctx.Done():
+		return nil
+	}
+}
+
 // UsageStatusSnapshot returns the most recent usage sweep without starting a
 // provider request. Status is an observation of the controller's last known
 // state, while routing refreshes remain responsible for deciding when to fetch
@@ -1803,22 +1841,6 @@ func (r *AccountRef) InvalidateUsageStatusCache() {
 	r.usageStatusCache = nil
 	r.usageStatusEpoch++
 	r.usageStatusSweep = nil
-}
-
-// InvalidateUsageWindowsForStatusRefresh makes the next explicit status
-// request read live provider usage. A prior 429 is historical evidence, not
-// a local prohibition on checking again. Keep supplementary model readings
-// so a successful primary usage GET can reuse known buckets.
-func (r *AccountRef) InvalidateUsageWindowsForStatusRefresh() {
-	if r == nil {
-		return
-	}
-	r.usageWindowsMu.Lock()
-	r.usageWindows = nil
-	r.usageWindowsLatest = nil
-	r.usageWindowsFailures = nil
-	r.usageWindowsEpoch++
-	r.usageWindowsMu.Unlock()
 }
 
 // InvalidateUsageWindowsCache drops cached quota windows, including model
@@ -3035,16 +3057,6 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			// generation published by another worker before serving cached rows.
 			s.accountListSnapshotContext(r.Context())
 		}
-		// Interactive status commands opt into a live sweep. Background clients
-		// keep the short shared cache so a dashboard cannot stampede providers.
-		if r.URL.Query().Get("refresh") == "1" && !snapshotOnly {
-			s.AccountRef.InvalidateUsageStatusCache()
-			// An explicitly requested status refresh must check the provider
-			// again even after a prior telemetry 429. The previous behavior
-			// reused a potentially hours-long cached error and displayed
-			// quota pending despite the provider having recovered.
-			s.AccountRef.InvalidateUsageWindowsForStatusRefresh()
-		}
 		var statuses []AccountUsageStatus
 		if snapshotOnly {
 			var cached bool
@@ -3059,7 +3071,11 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			if s.SchedulerRef != nil {
 				scoreRevision = s.SchedulerRef.ScoreRevision()
 			}
-			statuses = s.AccountRef.UsageStatuses(r.Context())
+			if r.URL.Query().Get("refresh") == "1" {
+				statuses = s.AccountRef.UsageStatusesFresh(r.Context())
+			} else {
+				statuses = s.AccountRef.UsageStatuses(r.Context())
+			}
 			if s.SchedulerRef != nil {
 				loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
 				s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, SchedulerAccounts(loaded))

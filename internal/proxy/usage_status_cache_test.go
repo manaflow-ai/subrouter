@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,25 @@ import (
 type usageRoundTripper struct {
 	calls     int
 	responses []*http.Response
+}
+
+type blockingUsageRoundTripper struct {
+	started chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	calls   int
+}
+
+func (u *blockingUsageRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	u.mu.Lock()
+	u.calls++
+	first := u.calls == 1
+	u.mu.Unlock()
+	if first {
+		close(u.started)
+		<-u.release
+	}
+	return usageOKResponse(), nil
 }
 
 func (u *usageRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -93,6 +113,29 @@ func TestUsageStatusesCachesWithinTTL(t *testing.T) {
 	}
 	if len(second[0].Windows) == 0 {
 		t.Fatal("cached status lost usage windows")
+	}
+}
+
+func TestUsageStatusesFreshSharesConcurrentSweep(t *testing.T) {
+	transport := &blockingUsageRoundTripper{started: make(chan struct{}), release: make(chan struct{})}
+	ref := cacheTestAccountRef(t, transport)
+	first := make(chan []AccountUsageStatus, 1)
+	go func() { first <- ref.UsageStatusesFresh(context.Background()) }()
+	<-transport.started
+	second := make(chan []AccountUsageStatus, 1)
+	go func() { second <- ref.UsageStatusesFresh(context.Background()) }()
+	close(transport.release)
+	if got := <-first; len(got) != 1 {
+		t.Fatalf("first fresh sweep returned %d rows, want 1", len(got))
+	}
+	if got := <-second; len(got) != 1 {
+		t.Fatalf("second fresh sweep returned %d rows, want 1", len(got))
+	}
+	transport.mu.Lock()
+	calls := transport.calls
+	transport.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("concurrent fresh status requests made %d provider calls, want one shared usage sweep (two provider endpoints)", calls)
 	}
 }
 
