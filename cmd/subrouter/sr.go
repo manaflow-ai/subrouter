@@ -4239,7 +4239,10 @@ func compactWindowStatus(window accounts.UsageWindow) string {
 	left := compactPercentLeft(window.UsedPercent)
 	if window.ResetAfterSeconds <= 0 {
 		if window.UsedPercent >= 100 && !window.ResetAt.IsZero() {
-			return left + "/expired"
+			// A provider reset timestamp in the past is stale evidence, not
+			// proof that the subscription is banned. Keep that distinction
+			// visible until a fresh response supplies the next reset.
+			return left + "/stale"
 		}
 		return left
 	}
