@@ -32,9 +32,25 @@ func (s Server) allOAuthAccountsWaitingForReset(now time.Time) (time.Time, bool)
 	// still applies. This only reads the published account-generation marker;
 	// it never contacts a provider. A replacement login advances the
 	// generation and clears UpdatedAt, so the next score pass can verify it.
-	loaded, _ := s.accountListSnapshotContext(context.Background())
+	allAccounts, _ := s.accountListSnapshotContext(context.Background())
 	if s.SchedulerRef.UpdatedAt().IsZero() {
 		return time.Time{}, false
+	}
+	// accountListSnapshotContext includes the server's startup list for
+	// compatibility and appends the AccountRef's reloaded list. Prefer the
+	// latter when a generation changed so a repaired credential does not get
+	// shadowed by its pre-login copy.
+	loadedByKey := make(map[string]accounts.Account, len(allAccounts))
+	for _, account := range allAccounts {
+		if account.AuthMode != accounts.AuthModeOAuth {
+			continue
+		}
+		key := string(accountProviderOrCodex(account)) + "\x00" + account.ID
+		loadedByKey[key] = account
+	}
+	loaded := make([]accounts.Account, 0, len(loadedByKey))
+	for _, account := range loadedByKey {
+		loaded = append(loaded, account)
 	}
 	if len(loaded) == 0 {
 		return time.Time{}, false
