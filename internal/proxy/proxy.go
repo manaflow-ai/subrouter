@@ -1549,6 +1549,12 @@ func (r *AccountRef) runUsageStatusSweep(ctx context.Context, sweep *usageStatus
 // snapshots and caches the sweep unless the cache was invalidated while it
 // ran. Callers hold usageStatusMu.
 func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch uint64) []AccountUsageStatus {
+	// An invalidated sweep may finish after a newer credential or status
+	// refresh. Its result can serve its waiting caller, but must never
+	// replace last-good status history used by subsequent sweeps.
+	if epoch != r.usageStatusEpoch {
+		return out
+	}
 	now := time.Now()
 	if r.lastGoodUsage == nil {
 		r.lastGoodUsage = map[string]usageStatusSnapshot{}
@@ -1590,10 +1596,8 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 		restored.UsageFresh = false
 		out[i] = restored
 	}
-	if epoch == r.usageStatusEpoch {
-		r.usageStatusCache = append([]AccountUsageStatus(nil), out...)
-		r.usageStatusAt = now
-	}
+	r.usageStatusCache = append([]AccountUsageStatus(nil), out...)
+	r.usageStatusAt = now
 	return out
 }
 
