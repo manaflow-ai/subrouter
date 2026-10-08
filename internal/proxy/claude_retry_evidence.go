@@ -71,3 +71,44 @@ func claudeRetryCandidatesFromScores(
 	}
 	return append(possible, uncertain...)
 }
+
+
+// claudeNewSessionCandidatesFromScores prefers an account with confirmed,
+// model-eligible capacity when assigning a brand-new conversation. The shared
+// scheduler's unknown-account default is optimistically 100% healthy, which
+// otherwise places fresh sessions there ahead of accounts with measured quota.
+//
+// A missing or stale measurement never makes an account ineligible: if no
+// verified usable choice exists, return the original pool unchanged. Callers
+// must only use this for initial placement, not existing sticky assignments.
+func claudeNewSessionCandidatesFromScores(
+	base, model selectacct.Scheduler,
+	candidates []accounts.Account,
+	poolModel string,
+) []accounts.Account {
+	modelKey := selectacct.ModelKey(poolModel)
+	hasDedicatedPool := modelKey != "" && base.HasModelPool(poolModel)
+	verified := make([]accounts.Account, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.AuthMode != accounts.AuthModeOAuth {
+			continue
+		}
+		provider := schedulerAccountProvider(candidate.Provider)
+		baseScore := base.ScoreFor(provider, candidate.ID)
+		if !baseScore.Fresh || !model.UsableForNewSession(provider, candidate.ID) {
+			continue
+		}
+		if hasDedicatedPool {
+			// A fresh account-wide reading is not proof that this account
+			// can serve a separately measured model quota pool.
+			if _, hasBucket := baseScore.ModelScores[modelKey]; !hasBucket {
+				continue
+			}
+		}
+		verified = append(verified, candidate)
+	}
+	if len(verified) > 0 {
+		return verified
+	}
+	return candidates
+}
