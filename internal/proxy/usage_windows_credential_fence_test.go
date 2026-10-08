@@ -1,0 +1,149 @@
+package proxy
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
+)
+
+func usageCredentialForTest(token, version string) accounts.Account {
+	return accounts.Account{
+		ID:                "same-profile",
+		Provider:          accounts.ProviderCodex,
+		AuthMode:          accounts.AuthModeOAuth,
+		Token:             token,
+		CredentialVersion: version,
+	}
+}
+
+func TestUsageWindowCacheDoesNotReusePreviousCredential(t *testing.T) {
+	transport := &countingTransport{}
+	transport.responses = func() *http.Response {
+		return codexUsageResponseForTest(float64(transport.calls * 10))
+	}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	old := usageCredentialForTest("old-access", "old-grant")
+	newer := usageCredentialForTest("new-access", "new-grant")
+
+	first, _, err := ref.FetchUsageWindowsCached(context.Background(), client, old)
+	if err != nil || len(first) != 1 || first[0].UsedPercent != 10 {
+		t.Fatalf("initial quota = %+v err=%v", first, err)
+	}
+	second, _, err := ref.FetchUsageWindowsCached(context.Background(), client, newer)
+	if err != nil || len(second) != 1 || second[0].UsedPercent != 20 {
+		t.Fatalf("new login inherited old quota: %+v err=%v", second, err)
+	}
+	third, _, err := ref.FetchUsageWindowsCached(context.Background(), client, newer)
+	if err != nil || len(third) != 1 || third[0].UsedPercent != 20 {
+		t.Fatalf("new credential cache was not reused: %+v err=%v", third, err)
+	}
+	if transport.calls != 2 {
+		t.Fatalf("upstream calls = %d, want one per credential", transport.calls)
+	}
+}
+
+func TestUsageWindowCacheOldFlightCannotReplaceNewCredential(t *testing.T) {
+	transport := &invalidationRaceTransport{
+		firstStarted:  make(chan struct{}),
+		releaseFirst:  make(chan struct{}),
+		secondStarted: make(chan struct{}),
+	}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	old := usageCredentialForTest("old-access", "old-grant")
+	newer := usageCredentialForTest("new-access", "new-grant")
+	type result struct {
+		windows []accounts.UsageWindow
+		err     error
+	}
+	oldResult := make(chan result, 1)
+	go func() {
+		w, _, err := ref.FetchUsageWindowsCached(context.Background(), client, old)
+		oldResult <- result{windows: w, err: err}
+	}()
+	<-transport.firstStarted
+
+	newResult := make(chan result, 1)
+	go func() {
+		w, _, err := ref.FetchUsageWindowsCached(context.Background(), client, newer)
+		newResult <- result{windows: w, err: err}
+	}()
+	<-transport.secondStarted
+	latest := <-newResult
+	close(transport.releaseFirst)
+	previous := <-oldResult
+	if previous.err != nil || latest.err != nil {
+		t.Fatalf("fetch errors: old=%v new=%v", previous.err, latest.err)
+	}
+	if len(previous.windows) != 1 || previous.windows[0].UsedPercent != 10 ||
+		len(latest.windows) != 1 || latest.windows[0].UsedPercent != 20 {
+		t.Fatalf("in-flight request results old=%+v new=%+v", previous.windows, latest.windows)
+	}
+	key := newer.ID + "\x00" + string(newer.Provider)
+	ref.usageWindowsMu.Lock()
+	entry := ref.usageWindows[key]
+	ref.usageWindowsMu.Unlock()
+	if len(entry.windows) != 1 || entry.windows[0].UsedPercent != 20 ||
+		entry.credentialKey != usageWindowsCredentialKey(newer) {
+		t.Fatalf("superseded credential replaced latest cache: %+v", entry)
+	}
+	// The successful newer fetch is reused; a late older completion cannot
+	// force another upstream quota read.
+	again, _, err := ref.FetchUsageWindowsCached(context.Background(), client, newer)
+	if err != nil || len(again) != 1 || again[0].UsedPercent != 20 {
+		t.Fatalf("newer credential not cached after race: %+v err=%v", again, err)
+	}
+}
+
+func TestUsageWindowCacheDoesNotFallbackToPreviousCredentialOnThrottle(t *testing.T) {
+	transport := &countingTransport{}
+	transport.responses = func() *http.Response {
+		if transport.calls == 1 {
+			return codexUsageResponseForTest(10)
+		}
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests",
+			Header: http.Header{},
+			Body: io.NopCloser(strings.NewReader("{}")),
+		}
+	}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	old := usageCredentialForTest("old-access", "old-grant")
+	newer := usageCredentialForTest("new-access", "new-grant")
+	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, old); err != nil {
+		t.Fatal(err)
+	}
+	result, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, newer)
+	if err == nil || fresh || len(result) != 0 {
+		t.Fatalf("new credential inherited stale previous-account quota: %+v fresh=%t err=%v", result, fresh, err)
+	}
+	if transport.calls != 2 {
+		t.Fatalf("upstream calls=%d, want one fresh check for new credential", transport.calls)
+	}
+}
+
+func TestUsageWindowCacheSeparatesCredentialVersionWithSameAccessToken(t *testing.T) {
+	transport := &countingTransport{}
+	transport.responses = func() *http.Response {
+		return codexUsageResponseForTest(float64(transport.calls * 10))
+	}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	old := usageCredentialForTest("same-access", "old-refresh-grant")
+	newer := usageCredentialForTest("same-access", "repaired-refresh-grant")
+	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, newer); err != nil {
+		t.Fatal(err)
+	}
+	if transport.calls != 2 {
+		t.Fatalf("a repaired credential was treated as the prior refresh grant: %d calls", transport.calls)
+	}
+}
