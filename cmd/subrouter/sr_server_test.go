@@ -385,8 +385,8 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 			http.Error(w, "unexpected path", http.StatusNotFound)
 			return
 		}
-		if req.URL.Query().Get("snapshot") != "1" {
-			t.Errorf("usage status query = %q, want snapshot=1", req.URL.RawQuery)
+		if req.URL.Query().Get("refresh") != "1" {
+			t.Errorf("usage status query = %q, want refresh=1", req.URL.RawQuery)
 		}
 		_ = json.NewEncoder(w).Encode([]remoteServerUsageStatus{{
 			ID: "acct@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth,
