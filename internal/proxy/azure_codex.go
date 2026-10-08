@@ -195,6 +195,9 @@ type attemptBudget struct {
 	// whole pool, while transport and overload retries keep the request-wide
 	// bounded budget above.
 	quotaRemaining atomic.Int64
+	// quotaPerPass is restored only after the outer autonomous loop starts
+	// another pass. A reset wake must get the full, bounded pool allowance.
+	quotaPerPass int64
 	// claudeOverload is the request's same-account Claude overload ladder,
 	// bounded on its own (see claudeOverloadHold).
 	claudeOverload claudeOverloadHold
@@ -205,7 +208,7 @@ func newAttemptBudget(retries int) *attemptBudget {
 }
 
 func newAttemptBudgetWithQuota(retries, quotaRetries int) *attemptBudget {
-	budget := &attemptBudget{}
+	budget := &attemptBudget{quotaPerPass: int64(quotaRetries)}
 	budget.remaining.Store(int64(retries))
 	budget.quotaRemaining.Store(int64(quotaRetries))
 	return budget
@@ -245,14 +248,17 @@ func (b *attemptBudget) consumeQuota() bool {
 	}
 }
 
-// replenish restores the bounded per-pass allowance for the outer autonomous
-// loop. The outer loop obeys provider Retry-After and has an elapsed-time cap
-// for transient failures, rather than an arbitrary number of pool passes.
+// replenish restores both retry allowances for the outer autonomous loop.
+// A Claude quota pass uses its separate pool-sized budget; without restoring it,
+// a pass after a provider-reset wait could not fail over to another account.
+// Reset instead of adding quota allowance, so unused slots cannot accumulate
+// into unbounded failover attempts across repeated autonomous passes.
 func (b *attemptBudget) replenish(retries int) {
 	if b == nil || retries <= 0 {
 		return
 	}
 	b.remaining.Add(int64(retries))
+	b.quotaRemaining.Store(b.quotaPerPass)
 }
 
 // azureCodexSticky pins a Codex session to an Azure endpoint. Prompt caching is
