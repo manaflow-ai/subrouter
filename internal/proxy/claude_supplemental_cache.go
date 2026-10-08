@@ -21,15 +21,13 @@ const claudeSupplementalProbeTTL = 10 * time.Minute
 type claudeSupplementalUsage struct {
 	windows []accounts.UsageWindow
 	at      time.Time
-	// Request start is used only to reject out-of-order passive replies.
-	// Freshness comes from when the upstream headers actually arrived.
+	// Request start orders overlapping model observations independently of
+	// when their headers arrive. The at field controls cache freshness.
 	requestStarted time.Time
 }
 
 func claudeSupplementalCacheKey(account accounts.Account) string {
-	// The full credential identity changes on re-login or refresh-grant
-	// replacement even when the access token itself is unchanged. Never
-	// inherit a different credential's model quota observation.
+	// A re-login or access-token rotation bypasses the prior probe result.
 	digest := sha256.Sum256([]byte(account.CredentialIdentity()))
 	return string(account.Provider) + "\x00" + account.ID + "\x00" + hex.EncodeToString(digest[:])
 }
@@ -155,7 +153,8 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
 		// The provider's usage endpoint supplied an explicit retry deadline.
 		// Do not immediately issue the synthetic Messages probe as a fallback;
 		// that would double traffic while the account is already throttled.
-		return nil, false, err
+		// Keep any unified reset headers from that same response for status.
+		return append([]accounts.UsageWindow(nil), throttle.Windows...), false, err
 	}
 	if usageWindowNamed(windows, agentclaude.FableWindowName) {
 		// The ordinary endpoint's model bucket is newer than our probe cache.

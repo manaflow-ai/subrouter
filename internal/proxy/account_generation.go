@@ -1084,12 +1084,16 @@ func (r *AccountRef) reconcileOrEvictAccountRollback(ctx context.Context, marker
 
 func (r *AccountRef) evictSnapshotForAccountRollbackLocked() (bool, uint64) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if len(r.accounts) == 0 {
-		return false, r.accountGeneration
+		generation := r.accountGeneration
+		r.mu.Unlock()
+		return false, generation
 	}
 	r.accounts = nil
 	r.accountGeneration++
 	r.credentialRevision++
-	return true, r.accountGeneration
+	generation := r.accountGeneration
+	r.mu.Unlock()
+	r.invalidateUsageStatusSnapshotPersistence()
+	return true, generation
 }

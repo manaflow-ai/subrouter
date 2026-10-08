@@ -2,9 +2,57 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
+
+func TestServerUsageRowsClassify429AsThrottleAndKeepResetWindows(t *testing.T) {
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID:       "claude@example.com",
+		Provider: accounts.ProviderClaude,
+		AuthMode: accounts.AuthModeOAuth,
+		Error:    "usage fetch failed: 429 Too Many Requests",
+		Windows: []accounts.UsageWindow{{
+			Name: "7d", UsedPercent: 26, ResetAfterSeconds: int64(time.Hour / time.Second),
+		}},
+	}})
+	if len(rows) != 1 || !rows[0].usageThrottled {
+		t.Fatalf("rows = %+v, want one throttled row", rows)
+	}
+	if got := usageGridState(rows[0]); got != "error" {
+		t.Fatalf("state = %q, want error", got)
+	}
+	if got := compactPickReason(rows[0]); got == "usage unavailable" || got == "usage throttled" {
+		t.Fatalf("cached reset information was discarded: %q", got)
+	}
+
+	rows = usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{
+		{ID: "claude@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Error: "usage fetch failed: 401 Unauthorized"},
+	})
+	if len(rows) != 1 || rows[0].usageThrottled || rows[0].err == nil {
+		t.Fatalf("401 row = %+v, want authentication error", rows)
+	}
+}
+
+func TestServerUsageRowsTreatHeaderlessThrottleAsUsableWithoutQuotaEvidence(t *testing.T) {
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID: "claude@example.com", Provider: accounts.ProviderClaude,
+		AuthMode: accounts.AuthModeOAuth, UsageThrottled: true,
+	}})
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want one", len(rows))
+	}
+	if got := usageGridState(rows[0]); got != "ready" {
+		t.Fatalf("state = %q, want ready", got)
+	}
+	if !usableForNewSession(rows[0].score) {
+		t.Fatalf("headerless telemetry throttle should remain score-eligible: %+v", rows[0])
+	}
+	if got := compactPickReason(rows[0]); got != "quota pending" {
+		t.Fatalf("Use = %q, want quota pending", got)
+	}
+}
 
 func TestServerUsageRowsShowLabelForOwnerKeyedCodexAccounts(t *testing.T) {
 	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{
