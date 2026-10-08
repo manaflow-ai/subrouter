@@ -213,10 +213,10 @@ func TestInvalidatedUsageSweepCannotReviveLastGoodQuota(t *testing.T) {
 	ref := &AccountRef{}
 	oldEpoch := ref.usageStatusEpoch
 	old := AccountUsageStatus{
-		AccountStatus: AccountStatus{ID: "same-account", Provider: accounts.ProviderClaude},
-		UsageFresh:    true,
+		AccountStatus:  AccountStatus{ID: "same-account", Provider: accounts.ProviderClaude},
+		UsageFresh:     true,
 		UsageFetchedAt: time.Now(),
-		Windows: []accounts.UsageWindow{{
+		Windows:        []accounts.UsageWindow{{
 			Name: "7d", UsedPercent: 20,
 		}},
 	}
