@@ -176,3 +176,28 @@ func TestClaudeProviderResetBecomesModelScopedSchedulerHold(t *testing.T) {
 		}
 	}
 }
+
+func TestClaudeWeeklyUtilizationDoesNotTreatPercentAsFraction(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want bool
+	}{
+		{"0", false},
+		{"0.81", false},
+		{"81", false},
+		{"99.9", false},
+		{"1", true},
+		{"1.0", true},
+		{"100", true},
+		{"NaN", false},
+		{"-1", false},
+		{"101", false},
+	}
+	for _, tc := range tests {
+		header := http.Header{}
+		header.Set("Anthropic-Ratelimit-Unified-7d-Utilization", tc.raw)
+		if got := claudeResponseCooksWeeklyWindow(header); got != tc.want {
+			t.Errorf("weekly raw utilization %q => cooked %t, want %t", tc.raw, got, tc.want)
+		}
+	}
+}
