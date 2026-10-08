@@ -10946,7 +10946,7 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 				// which candidates have verified quota. Prefer them over the
 				// optimistic 100%-headroom default for unmeasured accounts.
 				// Confirmed exhaustion with a future reset is not retryable.
-				candidates = claudeRetryCandidatesFromScores(quotaScheduler, scheduler, candidates, time.Now())
+				candidates = claudeRetryCandidatesFromScores(quotaScheduler, scheduler, candidates, poolModel, time.Now())
 				if len(candidates) == 0 {
 					return accounts.Account{}, fmt.Errorf("all untried Claude retry candidates have confirmed quota exhaustion")
 				}
