@@ -11,8 +11,8 @@ import (
 func TestObservedFeatureUsageWindowsIgnoresIncompleteOrInvalidHeaders(t *testing.T) {
 	now := time.Now()
 	for _, input := range []struct {
-		label string
-		status string
+		label       string
+		status      string
 		utilization string
 	}{
 		{label: "only status allowed", status: "allowed"},
