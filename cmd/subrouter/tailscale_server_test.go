@@ -781,3 +781,65 @@ func TestTailscaleRepairDiagnosticsRedactURLUserinfo(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultTailscaleStatusLoaderForksOncePerProcess(t *testing.T) {
+	resetTailscaleStatusMemoForTest()
+	t.Cleanup(resetTailscaleStatusMemoForTest)
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "calls")
+	binary := filepath.Join(dir, "tailscale-test")
+	script := "#!/bin/sh\necho x >> " + counter + "\nprintf '{\"Self\":{\"ID\":\"node-1\"}}\\n'\n"
+	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(tailscaleBinaryEnv, binary)
+	for i := 0; i < 3; i++ {
+		output, err := defaultTailscaleStatusLoader(context.Background())
+		if err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+		if !strings.Contains(string(output), "node-1") {
+			t.Fatalf("call %d output = %q", i, output)
+		}
+	}
+	calls, err := os.ReadFile(counter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(calls), "x"); got != 1 {
+		t.Fatalf("tailscale forks = %d, want 1", got)
+	}
+}
+
+func TestDefaultTailscaleStatusLoaderMemoizesTimeoutButNotCallerCancel(t *testing.T) {
+	resetTailscaleStatusMemoForTest()
+	t.Cleanup(resetTailscaleStatusMemoForTest)
+	binary := filepath.Join(t.TempDir(), "tailscale-test")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec sleep 60\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(tailscaleBinaryEnv, binary)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := defaultTailscaleStatusLoader(cancelled); err == nil {
+		t.Fatal("cancelled probe unexpectedly succeeded")
+	}
+	tailscaleStatusMemo.mu.Lock()
+	memoized := len(tailscaleStatusMemo.results)
+	tailscaleStatusMemo.mu.Unlock()
+	if memoized != 0 {
+		t.Fatal("a caller-cancelled probe must not be memoized")
+	}
+
+	if _, err := defaultTailscaleStatusLoader(context.Background()); err == nil {
+		t.Fatal("slow probe unexpectedly succeeded")
+	}
+	started := time.Now()
+	if _, err := defaultTailscaleStatusLoader(context.Background()); err == nil {
+		t.Fatal("memoized probe unexpectedly succeeded")
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("second probe took %s; the timed-out result should be memoized", elapsed)
+	}
+}
