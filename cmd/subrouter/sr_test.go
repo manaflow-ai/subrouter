@@ -3960,6 +3960,51 @@ func TestSRRankRowsGroupsProvidersSeparately(t *testing.T) {
 	}
 }
 
+func TestSRRankRowsMovesClaudeTelemetryThrottlesToBottom(t *testing.T) {
+	rows := []srUsageRow{
+		{
+			email: "throttled@example.com", provider: accounts.ProviderClaude,
+			authMode: accounts.AuthModeOAuth, usageThrottled: true,
+			score: selectacct.Score{AccountID: "throttled@example.com", Headroom: 1, ShortHeadroom: 1},
+		},
+		{
+			email: "healthy@example.com", provider: accounts.ProviderClaude,
+			authMode: accounts.AuthModeOAuth,
+			score:    selectacct.Score{AccountID: "healthy@example.com", Headroom: 0.5, ShortHeadroom: 0.5},
+		},
+	}
+
+	rankUsageRows(rows)
+	got := []string{rows[0].email, rows[1].email}
+	want := []string{"healthy@example.com", "throttled@example.com"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ranked rows = %#v, want %#v", got, want)
+	}
+}
+
+func TestSRRankRowsMovesReauthRowsToLowSignalGroup(t *testing.T) {
+	rows := []srUsageRow{
+		{
+			email: "needs-reauth@example.com", provider: accounts.ProviderCodex,
+			authMode: accounts.AuthModeOAuth, err: errors.New("401 Unauthorized"),
+			score: selectacct.Score{AccountID: "needs-reauth@example.com", Headroom: 1, ShortHeadroom: 1},
+		},
+		{
+			email: "healthy@example.com", provider: accounts.ProviderCodex,
+			authMode: accounts.AuthModeOAuth,
+			score:    selectacct.Score{AccountID: "healthy@example.com", Headroom: 0.5, ShortHeadroom: 0.5},
+		},
+	}
+
+	rankUsageRows(rows)
+	if rows[0].email != "healthy@example.com" || rows[1].email != "needs-reauth@example.com" {
+		t.Fatalf("ranked rows = %#v, want healthy then reauth", rows)
+	}
+	if usageRowStatusTier(rows[1]) != usageRowStatusTier((srUsageRow{usageThrottled: true})) {
+		t.Fatal("reauth and telemetry-throttled rows should share the low-signal tier")
+	}
+}
+
 func TestScoreFromWindowsUsesAllDisplayedRateLimits(t *testing.T) {
 	score := scoreFromWindows("a@example.com", []accounts.UsageWindow{
 		{Name: "primary", UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64((3 * time.Hour) / time.Second)},
