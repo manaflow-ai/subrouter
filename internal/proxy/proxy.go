@@ -892,9 +892,10 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 							supplementalFresh: flight.supplementalFresh,
 							credentialKey:     credentialKey,
 						}
+						delete(r.usageWindowsFailures, failureKey)
 					}
-					delete(r.usageWindowsFailures, failureKey)
-				} else if usageWindowsIsThrottle(flight.err) {
+				} else if usageWindowsIsThrottle(flight.err) &&
+					flight.epoch == r.usageWindowsEpoch && r.usageWindowsLatest[cacheKey] == flightKey {
 					if r.usageWindowsFailures == nil {
 						r.usageWindowsFailures = map[string]usageWindowsFailure{}
 					}
