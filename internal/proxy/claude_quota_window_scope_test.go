@@ -177,6 +177,34 @@ func TestClaudeProviderResetBecomesModelScopedSchedulerHold(t *testing.T) {
 	}
 }
 
+func TestClaudeAccountWideAndModelResetHoldsRemainSeparate(t *testing.T) {
+	now := time.Now().UTC()
+	accountReset := now.Add(time.Hour).Truncate(time.Second)
+	modelReset := now.Add(3 * time.Hour).Truncate(time.Second)
+	account := accounts.Account{ID: "account", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}
+	server := Server{SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: account.ID, Provider: accounts.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8,
+	}}))}
+	header := http.Header{}
+	header.Set("Anthropic-Ratelimit-Unified-5h-Status", "rejected")
+	header.Set("Anthropic-Ratelimit-Unified-5h-Reset", strconv.FormatInt(accountReset.Unix(), 10))
+	header.Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
+	header.Set("Anthropic-Ratelimit-Unified-7d-Reset", strconv.FormatInt(accountReset.Unix(), 10))
+	header.Set("Anthropic-Ratelimit-Unified-7d_Oi-Status", "rejected")
+	header.Set("Anthropic-Ratelimit-Unified-7d_Oi-Reset", strconv.FormatInt(modelReset.Unix(), 10))
+	server.markAccountExhaustedFromResponseForAccount(account, agentclaude.FableFeature, http.StatusTooManyRequests, header)
+
+	if got, blocked := server.SchedulerRef.ExplicitBlockedUntilFor(accounts.ProviderClaude, account.ID, "", now); !blocked || !got.Equal(accountReset) {
+		t.Fatalf("account-wide hold = (%s,%v), want %s", got, blocked, accountReset)
+	}
+	if got, blocked := server.SchedulerRef.ExplicitBlockedUntilFor(accounts.ProviderClaude, account.ID, agentclaude.OpusFeature, now); !blocked || !got.Equal(accountReset) {
+		t.Fatalf("unrelated model hold = (%s,%v), want account reset %s", got, blocked, accountReset)
+	}
+	if got, blocked := server.SchedulerRef.ExplicitBlockedUntilFor(accounts.ProviderClaude, account.ID, agentclaude.FableFeature, now); !blocked || !got.Equal(modelReset) {
+		t.Fatalf("model-specific hold = (%s,%v), want model reset %s", got, blocked, modelReset)
+	}
+}
+
 func TestClaudeWeeklyUtilizationDoesNotTreatPercentAsFraction(t *testing.T) {
 	tests := []struct {
 		raw  string

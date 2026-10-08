@@ -7124,8 +7124,26 @@ func (s Server) markAccountExhaustedFromResponseForAccount(account accounts.Acco
 	if account.Provider == accounts.ProviderClaude &&
 		claudeRejectionIsExplicitlyAccountWide(status, header) {
 		// A rejected 5h/7d window applies to every Claude model family.
-		// Do not leave an apparently healthy sibling pool selectable.
-		poolKey = ""
+		// Do not leave an apparently healthy sibling pool selectable, but keep
+		// a later model-specific reset from extending the account-wide hold.
+		now := time.Now()
+		accountResetAt := claudeExhaustionExpiryForPool(header, now, "")
+		poolResetAt := claudeExhaustionExpiryForPool(header, now, poolKey)
+		if claudeResponseCooksWeeklyWindow(header) {
+			s.SchedulerRef.MarkWeeklyExhaustedUntil(
+				schedulerAccountProvider(account.Provider), account.ID, "", accountResetAt,
+			)
+		} else {
+			s.SchedulerRef.MarkExhaustedUntil(
+				schedulerAccountProvider(account.Provider), account.ID, "", accountResetAt,
+			)
+		}
+		if poolKey != "" && poolResetAt.After(accountResetAt) {
+			s.SchedulerRef.MarkExhaustedUntil(
+				schedulerAccountProvider(account.Provider), account.ID, poolKey, poolResetAt,
+			)
+		}
+		return
 	}
 	resetAt := claudeExhaustionExpiryForPool(header, time.Now(), poolKey)
 	if claudeResponseCooksWeeklyWindow(header) {
