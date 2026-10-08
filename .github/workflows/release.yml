@@ -124,7 +124,7 @@ jobs:
   github-release:
     name: Publish GitHub release
     needs: build
-    runs-on: ubuntu-latest # runner-policy-exception: release pipeline stays GitHub-hosted because its build job must
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     permissions:
       contents: write
