@@ -10890,7 +10890,8 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 	// though healthy accounts remained untried.
 	var lastErr error
 	for {
-		scheduler := s.withCapacityMarks(s.scheduler().ForModel(poolModel), provider, poolModel, codexServiceTierFromContext(ctx))
+		quotaScheduler := s.scheduler()
+		scheduler := s.withCapacityMarks(quotaScheduler.ForModel(poolModel), provider, poolModel, codexServiceTierFromContext(ctx))
 		if s.Sessions != nil {
 			scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
 		}
@@ -10939,6 +10940,16 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 					return accounts.Account{}, fmt.Errorf("all %s retry candidates are in controller cooldown", provider)
 				}
 				candidates = eligible
+			}
+			if provider == accounts.ProviderClaude && len(candidates) > 0 {
+				// The same scheduler readings used for account status tell us
+				// which candidates have verified quota. Prefer them over the
+				// optimistic 100%-headroom default for unmeasured accounts.
+				// Confirmed exhaustion with a future reset is not retryable.
+				candidates = claudeRetryCandidatesFromScores(quotaScheduler, scheduler, candidates, time.Now())
+				if len(candidates) == 0 {
+					return accounts.Account{}, fmt.Errorf("all untried Claude retry candidates have confirmed quota exhaustion")
+				}
 			}
 			if len(candidates) == 0 {
 				if lastErr != nil {
