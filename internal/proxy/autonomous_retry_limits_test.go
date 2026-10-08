@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 func autonomousLimitsRequest(t *testing.T) *http.Request {
@@ -183,5 +185,63 @@ func TestAutonomousRetryRespectsElapsedCeiling(t *testing.T) {
 	if response.StatusCode != http.StatusServiceUnavailable || attempts != 2 || sleeps != 1 {
 		t.Fatalf("status=%d attempts=%d sleeps=%d, want 503 after two tries and one wait",
 			response.StatusCode, attempts, sleeps)
+	}
+}
+
+func TestAutonomousClaudeQuotaRetryBudgetRearmsAfterReset(t *testing.T) {
+	// A pool pass used every quota failover slot and returned a local 503
+	// with a near-term provider reset. After the outer loop waits, the next
+	// pass must be allowed to try the whole pool again.
+	budget := newAttemptBudgetWithQuota(2, 3)
+	attempts := 0
+	waits := 0
+	transport := autonomousAgentRetryTransport{
+		provider: accounts.ProviderClaude,
+		budget: budget,
+		retriesPerPass: 2,
+		base: autonomousRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			attempts++
+			for i := 0; i < 3; i++ {
+				if !budget.consumeQuota() {
+					t.Fatalf("pass %d cannot try account %d after reset", attempts, i+2)
+				}
+			}
+			if budget.consumeQuota() {
+				t.Fatal("quota pass admitted an extra account beyond its limit")
+			}
+			if attempts == 1 {
+				return autonomousLimitsResponse(r, http.StatusServiceUnavailable, "1"), nil
+			}
+			return autonomousLimitsResponse(r, http.StatusOK, ""), nil
+		}),
+		sleep: func(_ context.Context, _ time.Duration) bool {
+			waits++
+			return true
+		},
+	}
+	response, err := transport.RoundTrip(autonomousLimitsRequest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || attempts != 2 || waits != 1 {
+		t.Fatalf("after-reset attempt status=%d passes=%d waits=%d, want success with one wait",
+			response.StatusCode, attempts, waits)
+	}
+}
+
+func TestAutonomousQuotaBudgetDoesNotAccumulateUnusedSlots(t *testing.T) {
+	budget := newAttemptBudgetWithQuota(2, 3)
+	if !budget.consumeQuota() {
+		t.Fatal("initial pool attempt was unexpectedly blocked")
+	}
+	budget.replenish(2)
+	for i := 0; i < 3; i++ {
+		if !budget.consumeQuota() {
+			t.Fatalf("after restart, missing quota allowance %d", i+1)
+		}
+	}
+	if budget.consumeQuota() {
+		t.Fatal("unused quota slots accumulated across autonomous passes")
 	}
 }
