@@ -958,6 +958,7 @@ func (r *SchedulerRef) MarkCredentialExhaustedForSnapshot(
 			r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
 		}
 	}
+	r.pruneExhaustedMarksForAccountsLocked(accounts)
 
 	fingerprint := credentialFingerprint(credentialIdentity)
 	scoreKey := ScoreKey(provider, accountID)
