@@ -1315,6 +1315,7 @@ func (r *AccountRef) ReloadSnapshot() ([]accounts.Account, uint64, error) {
 		return nil, 0, err
 	}
 	r.mu.Lock()
+	previous := append([]accounts.Account(nil), r.accounts...)
 	r.accounts = append([]accounts.Account(nil), loaded...)
 	r.accountGeneration++
 	r.credentialRevision++
@@ -1322,6 +1323,7 @@ func (r *AccountRef) ReloadSnapshot() ([]accounts.Account, uint64, error) {
 	generation := r.accountGeneration
 	out := append([]accounts.Account(nil), loaded...)
 	r.mu.Unlock()
+	r.invalidateReplacedAccountUsage(previous, loaded)
 	r.invalidateUsageStatusSnapshotPersistence()
 	return out, generation, nil
 }
