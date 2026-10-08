@@ -529,6 +529,32 @@ func TestAccountCredentialSnapshotCannotRegressGeneration(t *testing.T) {
 	}
 }
 
+func TestAccountGenerationPrunesRemovedAccountExhaustionMarks(t *testing.T) {
+	removed := account.Account{ID: "removed@example.com", Provider: account.ProviderClaude}
+	kept := account.Account{ID: "kept@example.com", Provider: account.ProviderClaude}
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.AdvanceAccountGenerationWithAccounts(1, 1, []account.Account{removed, kept})
+	removedUntil := time.Now().Add(time.Hour)
+	keptUntil := time.Now().Add(2 * time.Hour)
+	ref.MarkWeeklyExhaustedUntil(removed.Provider, removed.ID, "", removedUntil)
+	ref.MarkExhaustedUntil(kept.Provider, kept.ID, "", keptUntil)
+
+	ref.AdvanceAccountGenerationWithAccounts(2, 2, []account.Account{kept})
+	if _, ok := ref.ExhaustedUntilFor(removed.Provider, removed.ID, ""); ok {
+		t.Fatal("removed account retained an exhaustion mark")
+	}
+	ref.mu.RLock()
+	_, weeklyMarked := ref.weeklyExhaustedUntil[poolScopedExhaustionKey(removed.Provider, removed.ID, "")]
+	_, seqMarked := ref.exhaustedMarkSeq[poolScopedExhaustionKey(removed.Provider, removed.ID, "")]
+	ref.mu.RUnlock()
+	if weeklyMarked || seqMarked {
+		t.Fatal("removed account retained weekly or sequence exhaustion state")
+	}
+	if got, ok := ref.ExhaustedUntilFor(kept.Provider, kept.ID, ""); !ok || !got.Equal(keptUntil) {
+		t.Fatalf("kept account mark = %v, %t; want %v, true", got, ok, keptUntil)
+	}
+}
+
 func TestSyncAccountCredentialsDropsExclusionAfterTokenRotation(t *testing.T) {
 	old := account.Account{
 		ID: "rotated@example.com", Provider: account.ProviderCodex, Token: "same-access-token",
