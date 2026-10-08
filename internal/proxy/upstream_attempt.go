@@ -67,6 +67,13 @@ func (a *upstreamAttempt) consume() bool {
 	return a.budget.consume()
 }
 
+// consumeQuota claims one fast Claude quota failover retry. It is separate
+// from the request-wide transport budget so a pool larger than six accounts
+// can be walked without changing transient retry behavior.
+func (a *upstreamAttempt) consumeQuota() bool {
+	return a.budget.consumeQuota()
+}
+
 // current is the account the last downward send was addressed to. A layer
 // reads it on entry, before sending anything itself, where it is the account
 // the layer above addressed this layer's input to.

@@ -771,7 +771,13 @@ func (r *SchedulerRef) retainExhaustedExpiriesForScoreKeysLocked(scoreKeys map[s
 			delete(r.weeklyExhaustedUntil, key)
 		}
 		switch {
-		case !ok || !score.exhausted():
+		case !ok || !score.Fresh:
+			// A missing or stale refresh did not measure this account's
+			// recovery. Keep an upstream rejection mark until a fresh score
+			// proves headroom, otherwise a throttled usage endpoint can make a
+			// cooked account immediately eligible again.
+			continue
+		case !score.exhausted():
 			dropMark(key)
 		case score.Fresh:
 			until := now.Add(DefaultExhaustedTTL)

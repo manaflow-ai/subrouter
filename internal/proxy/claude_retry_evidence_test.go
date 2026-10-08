@@ -42,6 +42,18 @@ func TestClaudeRetryPrefersConfirmedUsableQuotaOverOptimisticDefault(t *testing.
 	}
 }
 
+func TestClaudeRetryPrefersAnyFreshHeadroomOverUnknownQuota(t *testing.T) {
+	fresh := claudeRetryTestAccount("fresh")
+	unknown := claudeRetryTestAccount("unknown")
+	scheduler := selectacct.NewScheduler([]selectacct.Score{
+		claudeRetryTestScore("fresh", 0.08, true),
+	})
+	got := claudeRetryCandidatesFromScores(scheduler, scheduler, []accounts.Account{unknown, fresh}, "", time.Now())
+	if len(got) != 1 || got[0].ID != fresh.ID {
+		t.Fatalf("candidate set = %+v; expected fresh headroom before unknown quota", got)
+	}
+}
+
 func TestClaudeRetrySkipsConfirmedExhaustionUntilReset(t *testing.T) {
 	cooked := claudeRetryTestAccount("cooked")
 	unknown := claudeRetryTestAccount("unknown")
@@ -61,15 +73,15 @@ func TestClaudeRetrySkipsConfirmedExhaustionUntilReset(t *testing.T) {
 	}
 }
 
-func TestClaudeRetryAllowsStaleOrUnknownQuotaAsLastResort(t *testing.T) {
+func TestClaudeRetrySkipsKnownFutureResetBeforeUnknownQuota(t *testing.T) {
 	stale := claudeRetryTestAccount("stale")
 	unknown := claudeRetryTestAccount("unknown")
 	quota := claudeRetryTestScore("stale", 0, false)
 	quota.ExhaustedResetAt = time.Now().Add(time.Hour)
 	scheduler := selectacct.NewScheduler([]selectacct.Score{quota})
 	got := claudeRetryCandidatesFromScores(scheduler, scheduler, []accounts.Account{stale, unknown}, "", time.Now())
-	if len(got) != 2 {
-		t.Fatalf("stale exhaustion is not confirmed; all unverified candidates must remain available: %+v", got)
+	if len(got) != 1 || got[0].ID != unknown.ID {
+		t.Fatalf("known future reset must stay out of the retry set: %+v", got)
 	}
 }
 

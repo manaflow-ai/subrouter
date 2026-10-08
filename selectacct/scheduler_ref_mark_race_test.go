@@ -79,8 +79,8 @@ func TestFreshWeeklyHeadroomClearsWeeklyMark(t *testing.T) {
 	}
 }
 
-// A later session-level 429 must not shorten a proven weekly block, and a
-// weekly mark whose account left the pool must not linger as a zero score.
+// A later session-level 429 must not shorten a proven weekly block. Missing
+// score evidence does not prove recovery, so the weekly mark remains active.
 func TestWeeklyMarkStaysPairedWithItsExhaustionMark(t *testing.T) {
 	ref := NewSchedulerRef(NewScheduler([]Score{codexScore("a", 0.5), codexScore("ghost", 0.5)}))
 	weekly := time.Now().Add(6 * 24 * time.Hour)
@@ -92,7 +92,18 @@ func TestWeeklyMarkStaysPairedWithItsExhaustionMark(t *testing.T) {
 
 	ref.MarkWeeklyExhaustedUntil(account.ProviderCodex, "ghost", "", weekly)
 	publishRefresh(t, ref, NewScheduler([]Score{codexScore("a", 0)}), true)
-	if ref.Get().Exhausted(account.ProviderCodex, "ghost") {
-		t.Fatal("a weekly mark for an account no longer scored still zeroes it")
+	if !ref.Get().Exhausted(account.ProviderCodex, "ghost") {
+		t.Fatal("missing score evidence dropped the weekly mark")
+	}
+}
+
+func TestRefreshKeepsExhaustionMarkOnStaleScore(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{codexScore("a", 0.5)}))
+	ref.MarkExhaustedUntil(account.ProviderCodex, "a", "", time.Now().Add(5*time.Hour))
+	stale := codexScore("a", 0.9)
+	stale.Fresh = false
+	publishRefresh(t, ref, NewScheduler([]Score{stale}), true)
+	if !ref.Get().Exhausted(account.ProviderCodex, "a") {
+		t.Fatal("stale score dropped an upstream exhaustion mark")
 	}
 }

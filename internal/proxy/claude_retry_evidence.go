@@ -14,8 +14,9 @@ import (
 // already spent an upstream attempt, so prefer confirmed usable quota before
 // trying an optimistic default (which scores as 100% headroom).
 //
-// Measured exhaustion with a known future reset cannot recover by replaying
-// the same request. Unknown or stale scores stay eligible as a last resort.
+// Exhaustion with a known future reset cannot recover by replaying the same
+// request. Unknown scores and stale scores without a known reset remain a last
+// resort.
 // The caller still applies authoritative account/model cooldown exclusions.
 func claudeRetryCandidatesFromScores(
 	base, model selectacct.Scheduler,
@@ -25,8 +26,11 @@ func claudeRetryCandidatesFromScores(
 ) []accounts.Account {
 	modelKey := selectacct.ModelKey(poolModel)
 	hasDedicatedPool := modelKey != "" && base.HasModelPool(poolModel)
-	verified := make([]accounts.Account, 0, len(candidates))
+	// Keep measured headroom ahead of optimistic or stale scores. The caller
+	// still applies explicit controller marks before reaching this function.
+	measured := make([]accounts.Account, 0, len(candidates))
 	possible := make([]accounts.Account, 0, len(candidates))
+	uncertain := make([]accounts.Account, 0, len(candidates))
 	for _, candidate := range candidates {
 		provider := schedulerAccountProvider(candidate.Provider)
 		baseScore := base.ScoreFor(provider, candidate.ID)
@@ -43,21 +47,27 @@ func claudeRetryCandidatesFromScores(
 				continue
 			}
 		}
-		if baseScore.Fresh && model.Exhausted(provider, candidate.ID) {
+		if model.Exhausted(provider, candidate.ID) {
 			if resetAt, known := modelScore.ExhaustionClearsAt(); known && resetAt.After(now) {
-				// A measured quota window is still exhausted. Avoid sending
-				// another upstream call before its actual reset.
+				// A known future reset cannot recover by replaying the same
+				// request, whether the score is fresh or carried forward.
 				continue
 			}
+			// A fresh exhausted score without a reset is not headroom, but it
+			// also is not a known future reset. Keep it as a last resort after
+			// accounts with measurable capacity and unknown scores. A stale
+			// exhausted score follows the same last-resort path.
+			uncertain = append(uncertain, candidate)
+			continue
 		}
-		possible = append(possible, candidate)
-		if candidate.AuthMode == accounts.AuthModeOAuth && baseScore.Fresh &&
-			model.UsableForNewSession(provider, candidate.ID) {
-			verified = append(verified, candidate)
+		if baseScore.Fresh {
+			measured = append(measured, candidate)
+		} else {
+			possible = append(possible, candidate)
 		}
 	}
-	if len(verified) > 0 {
-		return verified
+	if len(measured) > 0 {
+		return measured
 	}
-	return possible
+	return append(possible, uncertain...)
 }
