@@ -1657,7 +1657,19 @@ func (r *AccountRef) RefreshUsageStatusSnapshotFromWindows(scores ...selectacct.
 		}
 		row.Windows = mergedWindows
 		row.UsageFresh = true
-		row.UsageFetchedAt = entry.at
+		// One timestamp describes the account-wide reset cells rendered by
+		// sr status. A feature-only refresh must not re-anchor older relative
+		// reset durations as if the account-wide endpoint had just answered.
+		accountWideObserved := false
+		for _, window := range entry.windows {
+			if window.Feature == "" && window.ExtraUsage == nil {
+				accountWideObserved = true
+				break
+			}
+		}
+		if accountWideObserved || row.UsageFetchedAt.IsZero() {
+			row.UsageFetchedAt = entry.at
+		}
 		row.QuotaUsageKnown = len(mergedWindows) > 0
 		row.ExtraUsage = extraUsageFromWindows(mergedWindows)
 		row.Error = ""

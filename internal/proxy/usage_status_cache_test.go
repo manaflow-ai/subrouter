@@ -381,8 +381,8 @@ func TestRefreshUsageStatusSnapshotFromWindowsPreservesAccountWindowsOnPartialRe
 	if !ok || len(statuses) != 1 {
 		t.Fatalf("snapshot = (%+v, %v), want one published status", statuses, ok)
 	}
-	if !statuses[0].UsageFetchedAt.Equal(newAt) {
-		t.Fatalf("partial refresh observation time = %s, want %s", statuses[0].UsageFetchedAt, newAt)
+	if !statuses[0].UsageFetchedAt.Equal(oldAt) {
+		t.Fatalf("partial refresh observation time = %s, want account observation %s", statuses[0].UsageFetchedAt, oldAt)
 	}
 	if len(statuses[0].Windows) != 3 {
 		t.Fatalf("partial refresh windows = %+v, want account and model buckets", statuses[0].Windows)
