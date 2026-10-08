@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -44,6 +45,29 @@ func findFeatureWindow(windows []accounts.UsageWindow, feature string) (accounts
 	return accounts.UsageWindow{}, false
 }
 
+type partialSupplementalTransport struct {
+	usageCalls int
+	fableCalls int
+}
+
+func (t *partialSupplementalTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	switch req.URL.Path {
+	case "/api/oauth/usage":
+		t.usageCalls++
+		return claudeUsageOK(), nil
+	case "/v1/messages":
+		t.fableCalls++
+		header := passiveClaudeHeader("7d_oi", "0.4")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     header,
+			Body:       io.NopCloser(strings.NewReader(`{"type":"message"}`)),
+		}, nil
+	default:
+		return nil, fmt.Errorf("unexpected Claude quota path %s", req.URL.Path)
+	}
+}
+
 func TestPassiveClaudeReplyEliminatesSupplementaryQuotaProbe(t *testing.T) {
 	account := passiveClaudeAccount("access-token", "grant-v1")
 	ref := &AccountRef{accounts: []accounts.Account{account}}
@@ -60,6 +84,28 @@ func TestPassiveClaudeReplyEliminatesSupplementaryQuotaProbe(t *testing.T) {
 	}
 	if transport.calls != 1 {
 		t.Fatalf("expected only the normal usage fetch, got %d upstream calls", transport.calls)
+	}
+}
+
+func TestPassiveOpusEvidenceStillProbesMissingFableQuota(t *testing.T) {
+	account := passiveClaudeAccount("access-token", "grant-v1")
+	ref := &AccountRef{accounts: []accounts.Account{account}}
+	ref.observeClaudeQuotaHeaders(account, passiveClaudeHeader("7d_opus", "0.6"), time.Now())
+	transport := &partialSupplementalTransport{}
+	windows, fresh, err := ref.FetchUsageWindowsCached(context.Background(), &http.Client{Transport: transport}, account)
+	if err != nil || !fresh {
+		t.Fatalf("quota fetch failed: fresh=%t err=%v", fresh, err)
+	}
+	if transport.usageCalls != 1 || transport.fableCalls != 1 {
+		t.Fatalf("quota calls = usage %d fable %d, want one of each", transport.usageCalls, transport.fableCalls)
+	}
+	opus, ok := findFeatureWindow(windows, agentclaude.OpusFeature)
+	if !ok || opus.UsedPercent != 60 {
+		t.Fatalf("passive Opus evidence was lost: %+v", windows)
+	}
+	fable, ok := findFeatureWindow(windows, agentclaude.FableFeature)
+	if !ok || fable.UsedPercent != 40 {
+		t.Fatalf("Fable probe evidence missing: %+v", windows)
 	}
 }
 

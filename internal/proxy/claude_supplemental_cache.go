@@ -173,7 +173,14 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
 			// predate it. Do not let the scheduler treat old headroom as a live
 			// routing signal; keep the last score until a new probe observes it.
 			supplementalFresh := len(supplemental) == 0 || time.Since(observedAt) < usageWindowsTTL
-			return mergeUsageWindows(windows, supplemental), supplementalFresh, nil
+			windows = mergeUsageWindows(windows, supplemental)
+			// Passive replies can supply only one model family's bucket. Keep
+			// that evidence, but still probe the missing Fable/OAuth-app bucket;
+			// otherwise a fresh Opus-only observation makes Fable look unsupported
+			// and suppresses the only probe that can discover its quota.
+			if len(supplemental) == 0 || usageWindowNamed(windows, agentclaude.FableWindowName) {
+				return windows, supplementalFresh, nil
+			}
 		}
 	}
 
