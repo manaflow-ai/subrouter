@@ -26,7 +26,7 @@ func TestFetchUsageWindowsSharedRechecksActiveThrottleBeforeFlight(t *testing.T)
 	}
 	ref.usageWindowsMu.Unlock()
 
-	windows, _, err := ref.fetchUsageWindowsShared(context.Background(), client, account, cacheKey)
+	windows, _, _, err := ref.fetchUsageWindowsShared(context.Background(), client, account, cacheKey)
 	if !errors.Is(err, throttleErr) || windows != nil {
 		t.Fatalf("active throttle was not reused: windows=%v err=%v", windows, err)
 	}
