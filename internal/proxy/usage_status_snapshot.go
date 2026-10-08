@@ -207,16 +207,24 @@ func (r *AccountRef) persistUsageStatusSnapshot(statuses []AccountUsageStatus) {
 			existing.AccountKey == snapshot.AccountKey &&
 			existing.DiskGeneration == snapshot.DiskGeneration {
 			if existing.SavedAt.After(snapshot.SavedAt) {
-				return
+				snapshot.SavedAt = existing.SavedAt
 			}
 			byKey := make(map[string]durableUsageStatusSnapshotRow, len(existing.Rows))
 			for _, row := range existing.Rows {
 				byKey[string(row.Provider)+"\x00"+row.ID] = row
 			}
+			seen := make(map[string]struct{}, len(snapshot.Rows))
 			for i, row := range snapshot.Rows {
-				old, ok := byKey[string(row.Provider)+"\x00"+row.ID]
+				key := string(row.Provider) + "\x00" + row.ID
+				seen[key] = struct{}{}
+				old, ok := byKey[key]
 				if ok && old.Status.UsageFetchedAt.After(row.Status.UsageFetchedAt) {
 					snapshot.Rows[i] = old
+				}
+			}
+			for key, row := range byKey {
+				if _, ok := seen[key]; !ok {
+					snapshot.Rows = append(snapshot.Rows, row)
 				}
 			}
 		}
