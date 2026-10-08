@@ -385,8 +385,8 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 			http.Error(w, "unexpected path", http.StatusNotFound)
 			return
 		}
-		if req.URL.Query().Get("snapshot") != "1" {
-			t.Errorf("usage status query = %q, want snapshot=1", req.URL.RawQuery)
+		if req.URL.Query().Get("refresh") != "1" {
+			t.Errorf("usage status query = %q, want refresh=1", req.URL.RawQuery)
 		}
 		_ = json.NewEncoder(w).Encode([]remoteServerUsageStatus{{
 			ID: "acct@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth,
@@ -420,6 +420,30 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "avail") {
 		t.Fatalf("status did not render complimentary reset status:\n%s", out.String())
+	}
+}
+
+func TestRemoteSingleAccountStatusChecksLiveUsage(t *testing.T) {
+	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/_subrouter/usage-status" || req.URL.Query().Get("refresh") != "1" {
+			t.Errorf("single-account status requested %s?%s instead of live quota", req.URL.Path, req.URL.RawQuery)
+		}
+		_ = json.NewEncoder(w).Encode([]remoteServerUsageStatus{{
+			ID: "acct@example.com", Email: "acct@example.com",
+			Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth,
+			AuthValid: true, PlanType: "max",
+			Windows: []accounts.UsageWindow{{Name: "5h", UsedPercent: 20, LimitWindowSeconds: 18000}},
+		}})
+	}))
+	defer serverHTTP.Close()
+	var out bytes.Buffer
+	runner := srRunner{out: &out, errOut: &out, client: serverHTTP.Client()}
+	server := srServerConfig{Name: "team", URL: serverHTTP.URL}
+	if err := runner.statusOneRemote(context.Background(), server, "acct@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "acct@example.com") || !strings.Contains(out.String(), "80%") {
+		t.Fatalf("single-account status failed to show live quota: %s", out.String())
 	}
 }
 
