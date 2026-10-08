@@ -36,9 +36,17 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 	r.usageWindowsMu.Lock()
 	defer r.usageWindowsMu.Unlock()
 	existing, hadPrevious := r.claudeSupplemental[key]
-	if hadPrevious && !requestStarted.After(existing.at) {
-		// Older concurrent requests must not overwrite newer quota evidence.
-		return
+	if hadPrevious {
+		previousStart := existing.requestStarted
+		if previousStart.IsZero() {
+			// Ordinary quota probes do not represent a model request. A reply
+			// started before that probe cannot supersede its later evidence.
+			previousStart = existing.at
+		}
+		if !requestStarted.After(previousStart) {
+			// Older concurrent requests must not overwrite newer quota evidence.
+			return
+		}
 	}
 
 	for _, window := range windows {
@@ -49,7 +57,7 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 			return
 		}
 	}
-	observedAt := requestStarted
+	observedAt := now // the headers arrived now, regardless of request duration
 	if hadPrevious && claudeSupplementalFreshEnough(existing, now) {
 		// Merge partial headers, but do not renew the age of older buckets
 		// unless the reply contains a replacement for every prior bucket.
@@ -69,7 +77,8 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 		r.claudeSupplemental = map[string]claudeSupplementalUsage{}
 	}
 	r.claudeSupplemental[key] = claudeSupplementalUsage{
-		windows: append([]accounts.UsageWindow(nil), windows...),
-		at:      observedAt,
+		windows:        append([]accounts.UsageWindow(nil), windows...),
+		at:             observedAt,
+		requestStarted: requestStarted,
 	}
 }
