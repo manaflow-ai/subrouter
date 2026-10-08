@@ -30,7 +30,8 @@ const (
 	srStatusStateProtected = "protected"
 	// srStatusStateReady is an account the text table shows with no state
 	// marker: usable, not recommended, not protected.
-	srStatusStateReady = "ready"
+	srStatusStateReady     = "ready"
+	srStatusStateThrottled = "throttled"
 )
 
 const srStatusJSONSchemaVersion = 1
@@ -109,6 +110,8 @@ func srStatusAccountState(row srUsageRow) string {
 		return srStatusStateActive
 	case markers["rec"]:
 		return srStatusStateRec
+	case markers["throttled"]:
+		return srStatusStateThrottled
 	case strings.Contains(compactPickReason(row), "protected <"):
 		return srStatusStateProtected
 	default:

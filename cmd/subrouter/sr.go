@@ -3810,9 +3810,9 @@ func usageGridState(row srUsageRow) string {
 			return "error"
 		}
 		if row.active {
-			return "active"
+			return "active, throttled"
 		}
-		return "ready"
+		return "throttled"
 	}
 	if usageProvider(row) == accounts.ProviderAntigravity && row.authMode == accounts.AuthModeOAuth {
 		active := row.active || (row.sessionsKnown && row.assignedSessions > 0)

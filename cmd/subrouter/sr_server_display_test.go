@@ -43,8 +43,8 @@ func TestServerUsageRowsTreatHeaderlessThrottleAsUsableWithoutQuotaEvidence(t *t
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want one", len(rows))
 	}
-	if got := usageGridState(rows[0]); got != "ready" {
-		t.Fatalf("state = %q, want ready", got)
+	if got := usageGridState(rows[0]); got != "throttled" {
+		t.Fatalf("state = %q, want throttled", got)
 	}
 	if !usableForNewSession(rows[0].score) {
 		t.Fatalf("headerless telemetry throttle should remain score-eligible: %+v", rows[0])
