@@ -121,13 +121,13 @@ func TestUsageThrottleKeepsProviderResetWindowsAcrossFailureCache(t *testing.T) 
 	client := &http.Client{Transport: transport}
 	account := accounts.Account{ID: "claude-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "token-a"}
 
-	windows, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
-	if err != nil || fresh || len(windows) != 1 {
-		t.Fatalf("first throttled read: windows=%v fresh=%t err=%v", windows, fresh, err)
+	windows, fresh, observedAt, throttled, err := ref.FetchUsageWindowsCachedWithObservation(context.Background(), client, account)
+	if err != nil || fresh || !throttled || observedAt.IsZero() || len(windows) != 1 {
+		t.Fatalf("first throttled read: windows=%v fresh=%t observed=%v throttled=%t err=%v", windows, fresh, observedAt, throttled, err)
 	}
-	windows, fresh, err = ref.FetchUsageWindowsCached(context.Background(), client, account)
-	if err != nil || fresh || len(windows) != 1 {
-		t.Fatalf("cached throttled read: windows=%v fresh=%t err=%v", windows, fresh, err)
+	windows, fresh, observedAt, throttled, err = ref.FetchUsageWindowsCachedWithObservation(context.Background(), client, account)
+	if err != nil || fresh || !throttled || observedAt.IsZero() || len(windows) != 1 {
+		t.Fatalf("cached throttled read: windows=%v fresh=%t observed=%v throttled=%t err=%v", windows, fresh, observedAt, throttled, err)
 	}
 	if transport.calls != 1 {
 		t.Fatalf("cached throttled read made another upstream call: %d", transport.calls)
