@@ -1569,7 +1569,13 @@ func (r *AccountRef) UsageStatusesFresh(ctx context.Context) []AccountUsageStatu
 		// The status lock is held while clearing the per-account observation so
 		// the sweep cannot start between invalidation and the live request.
 		r.usageWindowsMu.Lock()
-		r.usageWindows = nil
+		staleAt := time.Now().Add(-usageWindowsTTL - time.Second)
+		for key, entry := range r.usageWindows {
+			// Force the next read to contact the provider, but retain the last
+			// windows so a transient 429 can still render reset metadata.
+			entry.at = staleAt
+			r.usageWindows[key] = entry
+		}
 		r.usageWindowsLatest = nil
 		r.usageWindowsFailures = nil
 		r.usageWindowsEpoch++
