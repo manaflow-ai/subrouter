@@ -93,7 +93,7 @@ func TestPassiveClaudeOlderReplyDoesNotOverwriteNewerQuota(t *testing.T) {
 func TestPassiveClaudePartialFeatureHeadersKeepOlderBucketsAged(t *testing.T) {
 	account := passiveClaudeAccount("token", "grant-v1")
 	ref := &AccountRef{accounts: []accounts.Account{account}}
-	earlier := time.Now().Add(-2*time.Minute)
+	earlier := time.Now().Add(-2 * time.Minute)
 	later := earlier.Add(time.Minute)
 	ref.observeClaudeQuotaHeaders(account, passiveClaudeHeader("7d_opus", "0.6"), earlier)
 	ref.observeClaudeQuotaHeaders(account, passiveClaudeHeader("7d_oi", "0.4"), later)
