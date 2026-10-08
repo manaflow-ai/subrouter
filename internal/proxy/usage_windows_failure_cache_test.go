@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -98,6 +99,38 @@ func TestUsageThrottleKeepsLastGoodStaleWithoutExtraRequests(t *testing.T) {
 	}
 	if transport.calls != calls {
 		t.Fatalf("extra upstream probes while throttled: %d after %d", transport.calls, calls)
+	}
+}
+
+func TestUsageThrottleKeepsProviderResetWindowsAcrossFailureCache(t *testing.T) {
+	reset := time.Now().Add(2 * time.Hour).Unix()
+	transport := &countingTransport{responses: func() *http.Response {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429 Too Many Requests",
+			Header: http.Header{
+				"Retry-After":                                []string{"1800"},
+				"Anthropic-Ratelimit-Unified-5h-Status":      []string{"allowed"},
+				"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.42"},
+				"Anthropic-Ratelimit-Unified-5h-Reset":       []string{strconv.FormatInt(reset, 10)},
+			},
+			Body: io.NopCloser(strings.NewReader("{}")),
+		}
+	}}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	account := accounts.Account{ID: "claude-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "token-a"}
+
+	windows, fresh, observedAt, throttled, err := ref.FetchUsageWindowsCachedWithObservation(context.Background(), client, account)
+	if err != nil || fresh || !throttled || observedAt.IsZero() || len(windows) != 1 {
+		t.Fatalf("first throttled read: windows=%v fresh=%t observed=%v throttled=%t err=%v", windows, fresh, observedAt, throttled, err)
+	}
+	windows, fresh, observedAt, throttled, err = ref.FetchUsageWindowsCachedWithObservation(context.Background(), client, account)
+	if err != nil || fresh || !throttled || observedAt.IsZero() || len(windows) != 1 {
+		t.Fatalf("cached throttled read: windows=%v fresh=%t observed=%v throttled=%t err=%v", windows, fresh, observedAt, throttled, err)
+	}
+	if transport.calls != 1 {
+		t.Fatalf("cached throttled read made another upstream call: %d", transport.calls)
 	}
 }
 

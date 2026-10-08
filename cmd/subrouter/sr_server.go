@@ -1125,7 +1125,7 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 		srRunner.printCodexCapacityStatus,
 		srRunner.printTokenUsageStatus,
 	)
-	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
+	usage, available, err := r.fetchServerUsageSnapshot(ctx, server)
 	if err != nil {
 		return err
 	}
@@ -1334,7 +1334,7 @@ func (r srRunner) pickRemoteAccount(ctx context.Context, server srServerConfig) 
 }
 
 func (r srRunner) statusOneRemote(ctx context.Context, server srServerConfig, selector string) error {
-	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
+	usage, available, err := r.fetchServerUsageSnapshot(ctx, server)
 	if err != nil {
 		return err
 	}
@@ -1428,6 +1428,7 @@ type remoteServerUsageStatus struct {
 	ProviderModels     *int                             `json:"provider_models,omitempty"`
 	ProviderEndpoints  []string                         `json:"provider_endpoints,omitempty"`
 	QuotaStatus        string                           `json:"quota_status,omitempty"`
+	UsageThrottled     bool                             `json:"usage_throttled,omitempty"`
 	AccountIdentity    string                           `json:"account_identity,omitempty"`
 	QuotaUsageKnown    bool                             `json:"quota_usage_known,omitempty"`
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
@@ -1541,13 +1542,22 @@ func (r srRunner) fetchServerAccountStatuses(ctx context.Context, server srServe
 }
 
 func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerConfig) ([]remoteServerUsageStatus, bool, error) {
+	return r.fetchServerUsageStatusesQuery(ctx, server, "refresh=1")
+}
+
+// fetchServerUsageSnapshot reads the controller's last usage sweep. The
+// server seeds the snapshot once when none exists, then serves it without
+// starting another provider sweep or changing routing scores.
+func (r srRunner) fetchServerUsageSnapshot(ctx context.Context, server srServerConfig) ([]remoteServerUsageStatus, bool, error) {
+	return r.fetchServerUsageStatusesQuery(ctx, server, "snapshot=1")
+}
+
+func (r srRunner) fetchServerUsageStatusesQuery(ctx context.Context, server srServerConfig, query string) ([]remoteServerUsageStatus, bool, error) {
 	baseURL, err := serverControlBaseURL(server)
 	if err != nil {
 		return nil, false, err
 	}
-	// `sr status` is an interactive read; bypass the daemon's short shared
-	// usage cache so quota changes are visible immediately after a request.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/usage-status?refresh=1", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/usage-status?"+query, nil)
 	if err != nil {
 		return nil, false, redactServerRequestError(err, server)
 	}
@@ -1594,6 +1604,11 @@ func serverUsageDisplayAccount(status remoteServerUsageStatus) string {
 	return ""
 }
 
+func serverUsageThrottleError(message string) bool {
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "429") || strings.Contains(lower, "too many requests")
+}
+
 func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUsageRow {
 	rows := make([]srUsageRow, 0, len(statuses))
 	now := time.Now()
@@ -1628,6 +1643,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			complimentaryReset: status.ComplimentaryReset,
 			extraUsage:         status.ExtraUsage,
 			provider:           status.Provider,
+			usageThrottled:     status.UsageThrottled || status.QuotaStatus == "throttled" || serverUsageThrottleError(status.Error),
 			providerHealth:     status.ProviderHealth,
 			authChecked:        status.AuthChecked,
 			authValid:          status.AuthValid,
@@ -1668,6 +1684,17 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 				row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
 			} else {
 				row.score = selectacct.Score{AccountID: email, Headroom: 0, ShortHeadroom: 0}
+			}
+		} else if status.UsageThrottled || status.QuotaStatus == "throttled" {
+			// A telemetry 429 has no quota meaning. Preserve authoritative reset
+			// windows when supplied; only headerless throttles get an optimistic
+			// display score while the controller suppresses another poll.
+			if len(status.Windows) > 0 {
+				row.score = scoreFromWindows(email, status.Windows)
+				row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
+				row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
+			} else {
+				row.score = selectacct.Score{AccountID: email, Headroom: 1, ShortHeadroom: 1}
 			}
 		} else if status.AuthMode == accounts.AuthModeAPIKey && status.QuotaUsageKnown {
 			row.score = scoreFromWindows(email, status.Windows)

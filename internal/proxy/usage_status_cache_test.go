@@ -15,6 +15,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 type usageRoundTripper struct {
@@ -146,6 +147,169 @@ func TestUsageStatusRefreshQueryKeepsAccountWindowCache(t *testing.T) {
 	}
 }
 
+func TestUsageStatusSnapshotQueryReusesLastSweep(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse(), usageOKResponse()}}
+	ref := cacheTestAccountRef(t, transport)
+	handler := Server{AccountRef: ref}.Handler()
+
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status?snapshot=1", nil))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first snapshot = %d: %s", first.Code, first.Body.String())
+	}
+	callsAfterFirst := transport.calls
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status?snapshot=1", nil))
+	if second.Code != http.StatusOK {
+		t.Fatalf("second snapshot = %d: %s", second.Code, second.Body.String())
+	}
+	if transport.calls != callsAfterFirst {
+		t.Fatalf("snapshot read started another upstream sweep (%d -> %d calls)", callsAfterFirst, transport.calls)
+	}
+	ref.usageStatusMu.Lock()
+	ref.usageStatusAt = time.Now().Add(-time.Hour)
+	ref.usageStatusMu.Unlock()
+	third := httptest.NewRecorder()
+	handler.ServeHTTP(third, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status?snapshot=1", nil))
+	if third.Code != http.StatusOK {
+		t.Fatalf("aged snapshot = %d: %s", third.Code, third.Body.String())
+	}
+	if transport.calls != callsAfterFirst {
+		t.Fatalf("aged snapshot read started another upstream sweep (%d -> %d calls)", callsAfterFirst, transport.calls)
+	}
+}
+
+func TestUsageStatusSnapshotPersistsAcrossAccountRefRestart(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse()}}
+	first := cacheTestAccountRef(t, transport)
+	statuses := first.UsageStatuses(context.Background())
+	if len(statuses) != 1 || len(statuses[0].Windows) == 0 {
+		t.Fatalf("initial status = %+v, want usage windows", statuses)
+	}
+	path := usageStatusSnapshotPath(first.store)
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("usage snapshot was not persisted at %s: %v", path, err)
+	}
+	if strings.Contains(string(body), "tok") || strings.Contains(string(body), "ref") {
+		t.Fatalf("usage snapshot persisted credential material: %s", body)
+	}
+
+	second := &AccountRef{
+		accounts:    first.All(),
+		store:       first.store,
+		claudeStore: first.claudeStore,
+		client:      &http.Client{Transport: &usageRoundTripper{}},
+	}
+	second.restoreUsageStatusSnapshot()
+	got, ok := second.UsageStatusSnapshot()
+	if !ok || len(got) != 1 || len(got[0].Windows) == 0 {
+		t.Fatalf("restarted snapshot = (%+v, %v), want cached usage windows", got, ok)
+	}
+	if got[0].UsageFresh {
+		t.Fatal("restarted snapshot was marked live-fresh")
+	}
+	if !got[0].UsageFetchedAt.Equal(statuses[0].UsageFetchedAt) {
+		t.Fatalf("restarted observation time = %s, want %s", got[0].UsageFetchedAt, statuses[0].UsageFetchedAt)
+	}
+}
+
+func TestUsageStatusSnapshotRejectsCredentialRotation(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse()}}
+	first := cacheTestAccountRef(t, transport)
+	if statuses := first.UsageStatuses(context.Background()); len(statuses) != 1 {
+		t.Fatalf("initial statuses = %+v, want one row", statuses)
+	}
+	rotated := first.All()
+	if len(rotated) != 1 {
+		t.Fatalf("accounts = %+v, want one account", rotated)
+	}
+	rotated[0].CredentialVersion = "rotated-credential"
+	second := &AccountRef{
+		accounts:    rotated,
+		store:       first.store,
+		claudeStore: first.claudeStore,
+		client:      &http.Client{Transport: &usageRoundTripper{}},
+	}
+	second.restoreUsageStatusSnapshot()
+	if _, ok := second.UsageStatusSnapshot(); ok {
+		t.Fatal("snapshot survived a credential rotation")
+	}
+}
+
+func TestUsageStatusSnapshotRejectsDiskGenerationChange(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse()}}
+	first := cacheTestAccountRef(t, transport)
+	first.diskGeneration = "old-generation"
+	if statuses := first.UsageStatuses(context.Background()); len(statuses) != 1 {
+		t.Fatalf("initial statuses = %+v, want one row", statuses)
+	}
+	second := &AccountRef{
+		accounts:       first.All(),
+		diskGeneration: "new-generation",
+		store:          first.store,
+		claudeStore:    first.claudeStore,
+		client:         &http.Client{Transport: &usageRoundTripper{}},
+	}
+	second.restoreUsageStatusSnapshot()
+	if _, ok := second.UsageStatusSnapshot(); ok {
+		t.Fatal("snapshot survived an account disk generation change")
+	}
+}
+
+func TestRefreshUsageStatusSnapshotFromWindowsPublishesResetWindows(t *testing.T) {
+	ref := cacheTestAccountRef(t, &usageRoundTripper{})
+	ref.accounts = []accounts.Account{{
+		ID: "claude@example.com", Provider: accounts.ProviderClaude,
+		AuthMode: accounts.AuthModeOAuth, Email: "claude@example.com",
+	}}
+	observedAt := time.Now().Add(-time.Minute).UTC()
+	ref.usageWindows = map[string]usageWindowsEntry{
+		"claude@example.com\x00claude": {
+			windows: []accounts.UsageWindow{{
+				Name: "7d", UsedPercent: 100, LimitWindowSeconds: 604800,
+				ResetAfterSeconds: 3600,
+			}},
+			at: observedAt,
+		},
+	}
+	ref.RefreshUsageStatusSnapshotFromWindows(selectacct.Score{
+		AccountID: "claude@example.com", Provider: accounts.ProviderClaude, Fresh: true,
+	})
+	statuses, ok := ref.UsageStatusSnapshot()
+	if !ok || len(statuses) != 1 {
+		t.Fatalf("snapshot = (%+v, %v), want one published status", statuses, ok)
+	}
+	if len(statuses[0].Windows) != 1 || statuses[0].Windows[0].Name != "7d" {
+		t.Fatalf("snapshot windows = %+v, want cached weekly window", statuses[0].Windows)
+	}
+	if !statuses[0].UsageFresh || !statuses[0].UsageFetchedAt.Equal(observedAt) {
+		t.Fatalf("snapshot freshness = %v at %s, want fresh at %s", statuses[0].UsageFresh, statuses[0].UsageFetchedAt, observedAt)
+	}
+	ref.usageWindows["claude@example.com\x00claude"] = usageWindowsEntry{
+		windows: []accounts.UsageWindow{{Name: "7d", UsedPercent: 50}},
+		at:      observedAt.Add(-time.Minute),
+	}
+	ref.RefreshUsageStatusSnapshotFromWindows(selectacct.Score{
+		AccountID: "claude@example.com", Provider: accounts.ProviderClaude, Fresh: true,
+	})
+	statuses, _ = ref.UsageStatusSnapshot()
+	if !statuses[0].UsageFetchedAt.Equal(observedAt) || statuses[0].Windows[0].UsedPercent != 100 {
+		t.Fatalf("older score refresh regressed snapshot: %+v", statuses[0])
+	}
+	body, err := os.ReadFile(usageStatusSnapshotPath(ref.store))
+	if err != nil {
+		t.Fatalf("read persisted usage snapshot: %v", err)
+	}
+	var persisted durableUsageStatusSnapshot
+	if err := json.Unmarshal(body, &persisted); err != nil {
+		t.Fatalf("decode persisted usage snapshot: %v", err)
+	}
+	if len(persisted.Rows) != 1 || !persisted.Rows[0].Status.UsageFetchedAt.Equal(observedAt) {
+		t.Fatalf("persisted snapshot regressed observation: %+v", persisted.Rows)
+	}
+}
+
 func TestUsageStatusesRestoresLastGoodOnTransientFailure(t *testing.T) {
 	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse(), usage429Response()}}
 	ref := cacheTestAccountRef(t, transport)
@@ -206,6 +370,32 @@ func TestMergeUsageStatusesExpiresFromProviderObservationTime(t *testing.T) {
 	got := ref.mergeUsageStatusesLocked([]AccountUsageStatus{stale}, ref.usageStatusEpoch)
 	if len(got) != 1 || len(got[0].Windows) != 0 {
 		t.Fatalf("expired last-good quota was restored: %+v", got)
+	}
+}
+
+func TestMergeUsageStatusesClassifiesPlain429AsTransientThrottle(t *testing.T) {
+	ref := &AccountRef{}
+	rows := ref.mergeUsageStatusesLocked([]AccountUsageStatus{{
+		AccountStatus: AccountStatus{
+			ID: "claude@example.com", Provider: accounts.ProviderClaude,
+			Error: "usage fetch failed: 429 Too Many Requests",
+		},
+	}}, ref.usageStatusEpoch)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v, want one row", rows)
+	}
+	if rows[0].Error != "" || rows[0].QuotaStatus != "" || !rows[0].UsageThrottled {
+		t.Fatalf("plain 429 classification = %+v, want transient throttled status", rows[0])
+	}
+
+	authRows := ref.mergeUsageStatusesLocked([]AccountUsageStatus{{
+		AccountStatus: AccountStatus{
+			ID: "claude@example.com", Provider: accounts.ProviderClaude,
+			Error: "usage fetch failed: 401 Unauthorized",
+		},
+	}}, ref.usageStatusEpoch)
+	if authRows[0].Error == "" || authRows[0].QuotaStatus == "throttled" {
+		t.Fatalf("401 classification = %+v, want authentication error", authRows[0])
 	}
 }
 

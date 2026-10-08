@@ -4273,6 +4273,7 @@ func keychainHash(instancePath string) string {
 type UsageThrottleError struct {
 	Status  string
 	RetryAt time.Time
+	Windows []accounts.UsageWindow
 }
 
 func (e *UsageThrottleError) Error() string { return "usage fetch failed: " + e.Status }
@@ -4320,7 +4321,12 @@ func FetchUsage(ctx context.Context, client *http.Client, accessToken string) (*
 	}
 	defer res.Body.Close()
 	if res.StatusCode == http.StatusTooManyRequests {
-		return nil, &UsageThrottleError{Status: res.Status, RetryAt: usageThrottleRetryAt(res.Header.Get("Retry-After"), time.Now())}
+		now := time.Now()
+		return nil, &UsageThrottleError{
+			Status:  res.Status,
+			RetryAt: usageThrottleRetryAt(res.Header.Get("Retry-After"), now),
+			Windows: usageWindowsFromFableHeaders(res.Header, now),
+		}
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return nil, fmt.Errorf("usage fetch failed: %s", res.Status)

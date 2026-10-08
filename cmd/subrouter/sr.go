@@ -315,6 +315,7 @@ type srUsageRow struct {
 	extraUsage         *accounts.ExtraUsageInfo
 	apiKeySpend        *accounts.APIKeyUsageSnapshot
 	apiKeyHint         string
+	usageThrottled     bool
 	err                error
 	score              selectacct.Score
 	gtoReason          string
@@ -3796,6 +3797,15 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 }
 
 func usageGridState(row srUsageRow) string {
+	if row.usageThrottled {
+		if row.err != nil {
+			return "error"
+		}
+		if row.active {
+			return "active"
+		}
+		return "ready"
+	}
 	if usageProvider(row) == accounts.ProviderAntigravity && row.authMode == accounts.AuthModeOAuth {
 		active := row.active || (row.sessionsKnown && row.assignedSessions > 0)
 		failed := row.err != nil || (row.authChecked && !row.authValid)
@@ -3943,6 +3953,8 @@ func usageGridStateColor(row srUsageRow) string {
 		return ansiDim
 	case usageProvider(row) == accounts.ProviderGrok && row.authMode == accounts.AuthModeOAuth && row.providerHealth == "stored" && row.err == nil:
 		return ansiDim
+	case row.usageThrottled:
+		return ansiYellow
 	case row.providerHealth != "" && row.providerHealth != "auth ok" && row.providerHealth != "ok" && row.providerHealth != "not checked":
 		return ansiRed
 	case row.err != nil || row.cooked:
@@ -3960,6 +3972,8 @@ func usageGridStateColor(row srUsageRow) string {
 
 func usageGridPickColor(row srUsageRow) string {
 	switch {
+	case row.usageThrottled:
+		return ansiYellow
 	case (row.err != nil && !qwenTelemetryOnlyFailure(row)) || row.cooked:
 		return ansiRed
 	case row.tempCooked || !displayRecommendedForNewSession(row):
@@ -3989,6 +4003,14 @@ func compactPickReason(row srUsageRow) string {
 		case "error":
 			return "quota unavailable"
 		}
+	}
+	if row.usageThrottled || (row.err != nil && serverUsageThrottleError(row.err.Error())) {
+		if len(row.windows) > 0 {
+			row.err = nil
+			row.usageThrottled = false
+			return compactPickReason(row)
+		}
+		return "quota pending"
 	}
 	// A usage refresh can fail after the server has retained a last-known-good
 	// quota snapshot. Keep the reset-aware Use text in that case; State and the
