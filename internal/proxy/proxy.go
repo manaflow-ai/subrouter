@@ -461,12 +461,12 @@ type AccountRef struct {
 	usageStatusSweep *usageStatusSweep
 	usageStatusEpoch uint64
 
-	usageWindowsMu         sync.Mutex
-	usageWindows           map[string]usageWindowsEntry
-	usageWindowsFlights    map[string]*usageWindowsFlight
-	usageWindowsLatest     map[string]string
-	usageWindowsFailures   map[string]usageWindowsFailure
-	claudeSupplemental     map[string]claudeSupplementalUsage
+	usageWindowsMu       sync.Mutex
+	usageWindows         map[string]usageWindowsEntry
+	usageWindowsFlights  map[string]*usageWindowsFlight
+	usageWindowsLatest   map[string]string
+	usageWindowsFailures map[string]usageWindowsFailure
+	claudeSupplemental   map[string]claudeSupplementalUsage
 	usageWindowsEpoch    uint64
 
 	credFailMu sync.Mutex
