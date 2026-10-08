@@ -4571,12 +4571,13 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 		if account.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
-		if _, blocked := knownAccountWideQuotaReset(current.ScoreFor(schedulerAccountProvider(account.Provider), account.ID), time.Now()); blocked {
-			// The provider has already supplied every binding account-wide
-			// reset time. Refreshing credentials and usage while exhausted
-			// creates requests but cannot improve this account's eligibility.
-			// Preserve the measured score and recheck at its reset.
-			continue
+		if s.SchedulerRef != nil && !s.SchedulerRef.UpdatedAt().IsZero() {
+			if _, blocked := knownAccountWideQuotaReset(current.ScoreFor(schedulerAccountProvider(account.Provider), account.ID), time.Now()); blocked {
+				// The provider has already supplied every binding account-wide
+				// reset time. Preserve the measured state without a new probe.
+				// A re-login invalidates the score timestamp and bypasses this.
+				continue
+			}
 		}
 		if failure, dead := s.AccountRef.terminalCredFailure(account); dead {
 			if s.Logger != nil {
