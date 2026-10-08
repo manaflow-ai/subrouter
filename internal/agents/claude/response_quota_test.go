@@ -63,3 +63,23 @@ func TestObservedFeatureUsageWindowsParsesRealModelBuckets(t *testing.T) {
 		}
 	}
 }
+
+func TestObservedFeatureUsageWindowsSharesQuotaParserPercentageSemantics(t *testing.T) {
+	for _, tt := range []struct {
+		header string
+		want   float64
+	}{
+		{header: "0.4", want: 40},
+		{header: "1", want: 100},
+		{header: "2.5", want: 2.5},
+		{header: "60", want: 60},
+	} {
+		h := make(http.Header)
+		h.Set("anthropic-ratelimit-unified-7d_opus-status", "allowed")
+		h.Set("anthropic-ratelimit-unified-7d_opus-utilization", tt.header)
+		got := ObservedFeatureUsageWindows(h, time.Now())
+		if len(got) != 1 || math.Abs(got[0].UsedPercent-tt.want) > 0.0001 {
+			t.Fatalf("utilization %q got %+v, want %v%%", tt.header, got, tt.want)
+		}
+	}
+}
