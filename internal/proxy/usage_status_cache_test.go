@@ -347,6 +347,94 @@ func TestRefreshUsageStatusSnapshotFromWindowsPublishesResetWindows(t *testing.T
 	}
 }
 
+func TestRefreshUsageStatusSnapshotFromWindowsPreservesAccountWindowsOnPartialRefresh(t *testing.T) {
+	ref := cacheTestAccountRef(t, &usageRoundTripper{})
+	ref.accounts = []accounts.Account{{
+		ID: "claude@example.com", Provider: accounts.ProviderClaude,
+		AuthMode: accounts.AuthModeOAuth, Email: "claude@example.com",
+	}}
+	oldAt := time.Now().Add(-2 * time.Minute).UTC()
+	newAt := oldAt.Add(time.Minute)
+	ref.usageStatusCache = []AccountUsageStatus{{
+		AccountStatus: AccountStatus{ID: "claude@example.com", Provider: accounts.ProviderClaude},
+		Windows: []accounts.UsageWindow{
+			{Name: "5h", UsedPercent: 35, LimitWindowSeconds: int64(5 * time.Hour / time.Second), ResetAfterSeconds: 3600},
+			{Name: "7d", UsedPercent: 20, LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second), ResetAfterSeconds: 3600},
+		},
+		UsageFetchedAt: oldAt,
+	}}
+	ref.usageWindows = map[string]usageWindowsEntry{
+		"claude@example.com\x00claude": {
+			// The supplemental/model-specific observation is newer but does not
+			// contain the account-wide windows the status table renders.
+			windows: []accounts.UsageWindow{{
+				Name: "opus-weekly", Feature: agentclaude.OpusFeature,
+				UsedPercent: 60, LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second),
+			}},
+			at: newAt,
+		},
+	}
+	ref.RefreshUsageStatusSnapshotFromWindows(selectacct.Score{
+		AccountID: "claude@example.com", Provider: accounts.ProviderClaude, Fresh: true,
+	})
+	statuses, ok := ref.UsageStatusSnapshot()
+	if !ok || len(statuses) != 1 {
+		t.Fatalf("snapshot = (%+v, %v), want one published status", statuses, ok)
+	}
+	if !statuses[0].UsageFetchedAt.Equal(newAt) {
+		t.Fatalf("partial refresh observation time = %s, want %s", statuses[0].UsageFetchedAt, newAt)
+	}
+	if len(statuses[0].Windows) != 3 {
+		t.Fatalf("partial refresh windows = %+v, want account and model buckets", statuses[0].Windows)
+	}
+	if statuses[0].Windows[0].UsedPercent != 35 || statuses[0].Windows[1].UsedPercent != 20 {
+		t.Fatalf("partial refresh erased account windows: %+v", statuses[0].Windows)
+	}
+	if statuses[0].Windows[2].Feature != agentclaude.OpusFeature || statuses[0].Windows[2].UsedPercent != 60 {
+		t.Fatalf("partial refresh did not publish model bucket: %+v", statuses[0].Windows)
+	}
+}
+
+func TestUsageStatusSnapshotLegacyRowsUseSavedAtForResetDisplays(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse()}}
+	first := cacheTestAccountRef(t, transport)
+	statuses := first.UsageStatuses(context.Background())
+	if len(statuses) != 1 || len(statuses[0].Windows) == 0 {
+		t.Fatalf("initial status = %+v, want usage windows", statuses)
+	}
+	path := usageStatusSnapshotPath(first.store)
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read usage snapshot: %v", err)
+	}
+	var persisted durableUsageStatusSnapshot
+	if err := json.Unmarshal(body, &persisted); err != nil {
+		t.Fatalf("decode usage snapshot: %v", err)
+	}
+	persisted.Rows[0].Status.UsageFetchedAt = time.Time{}
+	body, err = json.Marshal(persisted)
+	if err != nil {
+		t.Fatalf("encode legacy usage snapshot: %v", err)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write legacy usage snapshot: %v", err)
+	}
+	second := &AccountRef{
+		accounts:    first.All(),
+		store:       first.store,
+		claudeStore: first.claudeStore,
+		client:      &http.Client{Transport: &usageRoundTripper{}},
+	}
+	second.restoreUsageStatusSnapshot()
+	got, ok := second.UsageStatusSnapshot()
+	if !ok || len(got) != 1 || len(got[0].Windows) == 0 {
+		t.Fatalf("legacy restored snapshot = (%+v, %v), want usage windows", got, ok)
+	}
+	if !got[0].UsageFetchedAt.Equal(persisted.SavedAt) {
+		t.Fatalf("legacy restored observation time = %s, want saved-at %s", got[0].UsageFetchedAt, persisted.SavedAt)
+	}
+}
+
 func TestUsageStatusesRestoresLastGoodOnTransientFailure(t *testing.T) {
 	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse(), usage429Response()}}
 	ref := cacheTestAccountRef(t, transport)

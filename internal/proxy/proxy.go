@@ -1645,11 +1645,21 @@ func (r *AccountRef) RefreshUsageStatusSnapshotFromWindows(scores ...selectacct.
 			continue
 		}
 		row.Provider = provider
-		row.Windows = append([]accounts.UsageWindow(nil), entry.windows...)
+		// A score refresh can observe only Claude's model-specific buckets
+		// (the supplemental probe deliberately caches those separately). Keep
+		// account-wide 5h/7d and other previously observed buckets when a newer
+		// partial observation arrives, while letting matching keys from the new
+		// observation replace the old values. This prevents a feature-only
+		// refresh from erasing the reset windows sr status needs to display.
+		mergedWindows := append([]accounts.UsageWindow(nil), entry.windows...)
+		if len(row.Windows) > 0 && len(entry.windows) > 0 {
+			mergedWindows = mergeUsageWindows(row.Windows, entry.windows)
+		}
+		row.Windows = mergedWindows
 		row.UsageFresh = true
 		row.UsageFetchedAt = entry.at
-		row.QuotaUsageKnown = len(entry.windows) > 0
-		row.ExtraUsage = extraUsageFromWindows(entry.windows)
+		row.QuotaUsageKnown = len(mergedWindows) > 0
+		row.ExtraUsage = extraUsageFromWindows(mergedWindows)
 		row.Error = ""
 		rows[idx] = row
 	}
