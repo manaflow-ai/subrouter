@@ -5576,6 +5576,13 @@ func (s Server) proxyHandler() http.Handler {
 			if routed, ok := routedResponseAccount(response); ok {
 				responseAccount = routed
 			}
+			if requestProvider == accounts.ProviderClaude && s.AccountRef != nil &&
+				response.StatusCode >= 200 && response.StatusCode < 300 &&
+				!claudeResponseRejected(response.Header) {
+				// Reuse any model quota headers from this real request on the
+				// next ordinary usage refresh. Never generate an extra probe here.
+				s.AccountRef.observeClaudeQuotaHeaders(responseAccount, response.Header, requestStarted)
+			}
 			s.captureResponseBodyForAccount(response, r.Context(), sessionAgentType, sessionID, responseAccount, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
 			usageSessionKey := ""
 			if tokenUsageTrackedSession(r, sessionID) {
