@@ -2831,8 +2831,8 @@ func displayRecommendedForNewSession(row srUsageRow) bool {
 }
 
 func codexUsageRowLess(a, b srUsageRow) bool {
-	if (a.err != nil) != (b.err != nil) {
-		return a.err == nil
+	if at, bt := usageRowStatusTier(a), usageRowStatusTier(b); at != bt {
+		return at < bt
 	}
 	at, bt := usageRowTier(a), usageRowTier(b)
 	if at != bt {
@@ -2861,8 +2861,8 @@ func codexUsageRowLess(a, b srUsageRow) bool {
 }
 
 func claudeUsageRowLess(a, b srUsageRow) bool {
-	if (a.err != nil) != (b.err != nil) {
-		return a.err == nil
+	if at, bt := usageRowStatusTier(a), usageRowStatusTier(b); at != bt {
+		return at < bt
 	}
 	if a.active != b.active {
 		return a.active
@@ -3211,6 +3211,9 @@ func providerReaddCommand(provider accounts.Provider) string {
 }
 
 func authErrorNeedsReadd(err error) bool {
+	if err == nil {
+		return false
+	}
 	msg := strings.ToLower(err.Error())
 	for _, marker := range []string{"401", "unauthorized", "invalid_grant", "reauth", "refresh failed", "access_expired", "setup token expired"} {
 		if strings.Contains(msg, marker) {
@@ -3218,6 +3221,21 @@ func authErrorNeedsReadd(err error) bool {
 		}
 	}
 	return false
+}
+
+// usageRowStatusTier keeps rows that need human attention out of the usable
+// portion of the table. A headerless 429 is a telemetry throttle, not proof
+// that quota is exhausted, but it is still low-signal for a status scan. Keep
+// it beside credentials that need re-authentication or provider review.
+func usageRowStatusTier(row srUsageRow) int {
+	if row.usageThrottled || (row.err != nil && serverUsageThrottleError(row.err.Error())) ||
+		authErrorNeedsReadd(row.err) || claudeAccountOnHold(row.err) {
+		return 2
+	}
+	if row.err != nil {
+		return 1
+	}
+	return 0
 }
 
 func printUsageGridGroup(out io.Writer, columns []usageGridColumn, label string, colored bool) {
