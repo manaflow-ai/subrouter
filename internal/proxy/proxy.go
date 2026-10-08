@@ -1394,19 +1394,7 @@ func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (acc
 	if !ok {
 		return account, nil
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if i := accountIndex(r.accounts, account.ID, func(candidate accounts.Account) bool {
-		return sameProvider(candidate.Provider, account.Provider)
-	}); i >= 0 {
-		if r.accounts[i].CredentialIdentity() != next.CredentialIdentity() {
-			r.credentialRevision++
-		}
-		r.accounts[i] = next
-	} else {
-		r.accounts = append(r.accounts, next)
-		r.credentialRevision++
-	}
+	r.replace(next)
 	return next, nil
 }
 
@@ -1578,7 +1566,9 @@ func (r *AccountRef) UsageStatusesFresh(ctx context.Context) []AccountUsageStatu
 			r.usageWindows[key] = entry
 		}
 		r.usageWindowsLatest = nil
-		r.usageWindowsFailures = nil
+		// Keep provider Retry-After failures across an explicit refresh. The
+		// refresh makes successful observations stale, but it must not turn a
+		// known cooldown into a new upstream request on every `sr status`.
 		r.usageWindowsEpoch++
 		r.usageWindowsMu.Unlock()
 		sweep = &usageStatusSweep{done: make(chan struct{}), epoch: r.usageStatusEpoch}
@@ -2687,19 +2677,30 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 }
 
 func (r *AccountRef) replace(account accounts.Account) {
+	var previous accounts.Account
+	var credentialChanged bool
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if i := accountIndex(r.accounts, account.ID, func(candidate accounts.Account) bool {
 		return sameProvider(candidate.Provider, account.Provider)
 	}); i >= 0 {
+		previous = r.accounts[i]
 		if r.accounts[i].CredentialIdentity() != account.CredentialIdentity() {
 			r.credentialRevision++
+			credentialChanged = true
 		}
 		r.accounts[i] = account
-		return
+	} else {
+		r.accounts = append(r.accounts, account)
+		r.credentialRevision++
 	}
-	r.accounts = append(r.accounts, account)
-	r.credentialRevision++
+	if credentialChanged {
+		// A normal in-place OAuth refresh rotates the access token (and often
+		// the refresh grant) while keeping the same logical account. Preserve
+		// its measured quota and telemetry cooldown until ReloadSnapshot can
+		// explicitly invalidate a genuinely replaced login.
+		r.migrateUsageCredentialState(previous, account)
+	}
+	r.mu.Unlock()
 }
 
 func (s Server) Handler() http.Handler {

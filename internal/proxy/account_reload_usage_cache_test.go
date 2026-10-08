@@ -91,10 +91,19 @@ func TestUnchangedCredentialAndOrdinaryRefreshKeepUsageCache(t *testing.T) {
 		Token: "access-v1", CredentialVersion: "chain-v1",
 	}
 	key := original.ID + "\x00" + string(original.Provider)
+	oldCredentialKey := usageWindowsCredentialKey(original)
+	retryAt := time.Now().Add(time.Hour)
+	oldFailureKey := usageWindowsFailureKey(key, original.CredentialIdentity())
 	ref := &AccountRef{
 		accounts: []accounts.Account{original},
 		usageWindows: map[string]usageWindowsEntry{
 			key: {at: time.Now(), windows: []accounts.UsageWindow{{Name: "5h", UsedPercent: 30}}},
+		},
+		usageWindowsFailures: map[string]usageWindowsFailure{
+			oldFailureKey: {err: errors.New("429 Too Many Requests"), retryAt: retryAt},
+		},
+		usageWindowsLatest: map[string]string{
+			key: key + "\x00" + oldCredentialKey + "\x000",
 		},
 	}
 	ref.invalidateReplacedAccountUsage([]accounts.Account{original}, []accounts.Account{original})
@@ -107,6 +116,16 @@ func TestUnchangedCredentialAndOrdinaryRefreshKeepUsageCache(t *testing.T) {
 	ref.replace(refreshed)
 	if _, ok := ref.usageWindows[key]; !ok || ref.usageWindowsEpoch != 0 {
 		t.Fatal("ordinary token refresh needlessly invalidated successful quota readings")
+	}
+	newFailureKey := usageWindowsFailureKey(key, refreshed.CredentialIdentity())
+	if _, ok := ref.usageWindowsFailures[oldFailureKey]; ok {
+		t.Fatal("ordinary token refresh retained cooldown under the old credential key")
+	}
+	if failure, ok := ref.usageWindowsFailures[newFailureKey]; !ok || !failure.retryAt.Equal(retryAt) {
+		t.Fatalf("ordinary token refresh lost active cooldown: %+v", ref.usageWindowsFailures)
+	}
+	if _, ok := ref.usageWindowsLatest[key]; ok {
+		t.Fatal("ordinary token refresh left an old-credential fetch owning the cache")
 	}
 }
 
@@ -138,5 +157,27 @@ func TestReloadSnapshotDropsPreviousLoginQuota(t *testing.T) {
 	}
 	if !ref.usageStatusAt.IsZero() {
 		t.Fatal("credential reload kept the previous status view")
+	}
+}
+
+func TestRepairedGrantReplaceDoesNotCarryThrottle(t *testing.T) {
+	old := accounts.Account{
+		ID: "claude-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth,
+		Token: "same-access", CredentialVersion: "old-grant",
+	}
+	key := old.ID + "\x00" + string(old.Provider)
+	oldFailureKey := usageWindowsFailureKey(key, old.CredentialIdentity())
+	ref := &AccountRef{
+		accounts: []accounts.Account{old},
+		usageWindowsFailures: map[string]usageWindowsFailure{
+			oldFailureKey: {err: errors.New("429 Too Many Requests"), retryAt: time.Now().Add(time.Hour)},
+		},
+	}
+	repaired := old
+	repaired.CredentialVersion = "repaired-grant"
+	ref.replace(repaired)
+	newFailureKey := usageWindowsFailureKey(key, repaired.CredentialIdentity())
+	if _, ok := ref.usageWindowsFailures[newFailureKey]; ok {
+		t.Fatal("repaired refresh grant inherited the old credential throttle")
 	}
 }

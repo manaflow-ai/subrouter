@@ -167,7 +167,8 @@ func claudeFullUsageResponse(used float64) *http.Response {
 
 func TestUsageStatusRefreshChecksProviderAfterCachedThrottle(t *testing.T) {
 	// A prior 429 may carry a long Retry-After. An explicit user-requested
-	// status read must check the provider again and recover actual utilization.
+	// status read must preserve that cooldown instead of issuing another
+	// provider request on every repeated `sr status`.
 	transport := &usageRoundTripper{responses: []*http.Response{
 		{
 			StatusCode: http.StatusTooManyRequests,
@@ -201,8 +202,18 @@ func TestUsageStatusRefreshChecksProviderAfterCachedThrottle(t *testing.T) {
 		t.Fatalf("initial throttle: status=%+v calls=%d", first, transport.calls)
 	}
 	second := read("/_subrouter/usage-status?refresh=1")
+	if !second.UsageThrottled || transport.calls != 1 {
+		t.Fatalf("live refresh ignored cached 429 cooldown: status=%+v calls=%d", second, transport.calls)
+	}
+	ref.usageWindowsMu.Lock()
+	for key, failure := range ref.usageWindowsFailures {
+		failure.retryAt = time.Now().Add(-time.Second)
+		ref.usageWindowsFailures[key] = failure
+	}
+	ref.usageWindowsMu.Unlock()
+	second = read("/_subrouter/usage-status?refresh=1")
 	if second.UsageThrottled || len(second.Windows) == 0 || transport.calls != 2 {
-		t.Fatalf("live refresh retained cached 429: status=%+v calls=%d", second, transport.calls)
+		t.Fatalf("refresh after cooldown did not recover usage: status=%+v calls=%d", second, transport.calls)
 	}
 	for _, w := range second.Windows {
 		if w.Name == "5h" && w.UsedPercent != 22 {
@@ -211,7 +222,7 @@ func TestUsageStatusRefreshChecksProviderAfterCachedThrottle(t *testing.T) {
 	}
 	third := read("/_subrouter/usage-status?refresh=1")
 	if third.UsageThrottled || transport.calls != 3 {
-		t.Fatalf("second explicit refresh skipped provider: status=%+v calls=%d", third, transport.calls)
+		t.Fatalf("second explicit refresh did not check provider after successful observation: status=%+v calls=%d", third, transport.calls)
 	}
 	sawUpdated := false
 	for _, w := range third.Windows {
