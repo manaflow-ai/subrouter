@@ -948,17 +948,21 @@ func (r *SchedulerRef) MarkCredentialExhaustedForSnapshot(
 		(accountGeneration == r.accountGeneration && credentialRevision < r.credentialRevision) {
 		return false
 	}
+	publishesSnapshot := accountGeneration > r.accountGeneration
 	if accountGeneration > r.accountGeneration {
 		r.advanceAccountGenerationLocked(accountGeneration)
 	}
 	if credentialRevision > r.credentialRevision || r.credentialFingerprints == nil {
+		publishesSnapshot = true
 		r.credentialRevision = credentialRevision
 		r.credentialFingerprints = make(map[string]string, len(accounts))
 		for _, candidate := range accounts {
 			r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
 		}
 	}
-	r.pruneExhaustedMarksForAccountsLocked(accounts)
+	if publishesSnapshot {
+		r.pruneExhaustedMarksForAccountsLocked(accounts)
+	}
 
 	fingerprint := credentialFingerprint(credentialIdentity)
 	scoreKey := ScoreKey(provider, accountID)

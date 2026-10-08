@@ -508,9 +508,14 @@ func TestCredentialFailureSnapshotPrunesRemovedAccountAtSameRevision(t *testing.
 	removed := account.Account{ID: "removed@example.com", Provider: account.ProviderClaude}
 	kept := account.Account{ID: "kept@example.com", Provider: account.ProviderClaude, Token: "kept-token"}
 	ref := NewSchedulerRef(NewScheduler(nil))
-	ref.AdvanceAccountGenerationWithAccounts(1, 1, []account.Account{removed, kept})
 	ref.MarkExhaustedUntil(removed.Provider, removed.ID, "", time.Now().Add(time.Hour))
 
+	if !ref.MarkCredentialExhaustedForSnapshot(
+		kept.Provider, kept.ID, kept.CredentialIdentity(), time.Now().Add(time.Hour),
+		1, 1, []account.Account{kept},
+	) {
+		t.Fatal("credential snapshot was rejected")
+	}
 	if !ref.MarkCredentialExhaustedForSnapshot(
 		kept.Provider, kept.ID, kept.CredentialIdentity(), time.Now().Add(time.Hour),
 		1, 1, []account.Account{kept},
