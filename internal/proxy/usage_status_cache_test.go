@@ -567,6 +567,46 @@ func TestMergeUsageStatusesExpiresFromProviderObservationTime(t *testing.T) {
 	}
 }
 
+func TestMergeUsageStatusesKeepsFreshAccountWindowsWhenSupplementalIsStale(t *testing.T) {
+	ref := &AccountRef{}
+	old := AccountUsageStatus{
+		AccountStatus:  AccountStatus{ID: "cheerleader", Provider: accounts.ProviderClaude},
+		UsageFresh:     true,
+		UsageFetchedAt: time.Now().Add(-time.Minute),
+		Windows: []accounts.UsageWindow{
+			{Name: "5h", UsedPercent: 100, LimitWindowSeconds: int64(5 * time.Hour / time.Second)},
+			{Name: "7d", UsedPercent: 26, LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second)},
+		},
+	}
+	ref.mergeUsageStatusesLocked([]AccountUsageStatus{old}, ref.usageStatusEpoch)
+
+	now := time.Now()
+	live := AccountUsageStatus{
+		AccountStatus:         AccountStatus{ID: "cheerleader", Provider: accounts.ProviderClaude},
+		AccountWideUsageFresh: true,
+		UsageFetchedAt:        now,
+		Windows: []accounts.UsageWindow{
+			{Name: "5h", UsedPercent: 0, LimitWindowSeconds: int64(5 * time.Hour / time.Second)},
+			{Name: "7d", UsedPercent: 0, LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second)},
+			{Name: "oauth-apps-weekly", Feature: agentclaude.FableFeature, UsedPercent: 0, LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second)},
+		},
+	}
+	got := ref.mergeUsageStatusesLocked([]AccountUsageStatus{live}, ref.usageStatusEpoch)
+	if len(got) != 1 || got[0].Windows[0].UsedPercent != 0 || got[0].Windows[1].UsedPercent != 0 {
+		t.Fatalf("fresh account windows were replaced by stale snapshot: %+v", got)
+	}
+
+	fallback := live
+	fallback.AccountWideUsageFresh = false
+	fallback.Windows = nil
+	fallback.UsageFetchedAt = time.Time{}
+	fallback.UsageFresh = false
+	got = ref.mergeUsageStatusesLocked([]AccountUsageStatus{fallback}, ref.usageStatusEpoch)
+	if len(got) != 1 || len(got[0].Windows) < 2 || got[0].Windows[0].UsedPercent != 0 {
+		t.Fatalf("fresh account windows were not retained as fallback: %+v", got)
+	}
+}
+
 func TestMergeUsageStatusesClassifiesPlain429AsTransientThrottle(t *testing.T) {
 	ref := &AccountRef{}
 	rows := ref.mergeUsageStatusesLocked([]AccountUsageStatus{{
