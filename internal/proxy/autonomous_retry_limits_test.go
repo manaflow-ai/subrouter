@@ -199,7 +199,7 @@ func TestAutonomousClaudeQuotaRetryBudgetRearmsAfterReset(t *testing.T) {
 		provider:       accounts.ProviderClaude,
 		budget:         budget,
 		retriesPerPass: 2,
-		base:           autonomousRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		base: autonomousRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
 			attempts++
 			for i := 0; i < 3; i++ {
 				if !budget.consumeQuota() {
