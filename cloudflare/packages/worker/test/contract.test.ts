@@ -427,6 +427,8 @@ describe("subrouter Durable Object contract", () => {
       "sonnet-weekly",
       "extra",
     ])
+    expect(usage.windows?.[1]?.feature).toBe("claude-opus")
+    expect(usage.windows?.[2]?.feature).toBe("claude-sonnet")
     expect(usage.extra_usage).toEqual({
       is_enabled: true,
       monthly_limit: 20,
@@ -435,14 +437,25 @@ describe("subrouter Durable Object contract", () => {
     })
     expect(usage.windows?.[3]?.extra_usage).toEqual(usage.extra_usage)
   })
-  test("claude paid metadata survives missing utilization", async () => {
+  test("claude usage rejects missing quota telemetry", async () => {
     const extra = { is_enabled: true, monthly_limit: 20, used_credits: 3 }
-    const usage = await fetchProviderUsage(
-      "anthropic_oauth",
-      { accessToken: "test", usageUrl: "https://usage.example" },
-      (async () => Response.json({ extra_usage: extra })) as unknown as typeof fetch
-    )
-    expect(usage.windows).toEqual([{name: "extra", used_percent: 0, extra_usage: extra}])
+    await expect(
+      fetchProviderUsage(
+        "anthropic_oauth",
+        { accessToken: "test", usageUrl: "https://usage.example" },
+        (async () => Response.json({ extra_usage: extra })) as unknown as typeof fetch
+      )
+    ).rejects.toThrow("Claude usage quota is unknown")
+  })
+
+  test("codex usage rejects missing account quota telemetry", async () => {
+    await expect(
+      fetchProviderUsage(
+        "codex_oauth",
+        { accessToken: "test", usageUrl: "https://usage.example" },
+        (async () => Response.json({ rate_limit: {} })) as unknown as typeof fetch
+      )
+    ).rejects.toThrow("Codex usage quota is unknown")
   })
 
 })

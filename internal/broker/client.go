@@ -189,6 +189,7 @@ type UsageStatus struct {
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
 	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
+	UsageFetchedAt     time.Time                        `json:"usage_fetched_at,omitzero"`
 }
 
 type leaseRef struct {
@@ -308,7 +309,7 @@ func (c *Client) UsageStatuses(ctx context.Context) ([]UsageStatus, error) {
 	if err := c.doHostedJSON(
 		ctx,
 		http.MethodGet,
-		"/_subrouter/usage-status",
+		"/_subrouter/usage-status?refresh=1",
 		nil,
 		&statuses,
 	); err != nil {

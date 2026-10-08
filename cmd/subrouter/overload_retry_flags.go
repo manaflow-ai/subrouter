@@ -11,8 +11,8 @@ import (
 const (
 	retryIntervalFlag = "--retry-interval"
 	retryMaxWaitFlag  = "--retry-max-wait"
-	// Keep the client from ending an autonomous request while Subrouter is
-	// waiting for the upstream to recover. Cancellation remains the bound.
+	// Allow long provider-reported reset waits and bounded transient retries;
+	// Subrouter returns the provider's retry deadline if this request cannot wait.
 	autonomousAgentClientTimeoutMS = 1<<31 - 1
 )
 

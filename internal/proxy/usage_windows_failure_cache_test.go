@@ -18,7 +18,7 @@ func TestFetchUsageWindowsSharedRechecksActiveThrottleBeforeFlight(t *testing.T)
 	client := &http.Client{Transport: transport}
 	account := accounts.Account{ID: "claude-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "token-a"}
 	cacheKey := account.ID + "\x00" + string(account.Provider)
-	flightKey := usageWindowsFlightKey(cacheKey, account.Token)
+	flightKey := usageWindowsFailureKey(cacheKey, account.Token)
 	throttleErr := errors.New("usage fetch failed: 429 Too Many Requests")
 	ref.usageWindowsMu.Lock()
 	ref.usageWindowsFailures = map[string]usageWindowsFailure{
@@ -26,7 +26,7 @@ func TestFetchUsageWindowsSharedRechecksActiveThrottleBeforeFlight(t *testing.T)
 	}
 	ref.usageWindowsMu.Unlock()
 
-	windows, err := ref.fetchUsageWindowsShared(context.Background(), client, account, cacheKey)
+	windows, _, err := ref.fetchUsageWindowsShared(context.Background(), client, account, cacheKey)
 	if !errors.Is(err, throttleErr) || windows != nil {
 		t.Fatalf("active throttle was not reused: windows=%v err=%v", windows, err)
 	}
@@ -122,7 +122,7 @@ func TestUsageThrottleCacheIsCredentialScopedAndExpires(t *testing.T) {
 
 	// Simulate expiry without sleeping: the next read can retry the upstream.
 	key := account.ID + "\x00" + string(account.Provider)
-	cacheKey := usageWindowsFlightKey(key, repaired.Token)
+	cacheKey := usageWindowsFailureKey(key, repaired.Token)
 	ref.usageWindowsMu.Lock()
 	failure := ref.usageWindowsFailures[cacheKey]
 	failure.at = time.Now().Add(-usageWindowsThrottleTTL - time.Second)
@@ -173,7 +173,7 @@ func TestUsageThrottleHonorsLongRetryAfterAndDoesNotProbe(t *testing.T) {
 		t.Fatal("want 429 from usage")
 	}
 	initial := transport.calls
-	key := usageWindowsFlightKey(account.ID+"\x00"+string(account.Provider), account.Token)
+	key := usageWindowsFailureKey(account.ID+"\x00"+string(account.Provider), account.Token)
 	ref.usageWindowsMu.Lock()
 	failure, ok := ref.usageWindowsFailures[key]
 	ref.usageWindowsMu.Unlock()
