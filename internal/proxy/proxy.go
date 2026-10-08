@@ -465,6 +465,7 @@ type AccountRef struct {
 	usageWindows        map[string]usageWindowsEntry
 	usageWindowsFlights map[string]*usageWindowsFlight
 	claudeSupplemental  map[string]claudeSupplementalUsage
+	usageWindowsEpoch   uint64
 
 	credFailMu sync.Mutex
 	credFail   map[string]credFailure
@@ -695,9 +696,21 @@ func (r *AccountRef) credentialSnapshot(provider accounts.Provider, id string) a
 // windows as a confident exhaustion signal: stale cooked data was overwriting
 // healthy accounts' scores and routing traffic to dead accounts.
 func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, error) {
+	windows, fresh, _, err := r.FetchUsageWindowsCachedWithObservation(ctx, client, account)
+	return windows, fresh, err
+}
+
+// FetchUsageWindowsCachedWithObservation is FetchUsageWindowsCached plus the
+// provider observation time represented by the returned windows. The time is
+// captured with the same cache/flight result, so a concurrent refresh cannot
+// pair old windows with an unrelated timestamp.
+func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, time.Time, error) {
 	if r == nil {
 		windows, err := fetchAccountUsageWindowsLive(ctx, client, account)
-		return windows, err == nil, err
+		if err != nil {
+			return windows, false, time.Time{}, err
+		}
+		return windows, true, time.Now().UTC(), nil
 	}
 	key := account.ID + "\x00" + string(account.Provider)
 	now := time.Now()
@@ -705,23 +718,25 @@ func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.C
 	entry, ok := r.usageWindows[key]
 	r.usageWindowsMu.Unlock()
 	if ok && now.Sub(entry.at) < usageWindowsTTL {
-		return append([]accounts.UsageWindow(nil), entry.windows...), entry.supplementalFresh, nil
+		return append([]accounts.UsageWindow(nil), entry.windows...), entry.supplementalFresh, entry.at, nil
 	}
-	windows, supplementalFresh, err := r.fetchUsageWindowsShared(ctx, client, account, key)
+	windows, supplementalFresh, fetchedAt, err := r.fetchUsageWindowsShared(ctx, client, account, key)
 	if err == nil {
-		return windows, supplementalFresh, nil
+		return windows, supplementalFresh, fetchedAt, nil
 	}
 	if !authLikeUsageError(err.Error()) && ok && now.Sub(entry.at) < usageWindowsLastGoodTTL {
-		return append([]accounts.UsageWindow(nil), entry.windows...), false, nil
+		return append([]accounts.UsageWindow(nil), entry.windows...), false, entry.at, nil
 	}
-	return nil, false, err
+	return nil, false, time.Time{}, err
 }
 
 // usageWindowsFlight is one in-flight upstream usage fetch shared by every
 // concurrent reader of the same account credential.
 type usageWindowsFlight struct {
 	done              chan struct{}
+	epoch             uint64
 	windows           []accounts.UsageWindow
+	fetchedAt         time.Time
 	supplementalFresh bool
 	err               error
 }
@@ -734,13 +749,14 @@ type usageWindowsFlight struct {
 // it, bounded by usageStatusFetchTimeout, so that caller disconnecting does
 // not fail every other waiter. Each caller still stops waiting when its own
 // context ends.
-func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.Client, account accounts.Account, cacheKey string) ([]accounts.UsageWindow, bool, error) {
+func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.Client, account accounts.Account, cacheKey string) ([]accounts.UsageWindow, bool, time.Time, error) {
 	tokenHash := sha256.Sum256([]byte(account.Token))
-	flightKey := cacheKey + "\x00" + hex.EncodeToString(tokenHash[:])
 	r.usageWindowsMu.Lock()
+	epoch := r.usageWindowsEpoch
+	flightKey := cacheKey + "\x00" + hex.EncodeToString(tokenHash[:]) + "\x00" + strconv.FormatUint(epoch, 10)
 	flight, joined := r.usageWindowsFlights[flightKey]
 	if !joined {
-		flight = &usageWindowsFlight{done: make(chan struct{})}
+		flight = &usageWindowsFlight{done: make(chan struct{}), epoch: epoch}
 		if r.usageWindowsFlights == nil {
 			r.usageWindowsFlights = map[string]*usageWindowsFlight{}
 		}
@@ -754,13 +770,12 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 				}
 				r.usageWindowsMu.Lock()
 				if flight.err == nil {
-					if r.usageWindows == nil {
-						r.usageWindows = map[string]usageWindowsEntry{}
-					}
-					r.usageWindows[cacheKey] = usageWindowsEntry{
-						windows:           append([]accounts.UsageWindow(nil), flight.windows...),
-						at:                time.Now(),
-						supplementalFresh: flight.supplementalFresh,
+					flight.fetchedAt = time.Now().UTC()
+					if flight.epoch == r.usageWindowsEpoch {
+						if r.usageWindows == nil {
+							r.usageWindows = map[string]usageWindowsEntry{}
+						}
+						r.usageWindows[cacheKey] = usageWindowsEntry{windows: append([]accounts.UsageWindow(nil), flight.windows...), at: flight.fetchedAt, supplementalFresh: flight.supplementalFresh}
 					}
 				}
 				if r.usageWindowsFlights[flightKey] == flight {
@@ -776,11 +791,11 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 	select {
 	case <-flight.done:
 		if flight.err != nil {
-			return nil, false, flight.err
+			return nil, false, time.Time{}, flight.err
 		}
-		return append([]accounts.UsageWindow(nil), flight.windows...), flight.supplementalFresh, nil
+		return append([]accounts.UsageWindow(nil), flight.windows...), flight.supplementalFresh, flight.fetchedAt, nil
 	case <-ctx.Done():
-		return nil, false, ctx.Err()
+		return nil, false, time.Time{}, ctx.Err()
 	}
 }
 
@@ -893,7 +908,12 @@ type AccountUsageStatus struct {
 	// mode, would redeem a credit on this account now (see
 	// --reset-credit-autospend).
 	ResetAdvice *ResetCreditAdvice `json:"reset_advice,omitempty"`
-	UsageFresh  bool               `json:"-"`
+	// UsageFresh is an internal signal used to decide whether a live fetch
+	// succeeded. UsageFetchedAt is the time represented by Windows and is
+	// exposed so clients can distinguish a last-known-good fallback from a
+	// current provider observation.
+	UsageFresh     bool      `json:"-"`
+	UsageFetchedAt time.Time `json:"usage_fetched_at,omitzero"`
 }
 
 // withWeeklyCooked fills each status's WeeklyCooked verdict from its windows,
@@ -1385,14 +1405,24 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 	for i := range out {
 		status := out[i]
 		key := status.ID + "\x00" + string(status.Provider)
-		if status.QuotaUsageKnown {
-			// A successful Qwen response may intentionally contain no windows.
-			// Record that empty result instead of resurrecting older limits.
-			r.lastGoodUsage[key] = usageStatusSnapshot{status: status, at: now}
-			continue
-		}
-		if len(status.Windows) > 0 {
-			r.lastGoodUsage[key] = usageStatusSnapshot{status: status, at: now}
+		if status.UsageFresh {
+			// A successful response may intentionally contain no windows. Record
+			// that empty result instead of resurrecting older limits. Keep the
+			// provider observation time in the wire status so clients can show
+			// how old the numbers are.
+			if status.UsageFetchedAt.IsZero() {
+				status.UsageFetchedAt = now.UTC()
+				out[i] = status
+			}
+			// UsageFresh also covers a hit in the short in-process window cache.
+			// Age the last-good fallback from the provider observation rather than
+			// this sweep, otherwise repeated cache hits can keep old quota alive
+			// indefinitely past usageStatusLastGoodTTL.
+			snapshotAt := status.UsageFetchedAt
+			if snapshotAt.IsZero() {
+				snapshotAt = now
+			}
+			r.lastGoodUsage[key] = usageStatusSnapshot{status: status, at: snapshotAt}
 			continue
 		}
 		if authLikeUsageError(status.Error) {
@@ -1442,6 +1472,7 @@ func (r *AccountRef) InvalidateUsageWindowsCache() {
 	r.usageWindowsMu.Lock()
 	r.usageWindows = nil
 	r.claudeSupplemental = nil
+	r.usageWindowsEpoch++
 	r.usageWindowsMu.Unlock()
 }
 
@@ -1482,6 +1513,9 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 	status.Windows = probe.Windows
 	status.Credits = probe.Credits
 	status.UsageFresh = probe.QuotaUsageKnown
+	if status.UsageFresh {
+		status.UsageFetchedAt = time.Now().UTC()
+	}
 
 	switch provider {
 	case accounts.ProviderQwenToken:
@@ -1518,6 +1552,7 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 				status.Windows = append(status.Windows, *usage.Weekly)
 			}
 			status.UsageFresh = true
+			status.UsageFetchedAt = time.Now().UTC()
 		}
 		if usageErr != nil || subscriptionErr != nil {
 			combinedErr := agentqwen.StatusError(stored.Email, usageErr, subscriptionErr)
@@ -1541,6 +1576,7 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 			status.QuotaUsageKnown = true
 			status.Windows = windows
 			status.UsageFresh = true
+			status.UsageFetchedAt = time.Now().UTC()
 		}
 	}
 	return status
@@ -1770,6 +1806,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.Credits = details.Credits
 			next.ComplimentaryReset = details.ComplimentaryReset
 			next.UsageFresh = true
+			next.UsageFetchedAt = time.Now().UTC()
 			out[i] = next
 		}()
 	}
@@ -1826,7 +1863,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.AuthValid = true
 			next.PlanType = details.PlanType()
 			r.replace(account)
-			windows, fresh, err := r.FetchUsageWindowsCached(sweepCtx, r.client, account)
+			windows, fresh, fetchedAt, err := r.FetchUsageWindowsCachedWithObservation(sweepCtx, r.client, account)
 			if err != nil {
 				next.Error = err.Error()
 				out[i] = next
@@ -1835,6 +1872,10 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.Windows = windows
 			next.ExtraUsage = extraUsageFromWindows(windows)
 			next.UsageFresh = fresh
+			next.UsageFetchedAt = fetchedAt
+			if next.UsageFetchedAt.IsZero() && fresh {
+				next.UsageFetchedAt = time.Now().UTC()
+			}
 			out[i] = next
 		}()
 	}
@@ -1935,6 +1976,9 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 					status.Windows = windows
 					status.QuotaUsageKnown = len(windows) > 0
 					status.UsageFresh = usageErr == nil
+					if status.UsageFresh {
+						status.UsageFetchedAt = time.Now().UTC()
+					}
 					if usageErr != nil && status.QuotaStatus == "" {
 						status.Error = usageErr.Error()
 					}

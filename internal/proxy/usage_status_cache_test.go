@@ -35,7 +35,10 @@ func (u *usageRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 }
 
 func usageOKResponse() *http.Response {
-	body := `{"five_hour":{"utilization":10.0,"resets_at":"2030-01-01T00:00:00+00:00"},"seven_day":{"utilization":5.0,"resets_at":"2030-01-02T00:00:00+00:00"}}`
+	// Include both provider shapes because the shared transport is used by
+	// Claude and Codex account fixtures. Codex must expose real quota windows;
+	// an empty rate_limit is now treated as unknown rather than 100% available.
+	body := `{"five_hour":{"utilization":10.0,"resets_at":"2030-01-01T00:00:00+00:00"},"seven_day":{"utilization":5.0,"resets_at":"2030-01-02T00:00:00+00:00"},"rate_limit":{"primary_window":{"used_percent":10.0,"limit_window_seconds":18000},"secondary_window":{"used_percent":5.0,"limit_window_seconds":604800}}}`
 	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}
 }
 
@@ -92,6 +95,27 @@ func TestUsageStatusesCachesWithinTTL(t *testing.T) {
 	}
 }
 
+func TestUsageStatusesPreservesProviderObservationTimeOnWindowCacheHit(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse()}}
+	ref := cacheTestAccountRef(t, transport)
+	first := ref.UsageStatuses(context.Background())
+	if len(first) != 1 || first[0].UsageFetchedAt.IsZero() {
+		t.Fatalf("first sweep missing usage observation time: %+v", first)
+	}
+	callsAfterFirst := transport.calls
+	ref.InvalidateUsageStatusCache()
+	second := ref.UsageStatuses(context.Background())
+	if transport.calls != callsAfterFirst {
+		t.Fatalf("window cache hit contacted upstream (%d -> %d calls)", callsAfterFirst, transport.calls)
+	}
+	if !second[0].UsageFresh {
+		t.Fatal("window cache hit was not marked fresh")
+	}
+	if !second[0].UsageFetchedAt.Equal(first[0].UsageFetchedAt) {
+		t.Fatalf("cache-hit observation time = %s, want original %s", second[0].UsageFetchedAt, first[0].UsageFetchedAt)
+	}
+}
+
 func TestUsageStatusRefreshQueryInvalidatesCache(t *testing.T) {
 	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse(), usageOKResponse(), usageOKResponse(), usageOKResponse()}}
 	ref := cacheTestAccountRef(t, transport)
@@ -115,6 +139,18 @@ func TestUsageStatusesRestoresLastGoodOnTransientFailure(t *testing.T) {
 	if len(first) != 1 || len(first[0].Windows) == 0 {
 		t.Fatalf("first sweep should have windows, got %+v", first)
 	}
+	if first[0].UsageFetchedAt.IsZero() {
+		t.Fatal("successful usage sweep did not record an observation time")
+	}
+	// Age the per-account cache past its fresh TTL without dropping it. The
+	// next sweep then exercises the transient-failure fallback instead of
+	// returning the cache before the provider is contacted.
+	ref.usageWindowsMu.Lock()
+	key := "claude@example.com\x00claude"
+	entry := ref.usageWindows[key]
+	entry.at = time.Now().Add(-usageWindowsTTL - time.Second)
+	ref.usageWindows[key] = entry
+	ref.usageWindowsMu.Unlock()
 	ref.InvalidateUsageStatusCache()
 	second := ref.UsageStatuses(context.Background())
 	if len(second) != 1 {
@@ -125,5 +161,36 @@ func TestUsageStatusesRestoresLastGoodOnTransientFailure(t *testing.T) {
 	}
 	if second[0].Error != "" {
 		t.Fatalf("transient failure with last-good backfill should not surface an error, got %q", second[0].Error)
+	}
+	if second[0].UsageFresh {
+		t.Fatal("transient failure was marked as fresh")
+	}
+	if !second[0].UsageFetchedAt.Equal(first[0].UsageFetchedAt) {
+		t.Fatalf("stale fallback observation time = %s, want original %s", second[0].UsageFetchedAt, first[0].UsageFetchedAt)
+	}
+}
+
+func TestMergeUsageStatusesExpiresFromProviderObservationTime(t *testing.T) {
+	ref := &AccountRef{}
+	observedAt := time.Now().Add(-usageStatusLastGoodTTL - time.Minute)
+	live := AccountUsageStatus{
+		AccountStatus:  AccountStatus{ID: "claude@example.com", Provider: accounts.ProviderClaude},
+		UsageFresh:     true,
+		UsageFetchedAt: observedAt,
+		Windows: []accounts.UsageWindow{{
+			Name: "7d", UsedPercent: 10, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second),
+		}},
+	}
+	ref.mergeUsageStatusesLocked([]AccountUsageStatus{live}, ref.usageStatusEpoch)
+
+	// A later failed sweep has no windows of its own. If the snapshot age were
+	// measured from the merge time instead of the provider observation, this
+	// would incorrectly resurrect the old quota.
+	stale := live
+	stale.UsageFresh = false
+	stale.Windows = nil
+	got := ref.mergeUsageStatusesLocked([]AccountUsageStatus{stale}, ref.usageStatusEpoch)
+	if len(got) != 1 || len(got[0].Windows) != 0 {
+		t.Fatalf("expired last-good quota was restored: %+v", got)
 	}
 }

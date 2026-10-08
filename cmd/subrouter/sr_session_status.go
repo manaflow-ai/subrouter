@@ -491,7 +491,10 @@ func (r srRunner) observeSession(ctx context.Context, ledger sessionLedger, laun
 		}
 		var fresh bool
 		statuses, fetchedAt, fresh = r.cachedServerUsage(ctx, ledger, server)
-		if !fresh && len(statuses) == 0 {
+		if !fresh {
+			// A failed or contended refresh may still return a non-empty last
+			// good snapshot. Keep rendering it, but mark the session view stale
+			// so the quota numbers are not mistaken for a live observation.
 			stale = true
 		}
 	}
@@ -519,8 +522,19 @@ func (r srRunner) observeSession(ctx context.Context, ledger sessionLedger, laun
 		if status, ok := usageStatusForAccount(statuses, provider, view.AccountID); ok {
 			view.Plan = status.PlanType
 			view.Windows = status.Windows
-			view.UsageFetchedAt = fetchedAt
+			view.UsageFetchedAt = status.UsageFetchedAt
+			if view.UsageFetchedAt.IsZero() {
+				view.UsageFetchedAt = fetchedAt
+			}
 		}
+	}
+	now := ledger.clock()
+	if !view.UsageFetchedAt.IsZero() && now.Sub(view.UsageFetchedAt) > sessionStaleAfter {
+		view.Stale = true
+		view.StaleNote = "usage " + formatStatusAge(now.Sub(view.UsageFetchedAt)) + " old"
+	}
+	if view.Stale && view.StaleNote == "" && !view.Unreachable && !view.Denied {
+		view.StaleNote = "usage refresh pending"
 	}
 	return view, event
 }
@@ -559,7 +573,10 @@ func localSessionView(ledger sessionLedger, launch sessionLaunchRecord, agent, s
 		if status, ok := usageStatusForAccount(cache.Statuses, ledgerProvider(agent), view.AccountID); ok {
 			view.Plan = status.PlanType
 			view.Windows = status.Windows
-			view.UsageFetchedAt = cache.FetchedAt
+			view.UsageFetchedAt = status.UsageFetchedAt
+			if view.UsageFetchedAt.IsZero() {
+				view.UsageFetchedAt = cache.FetchedAt
+			}
 			if view.Label == "" {
 				view.Label = accountDisplayLabel(status, view.AccountID)
 			}
