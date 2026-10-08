@@ -71,13 +71,13 @@ func TestCompactPickReasonDoesNotCallModelScopedThrottleFableOut(t *testing.T) {
 	}
 }
 
-func TestCompactWindowStatusMarksExpiredExhaustion(t *testing.T) {
+func TestCompactWindowStatusMarksStaleExhaustion(t *testing.T) {
 	window := accounts.UsageWindow{
 		Name: "5h", UsedPercent: 100, LimitWindowSeconds: int64(5 * time.Hour / time.Second),
 		ResetAt: time.Now().Add(-time.Minute),
 	}
-	if got := compactWindowStatus(window); got != "0%/expired" {
-		t.Fatalf("expired window = %q, want 0%%/expired", got)
+	if got := compactWindowStatus(window); got != "0%/stale" {
+		t.Fatalf("stale window = %q, want 0%%/stale", got)
 	}
 }
 

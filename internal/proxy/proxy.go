@@ -1069,8 +1069,9 @@ type AccountUsageStatus struct {
 	// succeeded. UsageFetchedAt is the time represented by Windows and is
 	// exposed so clients can distinguish a last-known-good fallback from a
 	// current provider observation.
-	UsageFresh     bool      `json:"-"`
-	UsageFetchedAt time.Time `json:"usage_fetched_at,omitzero"`
+	UsageFresh            bool      `json:"-"`
+	AccountWideUsageFresh bool      `json:"-"`
+	UsageFetchedAt        time.Time `json:"usage_fetched_at,omitzero"`
 }
 
 // withWeeklyCooked fills each status's WeeklyCooked verdict from its windows,
@@ -1783,6 +1784,19 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 	for i := range out {
 		status := out[i]
 		key := status.ID + "\x00" + string(status.Provider)
+		if status.AccountWideUsageFresh {
+			// The ordinary account-wide usage endpoint answered, but a
+			// model-specific supplementary bucket was older than the routing
+			// freshness cadence. Keep the new 5h/weekly values visible and
+			// retain them as the fallback, without treating stale model data as
+			// a fresh scheduler score.
+			snapshot := status
+			snapshot.UsageFresh = true
+			r.lastGoodUsage[key] = usageStatusSnapshot{status: snapshot, at: status.UsageFetchedAt}
+			status.UsageFresh = false
+			out[i] = status
+			continue
+		}
 		if status.UsageFresh {
 			// A successful response may intentionally contain no windows. Record
 			// that empty result instead of resurrecting older limits. Keep the
@@ -2272,6 +2286,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.UsageFresh = fresh
 			next.UsageFetchedAt = fetchedAt
 			next.UsageThrottled = throttled
+			next.AccountWideUsageFresh = !throttled && !fresh && !fetchedAt.IsZero() && time.Since(fetchedAt) < usageWindowsTTL
 			if next.UsageFetchedAt.IsZero() && fresh {
 				next.UsageFetchedAt = time.Now().UTC()
 			}
