@@ -192,7 +192,6 @@ func TestClaudeRetrySkipsKnownUnsupportedModelButAllowsUnknownEvidence(t *testin
 	}
 }
 
-
 func TestClaudeNewSessionPrefersVerifiedQuota(t *testing.T) {
 	unknown := claudeRetryTestAccount("unknown")
 	verified := claudeRetryTestAccount("verified")
