@@ -1125,7 +1125,7 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 		srRunner.printCodexCapacityStatus,
 		srRunner.printTokenUsageStatus,
 	)
-	usage, available, err := r.fetchServerUsageSnapshot(ctx, server)
+	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
 	if err != nil {
 		return err
 	}
@@ -1334,7 +1334,7 @@ func (r srRunner) pickRemoteAccount(ctx context.Context, server srServerConfig) 
 }
 
 func (r srRunner) statusOneRemote(ctx context.Context, server srServerConfig, selector string) error {
-	usage, available, err := r.fetchServerUsageSnapshot(ctx, server)
+	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
 	if err != nil {
 		return err
 	}
@@ -1562,7 +1562,13 @@ func (r srRunner) fetchServerUsageStatusesQuery(ctx context.Context, server srSe
 		return nil, false, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
+	timeout := 15 * time.Second
+	if query == "refresh=1" {
+		// The controller gets up to 30 seconds to check the whole pool.
+		// Allow a large usage response to finish on the client side.
+		timeout = 40 * time.Second
+	}
+	secured, err := r.securedRequestClientForServer(server, baseURL, timeout)
 	if err != nil {
 		return nil, false, err
 	}
