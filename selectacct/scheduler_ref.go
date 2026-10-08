@@ -551,9 +551,43 @@ func (r *SchedulerRef) AdvanceAccountGenerationWithAccounts(generation, credenti
 	}
 	r.advanceAccountGenerationLocked(generation)
 	r.credentialRevision = credentialRevision
+	r.pruneExhaustedMarksForAccountsLocked(accounts)
 	r.credentialFingerprints = make(map[string]string, len(accounts))
 	for _, candidate := range accounts {
 		r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
+	}
+}
+
+// pruneExhaustedMarksForAccountsLocked removes quota marks for accounts that
+// disappeared from the latest account snapshot. Marks for accounts that remain
+// present are intentionally left untouched so a stale or missing usage refresh
+// cannot make a recently rejected account eligible again.
+func (r *SchedulerRef) pruneExhaustedMarksForAccountsLocked(accounts []account.Account) {
+	present := make(map[string]struct{}, len(accounts))
+	for _, candidate := range accounts {
+		present[ScoreKey(candidate.Provider, candidate.ID)] = struct{}{}
+	}
+	for _, marks := range []map[string]time.Time{r.exhaustedUntil, r.weeklyExhaustedUntil} {
+		for key := range marks {
+			scoreKey, _, _, ok := exhaustionKeyParts(key)
+			if !ok {
+				delete(marks, key)
+				continue
+			}
+			if _, exists := present[scoreKey]; !exists {
+				delete(marks, key)
+			}
+		}
+	}
+	for key := range r.exhaustedMarkSeq {
+		scoreKey, _, _, ok := exhaustionKeyParts(key)
+		if !ok {
+			delete(r.exhaustedMarkSeq, key)
+			continue
+		}
+		if _, exists := present[scoreKey]; !exists {
+			delete(r.exhaustedMarkSeq, key)
+		}
 	}
 }
 
@@ -914,15 +948,20 @@ func (r *SchedulerRef) MarkCredentialExhaustedForSnapshot(
 		(accountGeneration == r.accountGeneration && credentialRevision < r.credentialRevision) {
 		return false
 	}
+	publishesSnapshot := accountGeneration > r.accountGeneration
 	if accountGeneration > r.accountGeneration {
 		r.advanceAccountGenerationLocked(accountGeneration)
 	}
 	if credentialRevision > r.credentialRevision || r.credentialFingerprints == nil {
+		publishesSnapshot = true
 		r.credentialRevision = credentialRevision
 		r.credentialFingerprints = make(map[string]string, len(accounts))
 		for _, candidate := range accounts {
 			r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
 		}
+	}
+	if publishesSnapshot {
+		r.pruneExhaustedMarksForAccountsLocked(accounts)
 	}
 
 	fingerprint := credentialFingerprint(credentialIdentity)
