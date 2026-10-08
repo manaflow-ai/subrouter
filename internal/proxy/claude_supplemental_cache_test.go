@@ -329,3 +329,37 @@ func TestClaudeHealthySupplementalStillExpiresAfterTTL(t *testing.T) {
 		t.Fatal("healthy model evidence older than TTL must not be treated as fresh")
 	}
 }
+
+func TestClaudeSupplementalOlderThanPrimaryCadenceIsStale(t *testing.T) {
+	transport := &supplementalProbeCounter{includeSupplemental: true, primaryUsed: 30}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	account := probeAccount()
+	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err != nil {
+		t.Fatal(err)
+	}
+	if transport.probeCalls != 1 {
+		t.Fatalf("initial synthetic probe count = %d, want 1", transport.probeCalls)
+	}
+	key := claudeSupplementalCacheKey(account)
+	ref.usageWindowsMu.Lock()
+	cached := ref.claudeSupplemental[key]
+	cached.at = time.Now().Add(-usageWindowsTTL - time.Second)
+	ref.claudeSupplemental[key] = cached
+	ref.usageWindowsMu.Unlock()
+
+	// The primary endpoint is refreshed, but the reusable model bucket is older
+	// than the normal primary cadence. Keep its values for display while
+	// withholding a fresh scheduler score until a new model probe observes it.
+	expirePrimaryClaudeUsageForTest(t, ref, account)
+	_, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh {
+		t.Fatal("stale supplemental model evidence was reported as a fresh usage score")
+	}
+	if transport.probeCalls != 1 {
+		t.Fatalf("stale supplemental evidence triggered an immediate probe: %d", transport.probeCalls)
+	}
+}

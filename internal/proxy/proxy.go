@@ -600,8 +600,9 @@ type credFailure struct {
 }
 
 type usageWindowsEntry struct {
-	windows []accounts.UsageWindow
-	at      time.Time
+	windows           []accounts.UsageWindow
+	at                time.Time
+	supplementalFresh bool
 }
 
 const usageWindowsTTL = 2 * time.Minute
@@ -704,11 +705,11 @@ func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.C
 	entry, ok := r.usageWindows[key]
 	r.usageWindowsMu.Unlock()
 	if ok && now.Sub(entry.at) < usageWindowsTTL {
-		return append([]accounts.UsageWindow(nil), entry.windows...), true, nil
+		return append([]accounts.UsageWindow(nil), entry.windows...), entry.supplementalFresh, nil
 	}
-	windows, err := r.fetchUsageWindowsShared(ctx, client, account, key)
+	windows, supplementalFresh, err := r.fetchUsageWindowsShared(ctx, client, account, key)
 	if err == nil {
-		return windows, true, nil
+		return windows, supplementalFresh, nil
 	}
 	if !authLikeUsageError(err.Error()) && ok && now.Sub(entry.at) < usageWindowsLastGoodTTL {
 		return append([]accounts.UsageWindow(nil), entry.windows...), false, nil
@@ -719,9 +720,10 @@ func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.C
 // usageWindowsFlight is one in-flight upstream usage fetch shared by every
 // concurrent reader of the same account credential.
 type usageWindowsFlight struct {
-	done    chan struct{}
-	windows []accounts.UsageWindow
-	err     error
+	done              chan struct{}
+	windows           []accounts.UsageWindow
+	supplementalFresh bool
+	err               error
 }
 
 // fetchUsageWindowsShared coalesces concurrent live fetches of one account's
@@ -732,7 +734,7 @@ type usageWindowsFlight struct {
 // it, bounded by usageStatusFetchTimeout, so that caller disconnecting does
 // not fail every other waiter. Each caller still stops waiting when its own
 // context ends.
-func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.Client, account accounts.Account, cacheKey string) ([]accounts.UsageWindow, error) {
+func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.Client, account accounts.Account, cacheKey string) ([]accounts.UsageWindow, bool, error) {
 	tokenHash := sha256.Sum256([]byte(account.Token))
 	flightKey := cacheKey + "\x00" + hex.EncodeToString(tokenHash[:])
 	r.usageWindowsMu.Lock()
@@ -755,7 +757,11 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 					if r.usageWindows == nil {
 						r.usageWindows = map[string]usageWindowsEntry{}
 					}
-					r.usageWindows[cacheKey] = usageWindowsEntry{windows: append([]accounts.UsageWindow(nil), flight.windows...), at: time.Now()}
+					r.usageWindows[cacheKey] = usageWindowsEntry{
+						windows:           append([]accounts.UsageWindow(nil), flight.windows...),
+						at:                time.Now(),
+						supplementalFresh: flight.supplementalFresh,
+					}
 				}
 				if r.usageWindowsFlights[flightKey] == flight {
 					delete(r.usageWindowsFlights, flightKey)
@@ -763,18 +769,18 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 				r.usageWindowsMu.Unlock()
 				close(flight.done)
 			}()
-			flight.windows, flight.err = r.fetchAccountUsageWindowsLive(fetchCtx, client, account)
+			flight.windows, flight.supplementalFresh, flight.err = r.fetchAccountUsageWindowsLiveWithFreshness(fetchCtx, client, account)
 		}()
 	}
 	r.usageWindowsMu.Unlock()
 	select {
 	case <-flight.done:
 		if flight.err != nil {
-			return nil, flight.err
+			return nil, false, flight.err
 		}
-		return append([]accounts.UsageWindow(nil), flight.windows...), nil
+		return append([]accounts.UsageWindow(nil), flight.windows...), flight.supplementalFresh, nil
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, false, ctx.Err()
 	}
 }
 
@@ -783,8 +789,13 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 // newer OAuth provider such as Kimi fell through to the legacy Codex endpoint,
 // which could incorrectly zero a healthy account's routing score on reload.
 func (r *AccountRef) fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
+	windows, _, err := r.fetchAccountUsageWindowsLiveWithFreshness(ctx, client, account)
+	return windows, err
+}
+
+func (r *AccountRef) fetchAccountUsageWindowsLiveWithFreshness(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, error) {
 	if account.Provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth {
-		return r.fetchClaudeUsageWindowsReusingSupplemental(ctx, client, account)
+		return r.fetchClaudeUsageWindowsReusingSupplementalWithFreshness(ctx, client, account)
 	}
 	if account.AuthMode == accounts.AuthModeOAuth {
 		for _, source := range r.oauthSources {
@@ -793,13 +804,14 @@ func (r *AccountRef) fetchAccountUsageWindowsLive(ctx context.Context, client *h
 			}
 			usageSource, ok := source.(OAuthUsageSource)
 			if !ok {
-				return nil, fmt.Errorf("%w for provider %q", errOAuthUsageUnavailable, account.Provider)
+				return nil, true, fmt.Errorf("%w for provider %q", errOAuthUsageUnavailable, account.Provider)
 			}
 			_, windows, err := usageSource.FetchUsage(ctx, client, account)
-			return windows, err
+			return windows, true, err
 		}
 	}
-	return fetchAccountUsageWindowsLive(ctx, client, account)
+	windows, err := fetchAccountUsageWindowsLive(ctx, client, account)
+	return windows, true, err
 }
 
 // ResolvedAccount returns a refreshed, token-bearing OAuth account for the

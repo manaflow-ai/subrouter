@@ -62,21 +62,26 @@ func claudeSupplementalFreshEnough(cached claudeSupplementalUsage, now time.Time
 }
 
 func (r *AccountRef) cachedClaudeSupplemental(account accounts.Account, now time.Time) ([]accounts.UsageWindow, bool) {
+	windows, _, ok := r.cachedClaudeSupplementalWithObservation(account, now)
+	return windows, ok
+}
+
+func (r *AccountRef) cachedClaudeSupplementalWithObservation(account accounts.Account, now time.Time) ([]accounts.UsageWindow, time.Time, bool) {
 	r.usageWindowsMu.Lock()
 	defer r.usageWindowsMu.Unlock()
 	cached, ok := r.claudeSupplemental[claudeSupplementalCacheKey(account)]
 	if !ok || !claudeSupplementalFreshEnough(cached, now) {
-		return nil, false
+		return nil, time.Time{}, false
 	}
 	for _, window := range cached.windows {
 		if window.UsedPercent >= 100 && window.ResetAt.IsZero() {
 			// Exhaustion with an unknown reset has no defensible cache lifetime.
 			// Request fresh evidence at the next ordinary quota refresh.
-			return nil, false
+			return nil, time.Time{}, false
 		}
 		if !window.ResetAt.IsZero() && !now.Before(window.ResetAt) {
 			// A quota reset invalidates previously observed utilization.
-			return nil, false
+			return nil, time.Time{}, false
 		}
 	}
 	// A successful empty probe also counts; it prevents needless periodic
@@ -91,7 +96,7 @@ func (r *AccountRef) cachedClaudeSupplemental(account accounts.Account, now time
 			copyOfWindows[i].ResetAfterSeconds = remaining
 		}
 	}
-	return copyOfWindows, true
+	return copyOfWindows, cached.at, true
 }
 
 func (r *AccountRef) rememberClaudeSupplemental(account accounts.Account, windows []accounts.UsageWindow) {
@@ -130,6 +135,13 @@ func (r *AccountRef) rememberClaudeSupplemental(account accounts.Account, window
 func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplemental(
 	ctx context.Context, client *http.Client, account accounts.Account,
 ) ([]accounts.UsageWindow, error) {
+	windows, _, err := r.fetchClaudeUsageWindowsReusingSupplementalWithFreshness(ctx, client, account)
+	return windows, err
+}
+
+func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
+	ctx context.Context, client *http.Client, account accounts.Account,
+) ([]accounts.UsageWindow, bool, error) {
 	usage, err := agentclaude.FetchUsage(ctx, client, account.Token)
 	windows := claudeUsageWindows(usage)
 	if usageWindowNamed(windows, agentclaude.FableWindowName) {
@@ -137,15 +149,19 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplemental(
 		// Save it so a later ordinary response that omits the bucket does not
 		// resurrect older supplemental evidence.
 		r.rememberClaudeSupplemental(account, windows)
-		return windows, nil
+		return windows, true, nil
 	}
 
 	// A successful primary fetch can use prior supplementary evidence without
 	// another model request. On primary errors, leave the normal recovery
 	// probe intact so its primary windows may recover a usable status.
 	if err == nil && len(windows) > 0 {
-		if supplemental, ok := r.cachedClaudeSupplemental(account, time.Now()); ok {
-			return mergeUsageWindows(windows, supplemental), nil
+		if supplemental, observedAt, ok := r.cachedClaudeSupplementalWithObservation(account, time.Now()); ok {
+			// The primary endpoint is fresh, but the model-specific values may
+			// predate it. Do not let the scheduler treat old headroom as a live
+			// routing signal; keep the last score until a new probe observes it.
+			supplementalFresh := len(supplemental) == 0 || time.Since(observedAt) < usageWindowsTTL
+			return mergeUsageWindows(windows, supplemental), supplementalFresh, nil
 		}
 	}
 
@@ -158,10 +174,10 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplemental(
 			windows = mergeUsageWindows(windows, fableWindows)
 		}
 	} else if err != nil {
-		return nil, probeErr
+		return nil, true, probeErr
 	}
 	if err != nil && len(windows) == 0 {
-		return nil, err
+		return nil, true, err
 	}
-	return windows, nil
+	return windows, true, nil
 }
