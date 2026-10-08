@@ -1781,10 +1781,24 @@ func (r *AccountRef) InvalidateUsageStatusCache() {
 	r.usageStatusSweep = nil
 }
 
-// InvalidateUsageWindowsCache drops per-account usage windows as well as the
-// aggregate status snapshot. Interactive `sr status` calls use this so a
-// refresh really reaches the provider instead of reusing the two-minute
-// scheduler cache.
+// InvalidateUsageWindowsForStatusRefresh makes the next explicit status
+// request read live provider usage. A prior 429 is historical evidence, not
+// a local prohibition on checking again. Keep supplementary model readings
+// so a successful primary usage GET can reuse known buckets.
+func (r *AccountRef) InvalidateUsageWindowsForStatusRefresh() {
+	if r == nil {
+		return
+	}
+	r.usageWindowsMu.Lock()
+	r.usageWindows = nil
+	r.usageWindowsLatest = nil
+	r.usageWindowsFailures = nil
+	r.usageWindowsEpoch++
+	r.usageWindowsMu.Unlock()
+}
+
+// InvalidateUsageWindowsCache drops cached quota windows, including model
+// supplements, while retaining the normal background 429 failure cache.
 func (r *AccountRef) InvalidateUsageWindowsCache() {
 	if r == nil {
 		return
@@ -2030,7 +2044,10 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	// account. Status latency must stay bounded as pools grow; entries that do
 	// not acquire a slot retain the identity/status seeded below and are retried
 	// by the next sweep instead of extending this request by another batch.
-	sweepCtx, cancelSweep := context.WithTimeout(ctx, usageStatusFetchTimeout)
+	// The status sweep covers all accounts. The short score-fetch deadline
+	// previously expired before many profiles even reached the provider.
+	// An interactive status check gets the full status-sweep budget.
+	sweepCtx, cancelSweep := context.WithTimeout(ctx, usageStatusSweepTimeout)
 	defer cancelSweep()
 	var wg sync.WaitGroup
 	width := accountFetchConcurrencyFor(len(storedAccounts) + len(claudeProfiles))
@@ -2998,10 +3015,11 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		// keep the short shared cache so a dashboard cannot stampede providers.
 		if r.URL.Query().Get("refresh") == "1" && !snapshotOnly {
 			s.AccountRef.InvalidateUsageStatusCache()
-			// Keep the per-account window cache and its credential-scoped
-			// throttle deadlines. A manual status refresh should reassemble the
-			// rows, but must not turn every `sr status` into another burst of
-			// provider quota requests after a 401/429.
+			// An explicitly requested status refresh must check the provider
+			// again even after a prior telemetry 429. The previous behavior
+			// reused a potentially hours-long cached error and displayed
+			// quota pending despite the provider having recovered.
+			s.AccountRef.InvalidateUsageWindowsForStatusRefresh()
 		}
 		var statuses []AccountUsageStatus
 		if snapshotOnly {
