@@ -775,7 +775,7 @@ func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context,
 	}
 	key := account.ID + "\x00" + string(account.Provider)
 	credentialKey := usageWindowsCredentialKey(account)
-	failureKey := usageWindowsFailureKey(key, account.Token)
+	failureKey := usageWindowsFailureKey(key, account.CredentialIdentity())
 	now := time.Now()
 	r.usageWindowsMu.Lock()
 	entry, ok := r.usageWindows[key]
@@ -827,9 +827,11 @@ type usageWindowsFlight struct {
 // it, bounded by usageStatusFetchTimeout, so that caller disconnecting does
 // not fail every other waiter. Each caller still stops waiting when its own
 // context ends.
-func usageWindowsFailureKey(cacheKey, token string) string {
-	tokenHash := sha256.Sum256([]byte(token))
-	return cacheKey + "\x00" + hex.EncodeToString(tokenHash[:])
+// A repaired refresh grant may retain its access token. Scope throttle
+// deadlines to the complete credential chain so the repair can be checked.
+func usageWindowsFailureKey(cacheKey, credentialIdentity string) string {
+	digest := sha256.Sum256([]byte(credentialIdentity))
+	return cacheKey + "\x00" + hex.EncodeToString(digest[:])
 }
 
 // CredentialVersion also changes when only the refresh grant is repaired.
@@ -844,7 +846,7 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 	r.usageWindowsMu.Lock()
 	epoch := r.usageWindowsEpoch
 	flightKey := cacheKey + "\x00" + credentialKey + "\x00" + strconv.FormatUint(epoch, 10)
-	failureKey := usageWindowsFailureKey(cacheKey, account.Token)
+	failureKey := usageWindowsFailureKey(cacheKey, account.CredentialIdentity())
 	flight, joined := r.usageWindowsFlights[flightKey]
 	if !joined {
 		// A completed flight can remove itself just before a concurrent caller
