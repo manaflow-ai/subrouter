@@ -1428,6 +1428,7 @@ type remoteServerUsageStatus struct {
 	ProviderModels     *int                             `json:"provider_models,omitempty"`
 	ProviderEndpoints  []string                         `json:"provider_endpoints,omitempty"`
 	QuotaStatus        string                           `json:"quota_status,omitempty"`
+	UsageThrottled     bool                             `json:"usage_throttled,omitempty"`
 	AccountIdentity    string                           `json:"account_identity,omitempty"`
 	QuotaUsageKnown    bool                             `json:"quota_usage_known,omitempty"`
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
@@ -1642,7 +1643,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			complimentaryReset: status.ComplimentaryReset,
 			extraUsage:         status.ExtraUsage,
 			provider:           status.Provider,
-			usageThrottled:     status.QuotaStatus == "throttled" || serverUsageThrottleError(status.Error),
+			usageThrottled:     status.UsageThrottled || status.QuotaStatus == "throttled" || serverUsageThrottleError(status.Error),
 			providerHealth:     status.ProviderHealth,
 			authChecked:        status.AuthChecked,
 			authValid:          status.AuthValid,
@@ -1683,6 +1684,17 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 				row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
 			} else {
 				row.score = selectacct.Score{AccountID: email, Headroom: 0, ShortHeadroom: 0}
+			}
+		} else if status.UsageThrottled || status.QuotaStatus == "throttled" {
+			// A telemetry 429 has no quota meaning. Preserve authoritative reset
+			// windows when supplied; only headerless throttles get an optimistic
+			// display score while the controller suppresses another poll.
+			if len(status.Windows) > 0 {
+				row.score = scoreFromWindows(email, status.Windows)
+				row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
+				row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
+			} else {
+				row.score = selectacct.Score{AccountID: email, Headroom: 1, ShortHeadroom: 1}
 			}
 		} else if status.AuthMode == accounts.AuthModeAPIKey && status.QuotaUsageKnown {
 			row.score = scoreFromWindows(email, status.Windows)

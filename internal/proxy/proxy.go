@@ -633,6 +633,10 @@ type usageWindowsFailure struct {
 	err     error
 	at      time.Time
 	retryAt time.Time
+	// windows preserve provider-supplied reset metadata across the throttle
+	// cache window so repeated status reads remain display-only.
+	windows   []accounts.UsageWindow
+	fetchedAt time.Time
 }
 
 // Used only if a provider reports 429 without a typed retry deadline.
@@ -761,7 +765,7 @@ func (r *AccountRef) credentialSnapshot(provider accounts.Provider, id string) a
 // windows as a confident exhaustion signal: stale cooked data was overwriting
 // healthy accounts' scores and routing traffic to dead accounts.
 func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, error) {
-	windows, fresh, _, err := r.FetchUsageWindowsCachedWithObservation(ctx, client, account)
+	windows, fresh, _, _, err := r.FetchUsageWindowsCachedWithObservation(ctx, client, account)
 	return windows, fresh, err
 }
 
@@ -769,13 +773,13 @@ func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.C
 // provider observation time represented by the returned windows. The time is
 // captured with the same cache/flight result, so a concurrent refresh cannot
 // pair old windows with an unrelated timestamp.
-func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, time.Time, error) {
+func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, time.Time, bool, error) {
 	if r == nil {
 		windows, err := fetchAccountUsageWindowsLive(ctx, client, account)
 		if err != nil {
-			return windows, false, time.Time{}, err
+			return windows, false, time.Time{}, false, err
 		}
-		return windows, true, time.Now().UTC(), nil
+		return windows, true, time.Now().UTC(), false, nil
 	}
 	key := account.ID + "\x00" + string(account.Provider)
 	credentialKey := usageWindowsCredentialKey(account)
@@ -787,25 +791,32 @@ func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context,
 	failure, throttled := r.usageWindowsFailures[failureKey]
 	r.usageWindowsMu.Unlock()
 	if entryMatchesCredential && now.Sub(entry.at) < usageWindowsTTL {
-		return append([]accounts.UsageWindow(nil), entry.windows...), entry.supplementalFresh, entry.at, nil
+		return append([]accounts.UsageWindow(nil), entry.windows...), entry.supplementalFresh, entry.at, false, nil
 	}
 	// A quota-status poll should never turn one upstream 429 into a storm of
 	// identical follow-up 429s. No waiting: serve last-good or return the
 	// already-known failure. Actual model requests use their normal route.
 	if throttled && now.Before(failure.retryAt) {
 		if entryMatchesCredential && now.Sub(entry.at) < usageWindowsLastGoodTTL {
-			return append([]accounts.UsageWindow(nil), entry.windows...), false, entry.at, nil
+			return append([]accounts.UsageWindow(nil), entry.windows...), false, entry.at, true, nil
 		}
-		return nil, false, time.Time{}, failure.err
+		if len(failure.windows) > 0 {
+			return append([]accounts.UsageWindow(nil), failure.windows...), false, failure.fetchedAt, true, nil
+		}
+		return nil, false, time.Time{}, true, failure.err
 	}
 	windows, supplementalFresh, fetchedAt, err := r.fetchUsageWindowsShared(ctx, client, account, key)
 	if err == nil {
-		return windows, supplementalFresh, fetchedAt, nil
+		r.usageWindowsMu.Lock()
+		failure, throttled = r.usageWindowsFailures[failureKey]
+		throttleActive := throttled && now.Before(failure.retryAt)
+		r.usageWindowsMu.Unlock()
+		return windows, supplementalFresh, fetchedAt, throttleActive, nil
 	}
 	if !authLikeUsageError(err.Error()) && entryMatchesCredential && now.Sub(entry.at) < usageWindowsLastGoodTTL {
-		return append([]accounts.UsageWindow(nil), entry.windows...), false, entry.at, nil
+		return append([]accounts.UsageWindow(nil), entry.windows...), false, entry.at, throttled && now.Before(failure.retryAt), nil
 	}
-	return nil, false, time.Time{}, err
+	return nil, false, time.Time{}, throttled && now.Before(failure.retryAt), err
 }
 
 // usageWindowsFlight is one in-flight upstream usage fetch shared by every
@@ -851,7 +862,12 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 		// reaches this point. Recheck the credential-scoped throttle while still
 		// holding the same lock so that caller cannot start a duplicate request.
 		if failure, throttled := r.usageWindowsFailures[failureKey]; throttled && time.Now().Before(failure.retryAt) {
+			windows := append([]accounts.UsageWindow(nil), failure.windows...)
+			fetchedAt := failure.fetchedAt
 			r.usageWindowsMu.Unlock()
+			if len(windows) > 0 {
+				return windows, false, fetchedAt, nil
+			}
 			return nil, false, time.Time{}, failure.err
 		}
 		flight = &usageWindowsFlight{done: make(chan struct{}), epoch: epoch}
@@ -892,12 +908,21 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 						delete(r.usageWindowsFailures, failureKey)
 					}
 				} else if usageWindowsIsThrottle(flight.err) && flight.epoch == r.usageWindowsEpoch && latest {
+					var throttle *agentclaude.UsageThrottleError
+					if errors.As(flight.err, &throttle) && len(throttle.Windows) > 0 {
+						flight.fetchedAt = time.Now().UTC()
+					}
 					if r.usageWindowsFailures == nil {
 						r.usageWindowsFailures = map[string]usageWindowsFailure{}
 					}
-					r.usageWindowsFailures[failureKey] = usageWindowsFailure{
+					failure := usageWindowsFailure{
 						err: flight.err, at: now, retryAt: usageWindowsThrottleUntil(flight.err, now),
 					}
+					if errors.As(flight.err, &throttle) && len(throttle.Windows) > 0 {
+						failure.windows = append([]accounts.UsageWindow(nil), throttle.Windows...)
+						failure.fetchedAt = flight.fetchedAt
+					}
+					r.usageWindowsFailures[failureKey] = failure
 				}
 				if r.usageWindowsFlights[flightKey] == flight {
 					delete(r.usageWindowsFlights, flightKey)
@@ -912,6 +937,13 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 	select {
 	case <-flight.done:
 		if flight.err != nil {
+			var throttle *agentclaude.UsageThrottleError
+			if errors.As(flight.err, &throttle) && len(throttle.Windows) > 0 {
+				// The provider supplied authoritative reset metadata on a
+				// throttled telemetry response. Publish it as stale evidence while
+				// retaining the credential-scoped failure cache.
+				return append([]accounts.UsageWindow(nil), throttle.Windows...), false, flight.fetchedAt, nil
+			}
 			return nil, false, time.Time{}, flight.err
 		}
 		return append([]accounts.UsageWindow(nil), flight.windows...), flight.supplementalFresh, flight.fetchedAt, nil
@@ -1006,15 +1038,19 @@ type AccountStatus struct {
 
 type AccountUsageStatus struct {
 	AccountStatus
-	Active             bool                             `json:"active,omitempty"`
-	KeyFingerprint     string                           `json:"key_fingerprint,omitempty"`
-	AssignedSessions   int                              `json:"assigned_sessions,omitempty"`
-	SessionsKnown      bool                             `json:"sessions_known,omitempty"`
-	PlanType           string                           `json:"plan_type,omitempty"`
-	ProviderHealth     string                           `json:"provider_health,omitempty"`
-	ProviderModels     *int                             `json:"provider_models,omitempty"`
-	ProviderEndpoints  []string                         `json:"provider_endpoints,omitempty"`
-	QuotaStatus        string                           `json:"quota_status,omitempty"`
+	Active            bool     `json:"active,omitempty"`
+	KeyFingerprint    string   `json:"key_fingerprint,omitempty"`
+	AssignedSessions  int      `json:"assigned_sessions,omitempty"`
+	SessionsKnown     bool     `json:"sessions_known,omitempty"`
+	PlanType          string   `json:"plan_type,omitempty"`
+	ProviderHealth    string   `json:"provider_health,omitempty"`
+	ProviderModels    *int     `json:"provider_models,omitempty"`
+	ProviderEndpoints []string `json:"provider_endpoints,omitempty"`
+	QuotaStatus       string   `json:"quota_status,omitempty"`
+	// UsageThrottled means the provider's telemetry endpoint declined this
+	// observation with a transient 429. It says nothing about account quota and
+	// must never be used as a quota exhaustion decision.
+	UsageThrottled     bool                             `json:"usage_throttled,omitempty"`
 	AccountIdentity    string                           `json:"account_identity,omitempty"`
 	QuotaUsageKnown    bool                             `json:"quota_usage_known,omitempty"`
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
@@ -1703,7 +1739,8 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 				// A plain usage-endpoint 429 is a transient observation failure,
 				// not quota exhaustion or an authentication failure.
 				status.Error = ""
-				status.QuotaStatus = "throttled"
+				status.UsageThrottled = true
+				status.QuotaStatus = ""
 				out[i] = status
 			}
 			continue
@@ -1713,6 +1750,7 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 		restored.Refreshed = status.Refreshed
 		restored.Error = ""
 		restored.UsageFresh = false
+		restored.UsageThrottled = status.UsageThrottled
 		out[i] = restored
 	}
 	if epoch == r.usageStatusEpoch {
@@ -2149,7 +2187,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.AuthValid = true
 			next.PlanType = details.PlanType()
 			r.replace(account)
-			windows, fresh, fetchedAt, err := r.FetchUsageWindowsCachedWithObservation(sweepCtx, r.client, account)
+			windows, fresh, fetchedAt, throttled, err := r.FetchUsageWindowsCachedWithObservation(sweepCtx, r.client, account)
 			if err != nil {
 				next.Error = err.Error()
 				out[i] = next
@@ -2159,6 +2197,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.ExtraUsage = extraUsageFromWindows(windows)
 			next.UsageFresh = fresh
 			next.UsageFetchedAt = fetchedAt
+			next.UsageThrottled = throttled
 			if next.UsageFetchedAt.IsZero() && fresh {
 				next.UsageFetchedAt = time.Now().UTC()
 			}

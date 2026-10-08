@@ -384,7 +384,7 @@ func TestMergeUsageStatusesClassifiesPlain429AsTransientThrottle(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("rows = %+v, want one row", rows)
 	}
-	if rows[0].Error != "" || rows[0].QuotaStatus != "throttled" {
+	if rows[0].Error != "" || rows[0].QuotaStatus != "" || !rows[0].UsageThrottled {
 		t.Fatalf("plain 429 classification = %+v, want transient throttled status", rows[0])
 	}
 

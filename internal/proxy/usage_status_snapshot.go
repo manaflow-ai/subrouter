@@ -120,6 +120,14 @@ func (r *AccountRef) restoreUsageStatusSnapshot() {
 			return
 		}
 		status := saved.Status
+		// Snapshots written before UsageThrottled was split from quota status
+		// used quota_status=throttled for a plain telemetry 429. Normalize that
+		// legacy spelling on restore so a restart cannot reintroduce the false
+		// quota state.
+		if status.QuotaStatus == "throttled" {
+			status.UsageThrottled = true
+			status.QuotaStatus = ""
+		}
 		// A restart restores observations, not a false claim of live freshness.
 		// Keep the provider observation time so reset windows remain visible.
 		status.UsageFresh = false
