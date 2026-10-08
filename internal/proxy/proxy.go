@@ -4571,6 +4571,13 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 		if account.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
+		if _, blocked := knownAccountWideQuotaReset(current.ScoreFor(schedulerAccountProvider(account.Provider), account.ID), time.Now()); blocked {
+			// The provider has already supplied every binding account-wide
+			// reset time. Refreshing credentials and usage while exhausted
+			// creates requests but cannot improve this account's eligibility.
+			// Preserve the measured score and recheck at its reset.
+			continue
+		}
 		if failure, dead := s.AccountRef.terminalCredFailure(account); dead {
 			if s.Logger != nil {
 				s.Logger.Debug("skipping account with known-dead credential", "account", account.ID, "error", failure)
@@ -8560,6 +8567,11 @@ func (s Server) refreshUsageScoresForRequest(ctx context.Context) {
 	if s.CredentialBroker != nil || s.SchedulerRef == nil || !s.SchedulerRef.Stale(s.UsageScoreTTL) {
 		return
 	}
+	if _, blocked := s.allOAuthAccountsWaitingForReset(time.Now()); blocked {
+		// A fresh status probe cannot beat the known provider reset clock.
+		// Keep the saved exhaustion state and avoid request-triggered sweeps.
+		return
+	}
 	if s.SchedulerRef.UpdatedAt().IsZero() {
 		s.refreshUsageScoresIfStale(ctx)
 		return
@@ -8617,6 +8629,12 @@ func (s Server) nextUsageScoreRefreshDelay() time.Duration {
 	floor := ttl / 10
 	if floor <= 0 {
 		floor = time.Millisecond
+	}
+	if resetAt, blocked := s.allOAuthAccountsWaitingForReset(time.Now()); blocked {
+		// When the entire OAuth pool is exhausted, sleep until the earliest
+		// actual reset instead of waking every 30s to poll the same accounts.
+		// A small safety margin avoids racing the provider's reset clock.
+		return max(time.Duration(0), time.Until(resetAt)) + time.Second + rand.N(floor+1)
 	}
 	wait := floor
 	if updatedAt := s.SchedulerRef.UpdatedAt(); !updatedAt.IsZero() {
