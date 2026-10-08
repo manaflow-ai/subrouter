@@ -4738,6 +4738,14 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 		if account.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
+		if s.SchedulerRef != nil && !s.SchedulerRef.UpdatedAt().IsZero() {
+			if _, blocked := knownAccountWideQuotaReset(current.ScoreFor(schedulerAccountProvider(account.Provider), account.ID), time.Now()); blocked {
+				// The provider has already supplied every binding account-wide
+				// reset time. Preserve the measured state without a new probe.
+				// A re-login invalidates the score timestamp and bypasses this.
+				continue
+			}
+		}
 		if failure, dead := s.AccountRef.terminalCredFailure(account); dead {
 			if s.Logger != nil {
 				s.Logger.Debug("skipping account with known-dead credential", "account", account.ID, "error", failure)
@@ -8809,6 +8817,11 @@ func (s Server) refreshUsageScoresForRequest(ctx context.Context) {
 	if s.CredentialBroker != nil || s.SchedulerRef == nil || !s.SchedulerRef.Stale(s.UsageScoreTTL) {
 		return
 	}
+	if _, blocked := s.allOAuthAccountsWaitingForReset(time.Now()); blocked {
+		// A fresh status probe cannot beat the known provider reset clock.
+		// Keep the saved exhaustion state and avoid request-triggered sweeps.
+		return
+	}
 	if s.SchedulerRef.UpdatedAt().IsZero() {
 		s.refreshUsageScoresIfStale(ctx)
 		return
@@ -8866,6 +8879,19 @@ func (s Server) nextUsageScoreRefreshDelay() time.Duration {
 	floor := ttl / 10
 	if floor <= 0 {
 		floor = time.Millisecond
+	}
+	if resetAt, blocked := s.allOAuthAccountsWaitingForReset(time.Now()); blocked {
+		// When the entire OAuth pool is exhausted, sleep until the earliest
+		// actual reset instead of waking every 30s to poll the same accounts.
+		// Keep a bounded local recheck so a newly published login is noticed
+		// before its replacement credential waits behind the old reset clock.
+		// The recheck only reads account state and scheduler metadata; it does
+		// not start a provider usage request.
+		const maxAccountResetRecheck = time.Minute
+		recheck := min(ttl, maxAccountResetRecheck)
+		wait := min(max(time.Duration(0), time.Until(resetAt)), recheck)
+		jitter := min(floor, max(time.Duration(0), recheck/10))
+		return wait + time.Second + rand.N(jitter+1)
 	}
 	wait := floor
 	if updatedAt := s.SchedulerRef.UpdatedAt(); !updatedAt.IsZero() {
