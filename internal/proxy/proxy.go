@@ -461,11 +461,12 @@ type AccountRef struct {
 	usageStatusSweep *usageStatusSweep
 	usageStatusEpoch uint64
 
-	usageWindowsMu       sync.Mutex
-	usageWindows         map[string]usageWindowsEntry
-	usageWindowsFlights  map[string]*usageWindowsFlight
-	usageWindowsFailures map[string]usageWindowsFailure
-	claudeSupplemental   map[string]claudeSupplementalUsage
+	usageWindowsMu         sync.Mutex
+	usageWindows           map[string]usageWindowsEntry
+	usageWindowsFlights    map[string]*usageWindowsFlight
+	usageWindowsLatest     map[string]string
+	usageWindowsFailures   map[string]usageWindowsFailure
+	claudeSupplemental     map[string]claudeSupplementalUsage
 	usageWindowsEpoch    uint64
 
 	credFailMu sync.Mutex
@@ -618,6 +619,7 @@ type usageWindowsEntry struct {
 	windows           []accounts.UsageWindow
 	at                time.Time
 	supplementalFresh bool
+	credentialKey     string // SHA-256 fingerprint, never the raw credential
 }
 
 // A temporary upstream usage throttle has a short-lived, credential-scoped
@@ -772,10 +774,16 @@ func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context,
 		return windows, true, time.Now().UTC(), nil
 	}
 	key := account.ID + "\x00" + string(account.Provider)
+	credentialKey := usageWindowsCredentialKey(account)
 	failureKey := usageWindowsFailureKey(key, account.Token)
 	now := time.Now()
 	r.usageWindowsMu.Lock()
 	entry, ok := r.usageWindows[key]
+	// An account label can survive re-login. Its previous credential's quota
+	// cannot serve as either fresh or last-known-good evidence for the new one.
+	if ok && entry.credentialKey != credentialKey {
+		ok = false
+	}
 	failure, throttled := r.usageWindowsFailures[failureKey]
 	r.usageWindowsMu.Unlock()
 	if ok && now.Sub(entry.at) < usageWindowsTTL {
@@ -824,11 +832,18 @@ func usageWindowsFailureKey(cacheKey, token string) string {
 	return cacheKey + "\x00" + hex.EncodeToString(tokenHash[:])
 }
 
+// CredentialVersion also changes when only the refresh grant is repaired.
+// Hashing it keeps the cache isolated without retaining the original secret.
+func usageWindowsCredentialKey(account accounts.Account) string {
+	fingerprint := sha256.Sum256([]byte(account.CredentialIdentity()))
+	return hex.EncodeToString(fingerprint[:])
+}
+
 func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.Client, account accounts.Account, cacheKey string) ([]accounts.UsageWindow, bool, time.Time, error) {
-	tokenHash := sha256.Sum256([]byte(account.Token))
+	credentialKey := usageWindowsCredentialKey(account)
 	r.usageWindowsMu.Lock()
 	epoch := r.usageWindowsEpoch
-	flightKey := cacheKey + "\x00" + hex.EncodeToString(tokenHash[:]) + "\x00" + strconv.FormatUint(epoch, 10)
+	flightKey := cacheKey + "\x00" + credentialKey + "\x00" + strconv.FormatUint(epoch, 10)
 	failureKey := usageWindowsFailureKey(cacheKey, account.Token)
 	flight, joined := r.usageWindowsFlights[flightKey]
 	if !joined {
@@ -844,6 +859,12 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 			r.usageWindowsFlights = map[string]*usageWindowsFlight{}
 		}
 		r.usageWindowsFlights[flightKey] = flight
+		// A newer credential fetch owns the cache slot even if the older
+		// request completes last. In-flight callers still get their own result.
+		if r.usageWindowsLatest == nil {
+			r.usageWindowsLatest = map[string]string{}
+		}
+		r.usageWindowsLatest[cacheKey] = flightKey
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageStatusFetchTimeout)
 		go func() {
 			defer cancel()
@@ -861,11 +882,15 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 				}
 				if flight.err == nil {
 					flight.fetchedAt = time.Now().UTC()
-					if flight.epoch == r.usageWindowsEpoch {
+					if flight.epoch == r.usageWindowsEpoch && r.usageWindowsLatest[cacheKey] == flightKey {
 						if r.usageWindows == nil {
 							r.usageWindows = map[string]usageWindowsEntry{}
 						}
-						r.usageWindows[cacheKey] = usageWindowsEntry{windows: append([]accounts.UsageWindow(nil), flight.windows...), at: flight.fetchedAt, supplementalFresh: flight.supplementalFresh}
+						r.usageWindows[cacheKey] = usageWindowsEntry{
+							windows: append([]accounts.UsageWindow(nil), flight.windows...),
+							at: flight.fetchedAt, supplementalFresh: flight.supplementalFresh,
+							credentialKey: credentialKey,
+						}
 					}
 					delete(r.usageWindowsFailures, failureKey)
 				} else if usageWindowsIsThrottle(flight.err) {
@@ -1593,6 +1618,7 @@ func (r *AccountRef) InvalidateUsageWindowsCache() {
 	}
 	r.usageWindowsMu.Lock()
 	r.usageWindows = nil
+	r.usageWindowsLatest = nil
 	r.claudeSupplemental = nil
 	// A manual status/cache refresh must not defeat the provider's explicit
 	// usage-endpoint Retry-After. The throttle cache is keyed by credential
