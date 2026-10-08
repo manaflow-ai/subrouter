@@ -21,6 +21,9 @@ const claudeSupplementalProbeTTL = 10 * time.Minute
 type claudeSupplementalUsage struct {
 	windows []accounts.UsageWindow
 	at      time.Time
+	// Request start is used only to reject out-of-order passive replies.
+	// Freshness comes from when the upstream headers actually arrived.
+	requestStarted time.Time
 }
 
 func claudeSupplementalCacheKey(account accounts.Account) string {
