@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"time"
 
@@ -144,6 +145,13 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
 ) ([]accounts.UsageWindow, bool, error) {
 	usage, err := agentclaude.FetchUsage(ctx, client, account.Token)
 	windows := claudeUsageWindows(usage)
+	var throttle *agentclaude.UsageThrottleError
+	if errors.As(err, &throttle) {
+		// The provider's usage endpoint supplied an explicit retry deadline.
+		// Do not immediately issue the synthetic Messages probe as a fallback;
+		// that would double traffic while the account is already throttled.
+		return nil, false, err
+	}
 	if usageWindowNamed(windows, agentclaude.FableWindowName) {
 		// The ordinary endpoint's model bucket is newer than our probe cache.
 		// Save it so a later ordinary response that omits the bucket does not

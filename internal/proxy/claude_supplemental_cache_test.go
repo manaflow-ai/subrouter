@@ -16,6 +16,7 @@ import (
 type supplementalProbeCounter struct {
 	usageCalls           int
 	probeCalls           int
+	usageThrottle        bool
 	includeSupplemental  bool
 	primaryUsed          float64
 	primaryIncludesFable bool
@@ -26,6 +27,14 @@ func (c *supplementalProbeCounter) RoundTrip(req *http.Request) (*http.Response,
 	switch {
 	case strings.HasSuffix(req.URL.Path, "/api/oauth/usage"):
 		c.usageCalls++
+		if c.usageThrottle {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Status:     "429 Too Many Requests",
+				Header:     http.Header{"Retry-After": []string{"1800"}},
+				Body:       io.NopCloser(strings.NewReader("{}")),
+			}, nil
+		}
 		extra := ""
 		if c.primaryIncludesFable {
 			extra = fmt.Sprintf(`,"seven_day_oauth_apps":{"utilization":%.1f,"resets_at":"2030-01-03T00:00:00+00:00"}`, c.primaryFableUsed)
@@ -111,6 +120,21 @@ func TestClaudeSupplementalProbeReusedAcrossPrimaryUsageRefreshes(t *testing.T) 
 	}
 	if _, ok := fableUsageWindow(windows); !ok {
 		t.Fatal("supplementary window was lost on second fetch")
+	}
+}
+
+func TestClaudeUsageThrottleDoesNotLaunchSupplementalProbe(t *testing.T) {
+	transport := &supplementalProbeCounter{usageThrottle: true}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	account := probeAccount()
+
+	_, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
+	if err == nil {
+		t.Fatal("expected usage throttle error")
+	}
+	if transport.usageCalls != 1 || transport.probeCalls != 0 {
+		t.Fatalf("throttle launched an unnecessary probe: usage=%d probe=%d", transport.usageCalls, transport.probeCalls)
 	}
 }
 
