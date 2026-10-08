@@ -196,10 +196,10 @@ func TestAutonomousClaudeQuotaRetryBudgetRearmsAfterReset(t *testing.T) {
 	attempts := 0
 	waits := 0
 	transport := autonomousAgentRetryTransport{
-		provider: accounts.ProviderClaude,
-		budget: budget,
+		provider:       accounts.ProviderClaude,
+		budget:         budget,
 		retriesPerPass: 2,
-		base: autonomousRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		base:           autonomousRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
 			attempts++
 			for i := 0; i < 3; i++ {
 				if !budget.consumeQuota() {
