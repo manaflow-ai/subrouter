@@ -130,8 +130,8 @@ func TestClaudeOAuthRetryCandidateStopsWhenEveryWindowIsConfirmedCooked(t *testi
 	quota.ExhaustedResetAt = time.Now().Add(time.Hour)
 	refreshes := 0
 	server := Server{
-		Accounts: []accounts.Account{cooked},
-		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{quota})),
+		Accounts:      []accounts.Account{cooked},
+		SchedulerRef:  selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{quota})),
 		UsageScoreTTL: 0,
 		RefreshAccountFn: func(_ context.Context, account accounts.Account) (accounts.Account, error) {
 			refreshes++
