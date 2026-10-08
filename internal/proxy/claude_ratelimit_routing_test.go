@@ -550,7 +550,7 @@ func TestHTTPProxyDoesNotForwardClientIPHeaders(t *testing.T) {
 	}
 }
 
-func TestClaude429FailoverRespectsSharedAttemptBudget(t *testing.T) {
+func TestClaude429FailoverUsesPoolSizedQuotaBudget(t *testing.T) {
 	var hits []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -623,14 +623,14 @@ func TestClaude429FailoverRespectsSharedAttemptBudget(t *testing.T) {
 	}
 	defer response.Body.Close()
 	body, _ := io.ReadAll(response.Body)
-	if response.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("status=%d body=%s hits=%v, want final rate limit after the shared attempt budget", response.StatusCode, string(body), hits)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s hits=%v, want healthy account after pool-sized quota failover", response.StatusCode, string(body), hits)
 	}
-	if len(hits) != replayablePostMaxAttempts {
-		t.Fatalf("hits=%v, want aggregate cap %d", hits, replayablePostMaxAttempts)
+	if len(hits) != len(accountsList) {
+		t.Fatalf("hits=%v, want one attempt per pool account", hits)
 	}
-	if hits[len(hits)-1] != "cooked-5@example.com" {
-		t.Fatalf("last hit=%q, want sixth account; hits=%v", hits[len(hits)-1], hits)
+	if hits[len(hits)-1] != "fresh-7@example.com" {
+		t.Fatalf("last hit=%q, want the healthy account; hits=%v", hits[len(hits)-1], hits)
 	}
 }
 
@@ -1025,8 +1025,8 @@ func TestClaudeExplicitWindow429StopsAtControllerCooldown(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusTooManyRequests || stub.calls != 1 {
-		t.Fatalf("status=%d upstream_calls=%d, want one bounded attempt", response.StatusCode, stub.calls)
+	if response.StatusCode != http.StatusServiceUnavailable || stub.calls != 1 {
+		t.Fatalf("status=%d upstream_calls=%d, want one bounded attempt and sr pool 503", response.StatusCode, stub.calls)
 	}
 }
 
@@ -1062,6 +1062,7 @@ func TestClaudeBareRejectedFableMarksOnlyFablePool(t *testing.T) {
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
 		h := http.Header{}
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		h.Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(time.Now().Add(2*time.Hour).Unix(), 10))
 		return &http.Response{
 			StatusCode: http.StatusTooManyRequests,
 			Header:     h,
@@ -1084,8 +1085,8 @@ func TestClaudeBareRejectedFableMarksOnlyFablePool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("status=%d, want original fable rejection", response.StatusCode)
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want sr pool exhaustion 503", response.StatusCode)
 	}
 
 	scheduler := server.SchedulerRef.Get()
@@ -1116,10 +1117,11 @@ func TestClaudeFailoverExhaustionIsLogged(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Every account the server can pick returns a rejected 429, so failover
-	// never finds a healthy account and the client gets a 429.
+	// never finds a healthy account and the client gets sr's pool 503.
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
 		h := http.Header{}
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		h.Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(time.Now().Add(2*time.Hour).Unix(), 10))
 		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: h, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`))}
 	}}
 	var logBuf bytes.Buffer
@@ -1144,8 +1146,15 @@ func TestClaudeFailoverExhaustionIsLogged(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want 429 (all accounts rate-limited)", response.StatusCode)
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want sr pool exhaustion 503", response.StatusCode)
+	}
+	body, _ := io.ReadAll(response.Body)
+	if !strings.Contains(string(body), "no non-exhausted claude accounts available") || strings.Contains(string(body), "rate_limit_error") {
+		t.Fatalf("body = %q, want sr pool message without provider 429", string(body))
+	}
+	if response.Header.Get("Retry-After") == "" {
+		t.Fatal("pool exhaustion 503 missing Retry-After")
 	}
 	logs := logBuf.String()
 	if !strings.Contains(logs, "claude rate-limit returned to client after failover exhausted") {
@@ -1188,8 +1197,8 @@ func TestClaudeFailoverSkipsControllerCooldownAlternate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("status=%d, want original 429", response.StatusCode)
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want sr pool exhaustion 503", response.StatusCode)
 	}
 	if calls != 1 {
 		t.Fatalf("upstream calls=%d, want the controller-held alternate skipped", calls)

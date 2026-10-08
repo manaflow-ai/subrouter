@@ -3,6 +3,7 @@ package proxy
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -153,4 +154,24 @@ func writeAccountSelectionUnavailable(w http.ResponseWriter, err error) {
 		}
 	}
 	http.Error(w, message, http.StatusServiceUnavailable)
+}
+
+// poolExhaustedResponse is the transport equivalent of
+// writeAccountSelectionUnavailable. Failover discovers exhaustion after the
+// request has already entered ReverseProxy, so it must synthesize the same
+// local 503 instead of returning one account's provider 429 body.
+func poolExhaustedResponse(err error, req *http.Request) *http.Response {
+	header := make(http.Header)
+	header.Set("Content-Type", "text/plain; charset=utf-8")
+	var exhausted *poolExhaustedError
+	if errors.As(err, &exhausted) && exhausted.retryAfterSeconds > 0 {
+		header.Set("Retry-After", strconv.FormatInt(exhausted.retryAfterSeconds, 10))
+	}
+	return &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Status:     "503 Service Unavailable",
+		Header:     header,
+		Body:       io.NopCloser(strings.NewReader(err.Error() + "\n")),
+		Request:    req,
+	}
 }
