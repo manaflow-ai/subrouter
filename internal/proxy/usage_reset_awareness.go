@@ -21,7 +21,10 @@ func knownAccountWideQuotaReset(score selectacct.Score, now time.Time) (time.Tim
 // A missing/unknown score or any healthy account keeps the normal background
 // cadence; do not guess a global recovery deadline from partial telemetry.
 func (s Server) allOAuthAccountsWaitingForReset(now time.Time) (time.Time, bool) {
-	if s.AccountRef == nil || s.SchedulerRef == nil {
+	if s.AccountRef == nil || s.SchedulerRef == nil || s.SchedulerRef.UpdatedAt().IsZero() {
+		// Account-import/re-login advances the account generation and
+		// invalidates the measured score timestamp. Do not apply an old
+		// account's deadline to its newly installed credential.
 		return time.Time{}, false
 	}
 	loaded, _ := s.AccountRef.Snapshot()
