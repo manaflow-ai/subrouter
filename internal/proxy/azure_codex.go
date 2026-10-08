@@ -190,14 +190,24 @@ const (
 // retry loops cannot multiply into one full allowance per layer.
 type attemptBudget struct {
 	remaining atomic.Int64
+	// quotaRemaining is the Claude subscription quota failover allowance.
+	// Header-confirmed quota 429s are cheap account switches and may use the
+	// whole pool, while transport and overload retries keep the request-wide
+	// bounded budget above.
+	quotaRemaining atomic.Int64
 	// claudeOverload is the request's same-account Claude overload ladder,
 	// bounded on its own (see claudeOverloadHold).
 	claudeOverload claudeOverloadHold
 }
 
 func newAttemptBudget(retries int) *attemptBudget {
+	return newAttemptBudgetWithQuota(retries, retries)
+}
+
+func newAttemptBudgetWithQuota(retries, quotaRetries int) *attemptBudget {
 	budget := &attemptBudget{}
 	budget.remaining.Store(int64(retries))
+	budget.quotaRemaining.Store(int64(quotaRetries))
 	return budget
 }
 
@@ -215,6 +225,21 @@ func (b *attemptBudget) consume() bool {
 			return false
 		}
 		if b.remaining.CompareAndSwap(remaining, remaining-1) {
+			return true
+		}
+	}
+}
+
+func (b *attemptBudget) consumeQuota() bool {
+	if b == nil {
+		return true
+	}
+	for {
+		remaining := b.quotaRemaining.Load()
+		if remaining <= 0 {
+			return false
+		}
+		if b.quotaRemaining.CompareAndSwap(remaining, remaining-1) {
 			return true
 		}
 	}

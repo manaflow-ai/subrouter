@@ -5617,7 +5617,14 @@ func (s Server) proxyHandler() http.Handler {
 		usageFailoverInstalled := false
 		if retryPost && postReplayable {
 			requestMaxAttempts := replayablePostMaxAttempts
-			requestRetryBudget := newAttemptBudget(requestMaxAttempts - 1)
+			quotaRetryBudget := requestMaxAttempts - 1
+			if requestProvider == accounts.ProviderClaude && usageRetryMaxAttempts > 0 {
+				quotaRetryBudget = usageRetryMaxAttempts - 1
+				if quotaRetryBudget < 0 {
+					quotaRetryBudget = 0
+				}
+			}
+			requestRetryBudget := newAttemptBudgetWithQuota(requestMaxAttempts-1, quotaRetryBudget)
 			// Every layer below reads and updates this one per-request state:
 			// the account the request is addressed to, the shared retry budget
 			// and the buffered body.
@@ -9297,9 +9304,15 @@ func subrouterNoRetryRequest(r *http.Request) bool {
 	}
 }
 
-func (s Server) usageLimitRetryMaxAttempts(_ context.Context, _ accounts.Provider) int {
-	// The budget is request-wide, not pool-sized. A large account pool must not
-	// turn one client request into one provider call per account.
+func (s Server) usageLimitRetryMaxAttempts(ctx context.Context, provider accounts.Provider) int {
+	// Claude quota 429s are fast account switches, so walk the local pool once
+	// before giving up. Other providers retain the bounded request-wide retry
+	// count and their existing backoff behavior.
+	if provider == accounts.ProviderClaude {
+		if poolSize := len(filterAccountsForProvider(s.accountListContext(ctx), provider)); poolSize > 0 {
+			return poolSize
+		}
+	}
 	return replayablePostMaxAttempts
 }
 
@@ -9572,6 +9585,29 @@ func (t usageLimitRetryTransport) fableFallbackResponse(giveUp *http.Response, a
 	// rejected response, so prevent passive response capture from attributing
 	// the fallback result to that account.
 	return tagRoutedResponseAccount(fallback, accounts.Account{Provider: t.provider}), true
+}
+
+// claudePoolExhaustedResponse turns a failover give-up into sr's own 503. The
+// provider's last 429 may describe only one account and can advertise a reset
+// several days away even when another account recovers sooner.
+func (t usageLimitRetryTransport) claudePoolExhaustedResponse(giveUp *http.Response, req *http.Request, accountID, reason string) (*http.Response, bool) {
+	if t.server == nil || t.provider != accounts.ProviderClaude {
+		return nil, false
+	}
+	allCandidates := filterAccountsForProvider(t.server.accountListContext(req.Context()), t.provider)
+	poolErr := t.server.poolExhaustedError(t.provider, allCandidates, t.poolModel)
+	if fallback, ok := t.fableFallbackResponse(giveUp, accountID, reason); ok {
+		return fallback, true
+	}
+	if giveUp != nil && giveUp.Body != nil {
+		_ = giveUp.Body.Close()
+	}
+	return poolExhaustedResponse(poolErr, req), true
+}
+
+func (t usageLimitRetryTransport) headerConfirmedClaudeQuota429(response *http.Response) bool {
+	return t.provider == accounts.ProviderClaude && response != nil && response.StatusCode == http.StatusTooManyRequests &&
+		claudeResponseRejectedForPool(response.Header, t.poolModel)
 }
 
 // providerOverloadMaxRetries bounds same-account overload retries for Kimi
@@ -10524,6 +10560,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				exhaustionPool = ""
 			}
 		}
+		quota429 := t.headerConfirmedClaudeQuota429(response)
 		var compatibilityNext accounts.Account
 		var compatibilityPickErr error
 		if modelUnsupported && t.server != nil {
@@ -10549,7 +10586,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		budgetExhausted := false
 		if attempt < maxAttempts && t.server != nil {
-			budgetExhausted = !a.consume()
+			if quota429 {
+				budgetExhausted = !a.consumeQuota()
+			} else {
+				budgetExhausted = !a.consume()
+			}
 		}
 		if attempt == maxAttempts || t.server == nil || budgetExhausted {
 			reason := "max_attempts"
@@ -10558,6 +10599,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				reason = "no_server"
 			case budgetExhausted:
 				reason = "retry_budget"
+			}
+			if quota429 {
+				t.logClaudeFailoverExhausted(response, accountID, reason, attempt, maxAttempts, len(tried))
+				if poolResponse, ok := t.claudePoolExhaustedResponse(response, attemptReq, accountID, reason); ok {
+					return poolResponse, nil
+				}
 			}
 			if fallback, ok := t.fableFallbackResponse(response, accountID, reason); ok {
 				return fallback, nil
@@ -10572,6 +10619,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if pickErr != nil {
 			if t.logger != nil {
 				t.logger.Warn("usage-limit retry has no alternate account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", pickErr)
+			}
+			var poolErr *poolExhaustedError
+			if quota429 && errors.As(pickErr, &poolErr) {
+				if poolResponse, ok := t.claudePoolExhaustedResponse(response, attemptReq, accountID, "no_alternate_account"); ok {
+					return poolResponse, nil
+				}
 			}
 			if fallback, ok := t.fableFallbackResponse(response, accountID, "no_alternate_account"); ok {
 				return fallback, nil
@@ -11255,7 +11308,7 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 					eligible = append(eligible, candidate)
 				}
 				if len(eligible) == 0 && len(candidates) > 0 {
-					return accounts.Account{}, fmt.Errorf("all %s retry candidates are in controller cooldown", provider)
+					return accounts.Account{}, fmt.Errorf("all %s retry candidates are in controller cooldown: %w", provider, s.poolExhaustedError(provider, allCandidates, poolModel))
 				}
 				candidates = eligible
 			}
@@ -11264,7 +11317,7 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 				// without fetching another status snapshot before retry.
 				candidates = claudeRetryCandidatesFromScores(quotaScheduler, scheduler, candidates, poolModel, time.Now())
 				if len(candidates) == 0 {
-					return accounts.Account{}, fmt.Errorf("all untried Claude retry candidates have confirmed quota exhaustion or lack model support")
+					return accounts.Account{}, fmt.Errorf("all untried Claude retry candidates have confirmed quota exhaustion or lack model support: %w", s.poolExhaustedError(provider, allCandidates, poolModel))
 				}
 			}
 			if len(candidates) == 0 {
