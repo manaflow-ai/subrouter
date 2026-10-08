@@ -50,6 +50,7 @@ func TestSRStatusAccountStateMapping(t *testing.T) {
 		{"temp", func() srUsageRow { return srStatusCodexRow(100, 20) }, srStatusStateTemp},
 		{"cooked", func() srUsageRow { return srStatusCodexRow(0, 100) }, srStatusStateCooked},
 		{"active cooked", func() srUsageRow { r := srStatusCodexRow(0, 100); r.active = true; return r }, srStatusStateCooked},
+		{"throttled", func() srUsageRow { r := healthy; r.usageThrottled = true; return r }, srStatusStateThrottled},
 		{"error", func() srUsageRow { r := healthy; r.err = errors.New("refresh failed"); return r }, srStatusStateError},
 		{"cooked error", func() srUsageRow { r := srStatusCodexRow(0, 100); r.err = errors.New("x"); return r }, srStatusStateError},
 		{"keyed bad key", func() srUsageRow {
