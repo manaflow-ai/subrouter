@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -56,5 +57,30 @@ func TestFetchUsageReturnsTypedThrottleWithDeadline(t *testing.T) {
 	}
 	if throttled.RetryAt.Before(before.Add(29 * time.Minute)) {
 		t.Fatalf("retry at %v before 30m provider deadline", throttled.RetryAt)
+	}
+}
+
+func TestFetchUsageKeepsQuotaWindowsFromThrottledResponse(t *testing.T) {
+	reset := time.Now().Add(2 * time.Hour).Unix()
+	client := &http.Client{Transport: usage429Transport(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429 Too Many Requests",
+			Header: http.Header{
+				"Retry-After":                                []string{"60"},
+				"Anthropic-Ratelimit-Unified-5h-Status":      []string{"allowed"},
+				"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.42"},
+				"Anthropic-Ratelimit-Unified-5h-Reset":       []string{strconv.FormatInt(reset, 10)},
+			},
+			Body: io.NopCloser(strings.NewReader("{}")),
+		}, nil
+	})}
+	_, err := FetchUsage(context.Background(), client, "fake-credential")
+	var throttled *UsageThrottleError
+	if !errors.As(err, &throttled) || len(throttled.Windows) != 1 {
+		t.Fatalf("error = %#v, want one reset window", err)
+	}
+	if throttled.Windows[0].UsedPercent != 42 || throttled.Windows[0].ResetAt.IsZero() {
+		t.Fatalf("windows = %+v, want utilization and reset", throttled.Windows)
 	}
 }
