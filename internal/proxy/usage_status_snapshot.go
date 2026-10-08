@@ -132,6 +132,13 @@ func (r *AccountRef) restoreUsageStatusSnapshot() {
 		// Keep the provider observation time so reset windows remain visible.
 		status.UsageFresh = false
 		status.Error = ""
+		// Older durable snapshots did not persist UsageFetchedAt. Their rows
+		// still contain the provider windows, so use the snapshot write time as
+		// the best available observation time instead of dropping those windows
+		// from last-good recovery (and rendering blank reset cells after a 429).
+		if status.UsageFetchedAt.IsZero() && len(status.Windows) > 0 {
+			status.UsageFetchedAt = snapshot.SavedAt
+		}
 		status.Active = (status.Provider == accounts.ProviderClaude && status.ID == activeClaude) ||
 			(status.Provider != accounts.ProviderClaude && status.ID == activeCodex)
 		rows = append(rows, status)

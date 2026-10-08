@@ -1553,6 +1553,44 @@ func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
 	}
 }
 
+// UsageStatusesFresh starts a live status sweep for an explicit user request.
+// A sweep already in progress is shared instead of being invalidated and
+// restarted, so concurrent `sr status` callers cannot stampede the provider.
+func (r *AccountRef) UsageStatusesFresh(ctx context.Context) []AccountUsageStatus {
+	if r == nil {
+		return nil
+	}
+	r.usageStatusMu.Lock()
+	sweep := r.usageStatusSweep
+	if sweep == nil {
+		r.usageStatusAt = time.Time{}
+		r.usageStatusCache = nil
+		r.usageStatusEpoch++
+		// The status lock is held while clearing the per-account observation so
+		// the sweep cannot start between invalidation and the live request.
+		r.usageWindowsMu.Lock()
+		r.usageWindows = nil
+		r.usageWindowsLatest = nil
+		r.usageWindowsFailures = nil
+		r.usageWindowsEpoch++
+		r.usageWindowsMu.Unlock()
+		sweep = &usageStatusSweep{done: make(chan struct{}), epoch: r.usageStatusEpoch}
+		r.usageStatusSweep = sweep
+		sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageStatusSweepTimeout)
+		go func() {
+			defer cancel()
+			r.runUsageStatusSweep(sweepCtx, sweep)
+		}()
+	}
+	r.usageStatusMu.Unlock()
+	select {
+	case <-sweep.done:
+		return append([]AccountUsageStatus(nil), sweep.result...)
+	case <-ctx.Done():
+		return nil
+	}
+}
+
 // UsageStatusSnapshot returns the most recent usage sweep without starting a
 // provider request. Status is an observation of the controller's last known
 // state, while routing refreshes remain responsible for deciding when to fetch
@@ -1645,11 +1683,33 @@ func (r *AccountRef) RefreshUsageStatusSnapshotFromWindows(scores ...selectacct.
 			continue
 		}
 		row.Provider = provider
-		row.Windows = append([]accounts.UsageWindow(nil), entry.windows...)
+		// A score refresh can observe only Claude's model-specific buckets
+		// (the supplemental probe deliberately caches those separately). Keep
+		// account-wide 5h/7d and other previously observed buckets when a newer
+		// partial observation arrives, while letting matching keys from the new
+		// observation replace the old values. This prevents a feature-only
+		// refresh from erasing the reset windows sr status needs to display.
+		mergedWindows := append([]accounts.UsageWindow(nil), entry.windows...)
+		if len(row.Windows) > 0 && len(entry.windows) > 0 {
+			mergedWindows = mergeUsageWindows(row.Windows, entry.windows)
+		}
+		row.Windows = mergedWindows
 		row.UsageFresh = true
-		row.UsageFetchedAt = entry.at
-		row.QuotaUsageKnown = len(entry.windows) > 0
-		row.ExtraUsage = extraUsageFromWindows(entry.windows)
+		// One timestamp describes the account-wide reset cells rendered by
+		// sr status. A feature-only refresh must not re-anchor older relative
+		// reset durations as if the account-wide endpoint had just answered.
+		accountWideObserved := false
+		for _, window := range entry.windows {
+			if window.Feature == "" && window.ExtraUsage == nil {
+				accountWideObserved = true
+				break
+			}
+		}
+		if accountWideObserved || row.UsageFetchedAt.IsZero() {
+			row.UsageFetchedAt = entry.at
+		}
+		row.QuotaUsageKnown = len(mergedWindows) > 0
+		row.ExtraUsage = extraUsageFromWindows(mergedWindows)
 		row.Error = ""
 		rows[idx] = row
 	}
@@ -1783,10 +1843,8 @@ func (r *AccountRef) InvalidateUsageStatusCache() {
 	r.usageStatusSweep = nil
 }
 
-// InvalidateUsageWindowsCache drops per-account usage windows as well as the
-// aggregate status snapshot. Interactive `sr status` calls use this so a
-// refresh really reaches the provider instead of reusing the two-minute
-// scheduler cache.
+// InvalidateUsageWindowsCache drops cached quota windows, including model
+// supplements, while retaining the normal background 429 failure cache.
 func (r *AccountRef) InvalidateUsageWindowsCache() {
 	if r == nil {
 		return
@@ -2032,7 +2090,10 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	// account. Status latency must stay bounded as pools grow; entries that do
 	// not acquire a slot retain the identity/status seeded below and are retried
 	// by the next sweep instead of extending this request by another batch.
-	sweepCtx, cancelSweep := context.WithTimeout(ctx, usageStatusFetchTimeout)
+	// The status sweep covers all accounts. The short score-fetch deadline
+	// previously expired before many profiles even reached the provider.
+	// An interactive status check gets the full status-sweep budget.
+	sweepCtx, cancelSweep := context.WithTimeout(ctx, usageStatusSweepTimeout)
 	defer cancelSweep()
 	var wg sync.WaitGroup
 	width := accountFetchConcurrencyFor(len(storedAccounts) + len(claudeProfiles))
@@ -2996,15 +3057,6 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			// generation published by another worker before serving cached rows.
 			s.accountListSnapshotContext(r.Context())
 		}
-		// Interactive status commands opt into a live sweep. Background clients
-		// keep the short shared cache so a dashboard cannot stampede providers.
-		if r.URL.Query().Get("refresh") == "1" && !snapshotOnly {
-			s.AccountRef.InvalidateUsageStatusCache()
-			// Keep the per-account window cache and its credential-scoped
-			// throttle deadlines. A manual status refresh should reassemble the
-			// rows, but must not turn every `sr status` into another burst of
-			// provider quota requests after a 401/429.
-		}
 		var statuses []AccountUsageStatus
 		if snapshotOnly {
 			var cached bool
@@ -3019,7 +3071,11 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			if s.SchedulerRef != nil {
 				scoreRevision = s.SchedulerRef.ScoreRevision()
 			}
-			statuses = s.AccountRef.UsageStatuses(r.Context())
+			if r.URL.Query().Get("refresh") == "1" {
+				statuses = s.AccountRef.UsageStatusesFresh(r.Context())
+			} else {
+				statuses = s.AccountRef.UsageStatuses(r.Context())
+			}
 			if s.SchedulerRef != nil {
 				loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
 				s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, SchedulerAccounts(loaded))
