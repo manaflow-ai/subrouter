@@ -840,6 +840,7 @@ func usageRowsFromHostedStatuses(statuses []broker.UsageStatus) []srUsageRow {
 			Credits:            status.Credits,
 			ComplimentaryReset: status.ComplimentaryReset,
 			ExtraUsage:         status.ExtraUsage,
+			UsageFetchedAt:     status.UsageFetchedAt,
 		})
 	}
 	return usageRowsFromServerUsageStatuses(wire)

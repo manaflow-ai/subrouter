@@ -1,9 +1,77 @@
 package accounts
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 )
+
+type codexUsageTestTransport func(*http.Request) (*http.Response, error)
+
+func (f codexUsageTestTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func TestFetchCodexUsageRejectsUnknownAccountQuota(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{"missing rate limit", `{"plan_type":"pro"}`},
+		{"empty rate limit", `{"plan_type":"pro","rate_limit":{}}`},
+		{"null utilization", `{"rate_limit":{"primary_window":{"used_percent":null,"limit_window_seconds":18000}}}`},
+		{"omitted utilization", `{"rate_limit":{"primary_window":{"limit_window_seconds":18000}}}`},
+		{"negative utilization", `{"rate_limit":{"primary_window":{"used_percent":-1}}}`},
+		{"over-100 utilization", `{"rate_limit":{"primary_window":{"used_percent":101}}}`},
+		{"unknown weekly alongside known session", `{"rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":18000},"secondary_window":{"used_percent":null,"limit_window_seconds":604800}}}`},
+		{"model quota without account quota", `{"rate_limit":{},"additional_rate_limits":[{"limit_name":"model","rate_limit":{"primary_window":{"used_percent":0}}}]}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &http.Client{Transport: codexUsageTestTransport(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(test.body))}, nil
+			})}
+			details, err := FetchCodexUsageDetails(context.Background(), client, Account{AuthMode: AuthModeOAuth, Token: "test-token"})
+			if err == nil || !strings.Contains(err.Error(), "quota is unknown") {
+				t.Fatalf("unknown quota returned details %+v, error %v", details, err)
+			}
+		})
+	}
+}
+
+func TestFetchCodexUsageKeepsExplicitZeroAndReached(t *testing.T) {
+	for _, body := range []string{
+		`{"rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000}}}`,
+		`{"rate_limit":{"limit_reached":true,"primary_window":{"used_percent":null}}}`,
+	} {
+		client := &http.Client{Transport: codexUsageTestTransport(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+		})}
+		details, err := FetchCodexUsageDetails(context.Background(), client, Account{AuthMode: AuthModeOAuth, Token: "test-token"})
+		if err != nil || len(details.Windows) != 1 {
+			t.Fatalf("known quota returned details %+v, error %v", details, err)
+		}
+		if strings.Contains(body, "limit_reached") {
+			if details.Windows[0].Name != "reached" || details.Windows[0].UsedPercent != 100 {
+				t.Fatalf("explicit exhaustion = %+v, want reached at 100%%", details.Windows)
+			}
+		} else if details.Windows[0].UsedPercent != 0 {
+			t.Fatalf("explicit zero utilization = %+v", details.Windows)
+		}
+	}
+}
+
+func TestCodexDisplayWindowsOmitsUnknownModelUtilization(t *testing.T) {
+	var usage codexUsageResponse
+	if err := json.Unmarshal([]byte(`{"rate_limit":{"primary_window":{"used_percent":20}},"additional_rate_limits":[{"limit_name":"model","rate_limit":{"primary_window":{"used_percent":null}}}]}`), &usage); err != nil {
+		t.Fatal(err)
+	}
+	if windows := usage.displayWindows(); len(windows) != 1 || windows[0].UsedPercent != 20 || windows[0].Feature != "" {
+		t.Fatalf("display windows = %+v, want only the known account utilization", windows)
+	}
+}
 
 func TestDisplayWindowsTagsAdditionalLimitsWithFeature(t *testing.T) {
 	// Mirrors a real chatgpt usage response: an account-wide rate_limit plus one
