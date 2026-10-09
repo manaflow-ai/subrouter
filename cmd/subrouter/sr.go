@@ -3425,7 +3425,7 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 		columns = append(columns, column)
 	}
 	if usageGridRowsHaveValue(rows, "Tier") {
-		columns = append(columns, usageGridColumn{Key: "Tier", Title: "Tier", Width: usageGridDesiredWidth(rows, "Tier", "Tier", 22)})
+		columns = append(columns, usageGridColumn{Key: "Tier", Title: "Tier", Width: usageGridDesiredWidth(rows, "Tier", "Tier", 36)})
 	}
 	shrinkUsageGridColumnsToFit(columns, termWidth, []string{"State", "Account", "Plan", "Pick"})
 	for _, candidate := range []usageGridColumn{
