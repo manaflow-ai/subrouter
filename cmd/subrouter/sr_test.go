@@ -4005,6 +4005,20 @@ func TestSRRankRowsPutsClaudeTelemetryThrottlesAfterCookedRows(t *testing.T) {
 	}
 }
 
+func TestSRRankRowsMovesProviderFailureRowsToLowSignalGroup(t *testing.T) {
+	rows := []srUsageRow{
+		{email: "bad-key", provider: accounts.ProviderCodex, authMode: accounts.AuthModeAPIKey, providerHealth: "invalid key",
+			score: selectacct.Score{AccountID: "bad-key", Headroom: 1, ShortHeadroom: 1}},
+		{email: "healthy", provider: accounts.ProviderCodex, authMode: accounts.AuthModeAPIKey, providerHealth: "auth ok",
+			score: selectacct.Score{AccountID: "healthy", Headroom: 0.5, ShortHeadroom: 0.5}},
+	}
+
+	rankUsageRows(rows)
+	if got := []string{rows[0].email, rows[1].email}; !slices.Equal(got, []string{"healthy", "bad-key"}) {
+		t.Fatalf("ranked rows = %#v, want healthy then bad-key", got)
+	}
+}
+
 func TestSRRankRowsMovesReauthRowsToLowSignalGroup(t *testing.T) {
 	rows := []srUsageRow{
 		{

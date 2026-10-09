@@ -3238,10 +3238,21 @@ func usageRowStatusTier(row srUsageRow) int {
 	if row.usageThrottled || (row.err != nil && serverUsageThrottleError(row.err.Error())) {
 		return 5
 	}
-	if row.err != nil {
+	if row.err != nil || usageRowProviderFailure(row) {
 		return 6
 	}
 	return 0
+}
+
+// usageRowProviderFailure recognizes an explicit provider/key failure even
+// when the status probe recorded it as providerHealth rather than err.
+func usageRowProviderFailure(row srUsageRow) bool {
+	switch strings.ToLower(strings.TrimSpace(row.providerHealth)) {
+	case "", "auth ok", "ok", "ready", "stored", "not checked":
+		return false
+	default:
+		return true
+	}
 }
 
 func printUsageGridGroup(out io.Writer, columns []usageGridColumn, label string, colored bool) {
