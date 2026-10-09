@@ -63,6 +63,12 @@ type srStatusAccountJSON struct {
 	// ExtraUsageUSD is the Claude extra-usage money still available: the
 	// prepaid credit balance when known, else the monthly limit minus spend.
 	ExtraUsageUSD *float64 `json:"extra_usage_usd"`
+	// CostTier is the server's Claude cost tier ("plan", "api-credits",
+	// "extra-usage"), omitted for other providers and older servers.
+	CostTier *string `json:"cost_tier,omitempty"`
+	// CreditsExhaustedUntil is when a Claude API key held out for a spent
+	// credit balance will be probed again.
+	CreditsExhaustedUntil *string `json:"credits_exhausted_until,omitempty"`
 }
 
 type srStatusSummaryJSON struct {
@@ -224,6 +230,15 @@ func srStatusAccountFromRow(row srUsageRow, now time.Time) srStatusAccountJSON {
 		id = row.email
 	}
 	session, weekly := srStatusQuotaWindows(row)
+	var costTier, creditsExhaustedUntil *string
+	if row.costTier != "" {
+		tier := row.costTier
+		costTier = &tier
+	}
+	if !row.creditsExhaustedUntil.IsZero() {
+		until := row.creditsExhaustedUntil.UTC().Format(time.RFC3339)
+		creditsExhaustedUntil = &until
+	}
 	return srStatusAccountJSON{
 		ID:             id,
 		Label:          displayUsageAccountName(row),
@@ -235,6 +250,9 @@ func srStatusAccountFromRow(row srUsageRow, now time.Time) srStatusAccountJSON {
 		WeeklyLeftPct:  srStatusLeftPct(weekly),
 		WeeklyResetAt:  srStatusResetAt(weekly, now),
 		ExtraUsageUSD:  srStatusExtraUsageUSD(row),
+
+		CostTier:              costTier,
+		CreditsExhaustedUntil: creditsExhaustedUntil,
 	}
 }
 

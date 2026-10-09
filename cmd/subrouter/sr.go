@@ -313,19 +313,24 @@ type srUsageRow struct {
 	credits            *accounts.CreditsInfo
 	complimentaryReset *accounts.ComplimentaryResetInfo
 	extraUsage         *accounts.ExtraUsageInfo
-	apiKeySpend        *accounts.APIKeyUsageSnapshot
-	apiKeyHint         string
-	usageThrottled     bool
-	err                error
-	score              selectacct.Score
-	gtoReason          string
-	gtoRecommended     bool
-	cooked             bool
-	cookedReason       string
-	tempCooked         bool
-	tempCookedReason   string
-	authMode           accounts.AuthMode
-	provider           accounts.Provider
+	// costTier and costTierRank are the server's Claude cost tier for this
+	// account (see proxy.ClaudeCostOrder); empty when the server predates it.
+	costTier              string
+	costTierRank          int
+	creditsExhaustedUntil time.Time
+	apiKeySpend           *accounts.APIKeyUsageSnapshot
+	apiKeyHint            string
+	usageThrottled        bool
+	err                   error
+	score                 selectacct.Score
+	gtoReason             string
+	gtoRecommended        bool
+	cooked                bool
+	cookedReason          string
+	tempCooked            bool
+	tempCookedReason      string
+	authMode              accounts.AuthMode
+	provider              accounts.Provider
 }
 
 func cxAlias(args []string) error {
@@ -3082,7 +3087,11 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 			if currentGroup != "" {
 				fmt.Fprintln(out)
 			}
-			printUsageGridGroup(out, columns, group, colored)
+			groupLabel := group
+			if usageGridRowsHaveValue(rows[i:end], "Tier") {
+				groupLabel += " · spend order: " + proxy.ClaudeCostOrder
+			}
+			printUsageGridGroup(out, columns, groupLabel, colored)
 			printUsageGridLine(out, columns, func(col usageGridColumn) usageGridCell {
 				return usageGridCell{Text: col.Title, Style: ansiDim}
 			}, colored, "")
@@ -3415,6 +3424,9 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 	} {
 		columns = append(columns, column)
 	}
+	if usageGridRowsHaveValue(rows, "Tier") {
+		columns = append(columns, usageGridColumn{Key: "Tier", Title: "Tier", Width: usageGridDesiredWidth(rows, "Tier", "Tier", 22)})
+	}
 	shrinkUsageGridColumnsToFit(columns, termWidth, []string{"State", "Account", "Plan", "Pick"})
 	for _, candidate := range []usageGridColumn{
 		{Key: "Session", Title: "Session"},
@@ -3515,6 +3527,7 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Opus wk":         usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
 		"Sonnet wk":       usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
 		"Extra":           usageGridClaudeExtraCell(row),
+		"Tier":            usageGridClaudeTierCell(row),
 		"ExtraAutoReload": usageGridClaudeExtraAutoReloadCell(row),
 		"AG Gemini 5h": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
 			return isAntigravityFamilyWindow(window, "gemini", false)
@@ -3535,6 +3548,28 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 			return isAntigravityLegacyFamilyWindow(window, "claude-gpt")
 		}),
 	}
+}
+
+// usageGridClaudeTierCell shows the server's Claude cost tier: "1 plan",
+// "2 api credits", "3 extra usage", and for a key whose credit balance is
+// spent, when one request will probe it again.
+func usageGridClaudeTierCell(row srUsageRow) usageGridCell {
+	if row.costTier == "" {
+		return usageGridCell{}
+	}
+	text := strings.ReplaceAll(row.costTier, "-", " ")
+	if row.costTierRank > 0 {
+		text = strconv.Itoa(row.costTierRank) + " " + text
+	}
+	if !row.creditsExhaustedUntil.IsZero() {
+		wait := time.Until(row.creditsExhaustedUntil)
+		if wait < 0 {
+			wait = 0
+		}
+		text += ", spent, probe in " + formatDuration(int64(wait.Seconds()))
+		return usageGridCell{Text: text, Style: ansiYellow}
+	}
+	return usageGridCell{Text: text, Style: ansiDim}
 }
 
 // claudeExtraUsageForRow finds the account's paid-usage metadata, whether the

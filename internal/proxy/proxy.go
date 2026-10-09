@@ -1061,6 +1061,13 @@ type AccountUsageStatus struct {
 	// reset endpoint uses, so clients never have to re-derive it from Windows.
 	WeeklyCooked       bool   `json:"weekly_cooked,omitempty"`
 	WeeklyCookedWindow string `json:"weekly_cooked_window,omitempty"`
+	// CostTier is the Claude cost tier this account is spent in ("plan",
+	// "api-credits", "extra-usage"; see ClaudeCostOrder), and CostTierRank
+	// its position in that order. CreditsExhaustedUntil is set while an API
+	// key with a spent credit balance is held out of routing.
+	CostTier              string    `json:"cost_tier,omitempty"`
+	CostTierRank          int       `json:"cost_tier_rank,omitempty"`
+	CreditsExhaustedUntil time.Time `json:"credits_exhausted_until,omitzero"`
 	// ResetAdvice is set when the reset-credit spender, running in warn
 	// mode, would redeem a credit on this account now (see
 	// --reset-credit-autospend).
@@ -3104,7 +3111,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			}
 			s.updateSchedulerFromUsageStatusesAtScoreRevision(r.Context(), statuses, scoreRevision)
 		}
-		writeJSON(w, s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses))))))
+		writeJSON(w, s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses)))))))
 		return
 	}
 	accounts := s.accountListContext(r.Context())
@@ -3122,7 +3129,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	out = s.withKeyedProviderHealth(r.Context(), out)
-	writeJSON(w, withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(out))))
+	writeJSON(w, s.withClaudeCostTiers(withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(out)))))
 }
 
 func (s Server) handleQwenConsoleImport(w http.ResponseWriter, r *http.Request) {
@@ -4724,6 +4731,12 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 		if account.AuthMode == accounts.AuthModeAPIKey {
 			seed.Headroom = 0.01
 			seed.ShortHeadroom = 0.01
+			// An API key is billed per token, not from subscription model
+			// pools, so a missing Opus/Sonnet/Fable bucket says nothing about
+			// whether it can serve that model. Without this, ForModel scores
+			// every key zero in a model pool and the key would rank as an
+			// exhausted key behind exhausted subscriptions.
+			seed.MissingModelSupport = selectacct.ModelSupportUnknown
 		}
 		scoreByID[selectacct.ScoreKey(scoreProvider, account.ID)] = len(scores)
 		scores = append(scores, seed)
@@ -5623,7 +5636,7 @@ func (s Server) proxyHandler() http.Handler {
 			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude ||
 				requestProvider == accounts.ProviderAntigravity || keyedRequestProvider)
 		localUsageFailover = localUsageFailover ||
-			(account.AuthMode == accounts.AuthModeAPIKey && keyedRequestProvider)
+			(account.AuthMode == accounts.AuthModeAPIKey && (keyedRequestProvider || requestProvider == accounts.ProviderClaude))
 		usageRetryMaxAttempts := 0
 		installUsageFailover := !noRetry && !forcedAccountSelection && boundLease == nil && retryPost &&
 			postReplayable && localUsageFailover && s.CredentialBroker == nil
@@ -8464,6 +8477,14 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		}
 		account = fallback
 	}
+	if account.AuthMode == accounts.AuthModeAPIKey && provider == accounts.ProviderClaude &&
+		scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
+		// Selection tiers rank a held-out key last, so picking one means
+		// every Claude account is spent. Answer the pool-exhausted 503 now
+		// rather than forwarding a request Anthropic will reject with a
+		// billing 400 the client cannot fall back on.
+		return accounts.Account{}, sessionID, userEmail, s.poolExhaustedError(provider, availableAccounts, poolModel)
+	}
 	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID) && s.Logger != nil {
 		// Never refuse here based on the scheduler's view. Usage scores can be
 		// stale: the per-request re-score reads usage through a cache that falls
@@ -10525,7 +10546,21 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			return response, nil
 		}
 		usageLimited, exhausted, credentialFailure := false, false, false
-		if !modelUnsupported {
+		claudeCreditExhausted := false
+		if !modelUnsupported && t.provider == accounts.ProviderClaude {
+			claudeCreditExhausted, inspectErr = responseClaudeCreditExhausted(response)
+			if inspectErr != nil {
+				if t.logger != nil {
+					t.logger.Warn("credit-balance response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
+				}
+				return response, nil
+			}
+		}
+		if claudeCreditExhausted {
+			// A spent API credit balance is quota exhaustion for that key,
+			// reported as a 400 rather than a 429.
+			usageLimited, exhausted = true, true
+		} else if !modelUnsupported {
 			usageLimited, exhausted, credentialFailure, inspectErr = t.responseUsageLimited(response)
 			if inspectErr != nil {
 				if t.logger != nil {
@@ -10567,7 +10602,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// regardless of which request model happened to observe them.
 			exhaustionPool = ""
 		}
-		if t.provider == accounts.ProviderClaude {
+		if claudeCreditExhausted {
+			exhaustionPool = ""
+		} else if t.provider == accounts.ProviderClaude {
 			// Surface the genuine upstream rate-limit signal. The active retry
 			// path consumes this 429 before the passive ModifyResponse capture
 			// runs, so without logging here the real message would be invisible
@@ -10583,7 +10620,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				exhaustionPool = ""
 			}
 		}
-		quota429 := t.headerConfirmedClaudeQuota429(response)
+		// A spent credit balance gives up like a confirmed quota 429: the
+		// client must see the pool-exhausted 503 (which `cr claude` turns into
+		// its Bedrock fallback), never Anthropic's billing 400.
+		quota429 := t.headerConfirmedClaudeQuota429(response) || claudeCreditExhausted
 		var compatibilityNext accounts.Account
 		var compatibilityPickErr error
 		if modelUnsupported && t.server != nil {
@@ -10591,7 +10631,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				req.Context(), t.provider, t.agent, t.session, t.userEmail, accountID, exhaustionPool, tried,
 			)
 		}
-		if t.server != nil && credentialFailure && !modelUnsupported {
+		if t.server != nil && claudeCreditExhausted {
+			t.server.markClaudeCreditExhausted(accountID)
+		} else if t.server != nil && credentialFailure && !modelUnsupported {
 			// Bind auth rejection to the exact credential identity captured for
 			// this attempt. A concurrent key rotation must make this late response
 			// harmless rather than cooking the repaired account generation.
@@ -10644,7 +10686,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				t.logger.Warn("usage-limit retry has no alternate account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", pickErr)
 			}
 			var poolErr *poolExhaustedError
-			if quota429 && errors.As(pickErr, &poolErr) {
+			if (quota429 && errors.As(pickErr, &poolErr)) || claudeCreditExhausted {
 				if poolResponse, ok := t.claudePoolExhaustedResponse(response, attemptReq, accountID, "no_alternate_account"); ok {
 					return poolResponse, nil
 				}
@@ -11300,7 +11342,9 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 			candidates = append(candidates, account)
 		}
 		var account accounts.Account
-		if provider == accounts.ProviderClaude {
+		// Cost order: paid extra usage (tier 3) is reached only when no
+		// untried API key (tier 2, free credits) can still take the request.
+		if provider == accounts.ProviderClaude && !s.claudeAPIKeyCandidateAvailable(scheduler, candidates, poolModel) {
 			if fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, allCandidates, poolModel); ok {
 				_, alreadyTried := tried[fallback.ID]
 				if !alreadyTried || allowTriedClaudeExtraUsage {

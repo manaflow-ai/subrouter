@@ -56,6 +56,10 @@ type SchedulerRef struct {
 	// rotation proves that account state recovered, so those events must not
 	// clear this overlay.
 	accountUnavailableUntil map[string]time.Time
+	// creditExhaustedUntil labels the accountUnavailableUntil entries that
+	// came from a spent API credit balance, so status views can say why a
+	// key is held out. It never affects routing on its own.
+	creditExhaustedUntil map[string]time.Time
 	// incompatibleUntil records account/model exclusions learned from upstream
 	// entitlement errors. Usage refreshes cannot supersede these marks because
 	// quota headroom says nothing about whether an account supports a model.
@@ -401,6 +405,11 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 	for key, until := range r.accountUnavailableUntil {
 		if !until.After(now) {
 			delete(r.accountUnavailableUntil, key)
+		}
+	}
+	for key, until := range r.creditExhaustedUntil {
+		if !until.After(now) {
+			delete(r.creditExhaustedUntil, key)
 		}
 	}
 	for key, until := range r.incompatibleUntil {
@@ -1012,6 +1021,39 @@ func (r *SchedulerRef) MarkAccountUnavailableUntil(provider account.Provider, ac
 	}
 	r.accountUnavailableUntil[poolScopedExhaustionKey(provider, accountID, "")] = until
 	r.updatedAt = time.Now()
+}
+
+// MarkCreditExhaustedUntil holds an API-key account out of routing because
+// its prepaid credit balance is spent. The balance belongs to the provider
+// organization, not to the key string or a quota window, so neither a usage
+// refresh nor a key rotation clears it; only expiry does, after which one
+// request probes the key again.
+func (r *SchedulerRef) MarkCreditExhaustedUntil(provider account.Provider, accountID string, until time.Time) {
+	if r == nil || accountID == "" {
+		return
+	}
+	r.MarkAccountUnavailableUntil(provider, accountID, until)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.creditExhaustedUntil == nil {
+		r.creditExhaustedUntil = make(map[string]time.Time)
+	}
+	r.creditExhaustedUntil[poolScopedExhaustionKey(provider, accountID, "")] = until
+}
+
+// CreditExhaustedUntil reports a live MarkCreditExhaustedUntil hold.
+func (r *SchedulerRef) CreditExhaustedUntil(provider account.Provider, accountID string, now time.Time) (time.Time, bool) {
+	if r == nil {
+		return time.Time{}, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	key := poolScopedExhaustionKey(provider, accountID, "")
+	until := r.creditExhaustedUntil[key]
+	if !until.After(now) || !r.accountUnavailableUntil[key].After(now) {
+		return time.Time{}, false
+	}
+	return until, true
 }
 
 // MarkModelIncompatibleUntil excludes one account from one model until the
