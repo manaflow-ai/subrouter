@@ -19,8 +19,9 @@ import (
 //     Console organization funded by free monthly credits, so it costs no
 //     money until its balance is spent.
 //  3. extra-usage: a subscription's paid overage, bounded by the account's
-//     own monthly spend limit. Used only after every plan's weekly window is
-//     cooked and no API key can take the request.
+//     own monthly spend limit and never used on an unknown balance. Used
+//     only when every plan is unusable for the request (5h, weekly, or model
+//     pool exhausted) and no untried, unheld API key can take it.
 //  4. not in subrouter: with tiers 1-3 spent the pool answers its own 503
 //     with Retry-After, which `cr claude` turns into its Bedrock route.
 //
@@ -143,7 +144,7 @@ func (s Server) withClaudeCostTiers(statuses []AccountUsageStatus) []AccountUsag
 				continue
 			}
 			score := scheduler.ScoreFor(accounts.ProviderClaude, out[i].ID)
-			if score.WeeklyCooked() && claudeExtraUsageEligible(score) {
+			if scheduler.Exhausted(accounts.ProviderClaude, out[i].ID) && claudeExtraUsageEligible(score) {
 				out[i].CostTier = claudeCostTierExtraUsage
 				out[i].CostTierRank = 3
 			}

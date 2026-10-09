@@ -7198,8 +7198,7 @@ func (s Server) markAccountExhaustedFromResponseForAccount(account accounts.Acco
 	}
 	resetAt := claudeExhaustionExpiryForPool(header, time.Now(), poolKey)
 	if claudeResponseCooksWeeklyWindow(header) {
-		// Only confirmed account-wide weekly exhaustion authorizes the paid
-		// fallback; an isolated Fable/Opus/Sonnet quota is model-scoped.
+		// Record weekly evidence so the hold lasts until the weekly reset.
 		s.SchedulerRef.MarkWeeklyExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, poolKey, resetAt)
 		return
 	}
@@ -8537,11 +8536,15 @@ func claudeExtraUsageEligible(score selectacct.Score) bool {
 	return score.ClaudeExtraUsageEnabled && score.ClaudeExtraUsageKnown && score.ClaudeExtraUsageRemaining > 0
 }
 
-// pickClaudeExtraUsageFallback returns a funded paid-usage account only when
-// every Claude subscription account in the candidate pool has its weekly
-// window cooked. An account cooked on its 5h session window alone still has
-// weekly quota coming back on its own; that is a temporary wait, never a
-// reason to spend paid credits.
+// pickClaudeExtraUsageFallback returns the funded paid-usage account with the
+// most remaining balance, only when every Claude subscription account in the
+// candidate pool is unusable for this request: exhausted on its 5h window,
+// its weekly window, or the request's model pool. Extra usage is tier 3 of
+// the Claude cost order (see claude_cost_tiers.go): a 5h-only cooldown still
+// reaches it, because the alternative is the client's paid Bedrock route, not
+// a free wait. The funded account must be unusable too, or it would serve the
+// request from plan quota anyway. Only a known positive remaining balance
+// under the account's own monthly limit authorizes paid use.
 func pickClaudeExtraUsageFallback(scheduler selectacct.Scheduler, candidates []accounts.Account) (accounts.Account, bool) {
 	var best accounts.Account
 	bestRemaining := -1.0
@@ -8551,10 +8554,10 @@ func pickClaudeExtraUsageFallback(scheduler selectacct.Scheduler, candidates []a
 			continue
 		}
 		seenSubscription = true
-		score := scheduler.ScoreFor(accounts.ProviderClaude, candidate.ID)
-		if !score.WeeklyCooked() {
+		if !scheduler.Exhausted(accounts.ProviderClaude, candidate.ID) {
 			return accounts.Account{}, false
 		}
+		score := scheduler.ScoreFor(accounts.ProviderClaude, candidate.ID)
 		if claudeExtraUsageEligible(score) && score.ClaudeExtraUsageRemaining > bestRemaining {
 			best = candidate
 			bestRemaining = score.ClaudeExtraUsageRemaining
@@ -8564,7 +8567,7 @@ func pickClaudeExtraUsageFallback(scheduler selectacct.Scheduler, candidates []a
 }
 
 // pickClaudeExtraUsageFallbackForRequest applies request-time controller
-// exclusions before considering Claude extra usage. A weekly-cooked account
+// exclusions before considering Claude extra usage. An exhausted account
 // can have an extra-usage balance while still being held out by a live
 // upstream rejection; selecting it would bypass the controller's cooldown.
 func (s Server) pickClaudeExtraUsageFallbackForRequest(
@@ -8587,21 +8590,27 @@ func (s Server) pickClaudeExtraUsageFallbackForRequest(
 	return pickClaudeExtraUsageFallback(scheduler, eligible)
 }
 
-// claudeExtraUsageResponseAllowed is the request-time guard. The current
-// rejected response alone does not prove the weekly window is cooked — a 429
-// can be session-level — so this account and every other subscription must
-// show a cooked weekly window before its paid completion is used.
+// claudeExtraUsageResponseAllowed is the request-time guard for a 200 that
+// Anthropic served from extra usage on a rejected account. It is accepted only
+// in the state where routing would choose extra usage itself: this account
+// and every other subscription are unusable for the request, and no Claude
+// API key (tier 2) could take it instead. Otherwise the request fails over
+// to the cheaper tier.
 func (s Server) claudeExtraUsageResponseAllowed(ctx context.Context, accountID, poolModel string) bool {
 	if s.SchedulerRef == nil {
 		return false
 	}
 	scheduler := s.scheduler().ForModel(poolModel)
 	current := scheduler.ScoreFor(accounts.ProviderClaude, accountID)
-	if !claudeExtraUsageEligible(current) || !current.WeeklyCooked() {
+	if !claudeExtraUsageEligible(current) || !scheduler.Exhausted(accounts.ProviderClaude, accountID) {
+		return false
+	}
+	pool := filterAccountsForProvider(s.accountListContext(ctx), accounts.ProviderClaude)
+	if s.claudeAPIKeyCandidateAvailable(scheduler, pool, poolModel) {
 		return false
 	}
 	seenCurrent := false
-	for _, candidate := range filterAccountsForProvider(s.accountListContext(ctx), accounts.ProviderClaude) {
+	for _, candidate := range pool {
 		if candidate.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
@@ -8609,7 +8618,7 @@ func (s Server) claudeExtraUsageResponseAllowed(ctx context.Context, accountID, 
 			seenCurrent = true
 			continue
 		}
-		if !scheduler.ScoreFor(accounts.ProviderClaude, candidate.ID).WeeklyCooked() {
+		if !scheduler.Exhausted(accounts.ProviderClaude, candidate.ID) {
 			return false
 		}
 	}

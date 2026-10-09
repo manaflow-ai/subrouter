@@ -19,10 +19,8 @@ type Score struct {
 	ShortHeadroom float64
 	// WeeklyHeadroom is the remaining fraction of the account's long (weekly)
 	// windows only, unlike Headroom which also folds in the short (5h) window.
-	// Paid Claude fallback gates on it: a session-cooked account with weekly
-	// quota left is a temporary wait, never a reason to spend money. It
-	// defaults to 1 (unknown windows read as "not cooked") so paid use stays
-	// fail-closed on missing data.
+	// Status views read it (WeeklyCooked). It defaults to 1 (unknown windows
+	// read as "not cooked").
 	WeeklyHeadroom      float64
 	WeeklyHeadroomKnown bool
 	// WeeklySurplus is the weekly quota the account will lose at reset if it
@@ -195,8 +193,7 @@ func (s Scheduler) ForModel(model string) Scheduler {
 			} else {
 				modelScore = Score{
 					AccountID: score.AccountID, Provider: score.Provider, Headroom: 0, ShortHeadroom: 0,
-					// Weekly headroom is account-level evidence: carry it so the
-					// paid fallback keeps requiring a cooked weekly window.
+					// Weekly headroom is account-level evidence; carry it.
 					WeeklyHeadroom:      score.WeeklyHeadroom,
 					WeeklyHeadroomKnown: score.WeeklyHeadroomKnown,
 					// Paid Claude capacity is account metadata, not model-pool
@@ -626,9 +623,7 @@ func (s Score) ExhaustionClearsAt() (time.Time, bool) {
 	return s.ExhaustedResetAt, true
 }
 
-// WeeklyCooked reports that every long (weekly) window is exhausted. Paid
-// Claude fallback is allowed only in this state; a short-window-only
-// exhaustion is a temporary wait and must not spend credits.
+// WeeklyCooked reports that every long (weekly) window is exhausted.
 func (s Score) WeeklyCooked() bool {
 	return s.WeeklyHeadroomKnown && s.WeeklyHeadroom <= 0
 }

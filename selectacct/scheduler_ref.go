@@ -26,8 +26,8 @@ type SchedulerRef struct {
 	// hours, leaving real quota unroutable while clients got 429s.
 	exhaustedUntil map[string]time.Time
 	// weeklyExhaustedUntil is the subset of marks whose upstream response
-	// proved the weekly window cooked (7d status rejected). Paid Claude
-	// fallback reads it: session-only marks never authorize paid spend.
+	// proved the weekly window cooked (7d status rejected). Status views and
+	// WeeklyCooked read it.
 	// Entries are always paired with an exhaustedUntil mark and share its
 	// expiry.
 	weeklyExhaustedUntil map[string]time.Time
@@ -886,7 +886,7 @@ func (r *SchedulerRef) markExhaustedUntilLocked(provider account.Provider, accou
 // MarkWeeklyExhaustedUntil records an exhaustion mark whose upstream response
 // proved the WEEKLY window is cooked (anthropic-ratelimit-unified-7d-status:
 // rejected), not merely the 5h session window. Only weekly-cooked evidence
-// authorizes paid Claude fallback; a session-level 429 is a temporary wait.
+// keeps the hold through the weekly reset.
 func (r *SchedulerRef) MarkWeeklyExhaustedUntil(provider account.Provider, accountID, poolKey string, until time.Time) {
 	if accountID == "" {
 		return
@@ -1232,7 +1232,7 @@ func applyExhaustionMarks(base Scheduler, exhaustedUntil map[string]time.Time, n
 // applyWeeklyExhaustionMarks zeroes WeeklyHeadroom for accounts (or model
 // pools) whose upstream response proved the weekly window cooked. Ordinary
 // exhaustion marks leave WeeklyHeadroom untouched: a session-level 429 must
-// never read as weekly evidence, because paid Claude fallback gates on it.
+// never read as weekly evidence.
 func applyWeeklyExhaustionMarks(base Scheduler, weeklyUntil map[string]time.Time, now time.Time) Scheduler {
 	if len(weeklyUntil) == 0 {
 		return base
