@@ -3238,7 +3238,7 @@ func usageRowStatusTier(row srUsageRow) int {
 	if row.usageThrottled || (row.err != nil && serverUsageThrottleError(row.err.Error())) {
 		return 5
 	}
-	if row.err != nil || usageRowProviderFailure(row) {
+	if row.err != nil || (row.authChecked && !row.authValid) || usageRowProviderFailure(row) {
 		return 6
 	}
 	return 0
