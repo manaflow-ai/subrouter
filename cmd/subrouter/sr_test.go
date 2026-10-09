@@ -3982,6 +3982,29 @@ func TestSRRankRowsMovesClaudeTelemetryThrottlesToBottom(t *testing.T) {
 	}
 }
 
+func TestSRRankRowsPutsClaudeCookedRowsBelowTelemetryThrottles(t *testing.T) {
+	rows := []srUsageRow{
+		{
+			email: "cooked@example.com", provider: accounts.ProviderClaude,
+			authMode: accounts.AuthModeOAuth, usageThrottled: true, cooked: true,
+			score: selectacct.Score{AccountID: "cooked@example.com", Headroom: 0, ShortHeadroom: 0},
+		},
+		{
+			email: "throttled@example.com", provider: accounts.ProviderClaude,
+			authMode: accounts.AuthModeOAuth, usageThrottled: true,
+			score: selectacct.Score{AccountID: "throttled@example.com", Headroom: 1, ShortHeadroom: 1},
+		},
+	}
+
+	rankUsageRows(rows)
+	if got := []string{rows[0].email, rows[1].email}; !slices.Equal(got, []string{"throttled@example.com", "cooked@example.com"}) {
+		t.Fatalf("ranked rows = %#v, want telemetry-throttled then cooked", got)
+	}
+	if got := usageGridState(rows[1]); got != "cooked" {
+		t.Fatalf("cooked Claude state = %q, want cooked", got)
+	}
+}
+
 func TestSRRankRowsMovesReauthRowsToLowSignalGroup(t *testing.T) {
 	rows := []srUsageRow{
 		{
@@ -4000,8 +4023,8 @@ func TestSRRankRowsMovesReauthRowsToLowSignalGroup(t *testing.T) {
 	if rows[0].email != "healthy@example.com" || rows[1].email != "needs-reauth@example.com" {
 		t.Fatalf("ranked rows = %#v, want healthy then reauth", rows)
 	}
-	if usageRowStatusTier(rows[1]) != usageRowStatusTier((srUsageRow{usageThrottled: true})) {
-		t.Fatal("reauth and telemetry-throttled rows should share the low-signal tier")
+	if usageRowStatusTier(rows[1]) <= usageRowStatusTier((srUsageRow{usageThrottled: true})) {
+		t.Fatal("reauth rows should remain below telemetry-throttled rows")
 	}
 }
 
