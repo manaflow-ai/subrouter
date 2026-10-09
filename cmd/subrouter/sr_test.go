@@ -3982,7 +3982,7 @@ func TestSRRankRowsMovesClaudeTelemetryThrottlesToBottom(t *testing.T) {
 	}
 }
 
-func TestSRRankRowsPutsClaudeCookedRowsBelowTelemetryThrottles(t *testing.T) {
+func TestSRRankRowsPutsClaudeTelemetryThrottlesAfterCookedRows(t *testing.T) {
 	rows := []srUsageRow{
 		{
 			email: "cooked@example.com", provider: accounts.ProviderClaude,
@@ -3997,10 +3997,10 @@ func TestSRRankRowsPutsClaudeCookedRowsBelowTelemetryThrottles(t *testing.T) {
 	}
 
 	rankUsageRows(rows)
-	if got := []string{rows[0].email, rows[1].email}; !slices.Equal(got, []string{"throttled@example.com", "cooked@example.com"}) {
-		t.Fatalf("ranked rows = %#v, want telemetry-throttled then cooked", got)
+	if got := []string{rows[0].email, rows[1].email}; !slices.Equal(got, []string{"cooked@example.com", "throttled@example.com"}) {
+		t.Fatalf("ranked rows = %#v, want cooked then telemetry-throttled", got)
 	}
-	if got := usageGridState(rows[1]); got != "cooked" {
+	if got := usageGridState(rows[0]); got != "cooked" {
 		t.Fatalf("cooked Claude state = %q, want cooked", got)
 	}
 }

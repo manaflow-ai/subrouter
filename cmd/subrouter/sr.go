@@ -3225,25 +3225,21 @@ func authErrorNeedsReadd(err error) bool {
 
 // usageRowStatusTier keeps rows that need human attention out of the usable
 // portion of the table. A headerless 429 is a telemetry throttle, not proof
-// that quota is exhausted, but it is still low-signal for a status scan. Keep
-// it beside credentials that need re-authentication or provider review.
+// that quota is exhausted, so it belongs in the low-signal tail after rows
+// with authoritative quota state. Authentication failures remain last because
+// they require re-verification before the account can be considered usable.
 func usageRowStatusTier(row srUsageRow) int {
-	// Quota state is higher signal than a telemetry throttle. A row with a
-	// known exhausted window must remain in the cooked/temp-cooked tail even
-	// when its last usage refresh was also throttled.
-	if row.cooked {
-		return 4
-	}
 	if row.tempCooked {
 		return 3
 	}
+	if row.cooked {
+		return 4
+	}
 	if row.usageThrottled || (row.err != nil && serverUsageThrottleError(row.err.Error())) {
-		return 2
+		return 5
 	}
 	if row.err != nil {
-		// Authentication failures and provider holds need re-verification;
-		// keep them below quota-cooked rows so the actionable pool stays first.
-		return 5
+		return 6
 	}
 	return 0
 }
