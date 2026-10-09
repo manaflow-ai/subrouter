@@ -7813,7 +7813,7 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 	claudeUnusable := provider == accounts.ProviderClaude && accountID != "" &&
 		(claudeAccountUnusableStatus(response.StatusCode) || claudeResponseRejectedForPool(response.Header, poolModel))
 	inspectClaudeCredit := provider == accounts.ProviderClaude && accountID != "" &&
-		account.AuthMode == accounts.AuthModeAPIKey && claudeCreditExhaustedStatus(response.StatusCode)
+		claudeCreditExhaustedStatus(response.StatusCode) && s.claudeAuthMode(account) == accounts.AuthModeAPIKey
 	if claudeUnusable {
 		// Only poison the routing score when the account is genuinely out of
 		// quota (401, a 429 the upstream marks "rejected", or any response with

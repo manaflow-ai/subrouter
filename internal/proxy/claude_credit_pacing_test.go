@@ -347,3 +347,27 @@ func TestClaudeCostStoreRefusesToOverwriteCorruptFile(t *testing.T) {
 		t.Fatalf("state file = %q, %v; want it left untouched", data, err)
 	}
 }
+
+// The failover layer tags a response with only the account ID and credential
+// version; metering must still recognize the API key and charge its grant.
+func TestClaudeCreditMetersTaggedResponseAccount(t *testing.T) {
+	server, _ := claudeCreditServer(t, nil,
+		map[string]claudeCreditKeyState{"claude:k": creditState(time.Now().UTC().AddDate(0, 0, -1), 0)})
+	body := `{"id":"msg","type":"message","model":"claude-sonnet-4-6","usage":{"input_tokens":1000000,"output_tokens":100000}}`
+	response := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader(body))}
+	req, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.wrapTokenUsageBody(response, req, tokenUsageRequest{requestModel: "claude-sonnet-4-6"},
+		accounts.Account{ID: "claude:k", Provider: accounts.ProviderClaude, CredentialVersion: "v"})
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	server.claudeCosts.loadedAt = time.Time{}
+	if spent := server.claudeCosts.views(time.Now())["claude:k"].SpentUSD; spent < 4.49 || spent > 4.51 {
+		t.Fatalf("spent = %v, want $4.50 metered from the tagged response", spent)
+	}
+}
