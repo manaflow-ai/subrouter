@@ -3228,12 +3228,22 @@ func authErrorNeedsReadd(err error) bool {
 // that quota is exhausted, but it is still low-signal for a status scan. Keep
 // it beside credentials that need re-authentication or provider review.
 func usageRowStatusTier(row srUsageRow) int {
-	if row.usageThrottled || (row.err != nil && serverUsageThrottleError(row.err.Error())) ||
-		authErrorNeedsReadd(row.err) || claudeAccountOnHold(row.err) {
+	// Quota state is higher signal than a telemetry throttle. A row with a
+	// known exhausted window must remain in the cooked/temp-cooked tail even
+	// when its last usage refresh was also throttled.
+	if row.cooked {
+		return 4
+	}
+	if row.tempCooked {
+		return 3
+	}
+	if row.usageThrottled || (row.err != nil && serverUsageThrottleError(row.err.Error())) {
 		return 2
 	}
 	if row.err != nil {
-		return 1
+		// Authentication failures and provider holds need re-verification;
+		// keep them below quota-cooked rows so the actionable pool stays first.
+		return 5
 	}
 	return 0
 }
@@ -3805,6 +3815,20 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 }
 
 func usageGridState(row srUsageRow) string {
+	if usageProvider(row) == accounts.ProviderClaude {
+		if row.cooked {
+			if row.active {
+				return "active, cooked"
+			}
+			return "cooked"
+		}
+		if row.tempCooked {
+			if row.active {
+				return "active, temp"
+			}
+			return "temp"
+		}
+	}
 	if row.usageThrottled {
 		if row.err != nil {
 			return "error"
