@@ -1436,6 +1436,10 @@ type remoteServerUsageStatus struct {
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
 	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
 	UsageFetchedAt     time.Time                        `json:"usage_fetched_at,omitzero"`
+	// Claude cost tier (see proxy.ClaudeCostOrder); absent on older servers.
+	CostTier              string    `json:"cost_tier,omitempty"`
+	CostTierRank          int       `json:"cost_tier_rank,omitempty"`
+	CreditsExhaustedUntil time.Time `json:"credits_exhausted_until,omitzero"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
@@ -1633,31 +1637,34 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			email = "server"
 		}
 		row := srUsageRow{
-			email:              email,
-			accountID:          status.ID,
-			loginEmail:         strings.TrimSpace(status.Email),
-			displayAccount:     serverUsageDisplayAccount(status),
-			active:             status.Active,
-			authMode:           status.AuthMode,
-			planType:           status.PlanType,
-			quotaStatus:        status.QuotaStatus,
-			accountIdentity:    status.AccountIdentity,
-			quotaUsageKnown:    status.QuotaUsageKnown,
-			usageFetchedAt:     status.UsageFetchedAt,
-			windows:            status.Windows,
-			credits:            status.Credits,
-			complimentaryReset: status.ComplimentaryReset,
-			extraUsage:         status.ExtraUsage,
-			provider:           status.Provider,
-			usageThrottled:     status.UsageThrottled || status.QuotaStatus == "throttled" || serverUsageThrottleError(status.Error),
-			providerHealth:     status.ProviderHealth,
-			authChecked:        status.AuthChecked,
-			authValid:          status.AuthValid,
-			providerModels:     -1,
-			providerEndpoints:  append([]string(nil), status.ProviderEndpoints...),
-			keyFingerprint:     status.KeyFingerprint,
-			assignedSessions:   status.AssignedSessions,
-			sessionsKnown:      status.SessionsKnown,
+			email:                 email,
+			accountID:             status.ID,
+			loginEmail:            strings.TrimSpace(status.Email),
+			displayAccount:        serverUsageDisplayAccount(status),
+			active:                status.Active,
+			authMode:              status.AuthMode,
+			planType:              status.PlanType,
+			quotaStatus:           status.QuotaStatus,
+			accountIdentity:       status.AccountIdentity,
+			quotaUsageKnown:       status.QuotaUsageKnown,
+			usageFetchedAt:        status.UsageFetchedAt,
+			windows:               status.Windows,
+			credits:               status.Credits,
+			complimentaryReset:    status.ComplimentaryReset,
+			extraUsage:            status.ExtraUsage,
+			costTier:              status.CostTier,
+			costTierRank:          status.CostTierRank,
+			creditsExhaustedUntil: status.CreditsExhaustedUntil,
+			provider:              status.Provider,
+			usageThrottled:        status.UsageThrottled || status.QuotaStatus == "throttled" || serverUsageThrottleError(status.Error),
+			providerHealth:        status.ProviderHealth,
+			authChecked:           status.AuthChecked,
+			authValid:             status.AuthValid,
+			providerModels:        -1,
+			providerEndpoints:     append([]string(nil), status.ProviderEndpoints...),
+			keyFingerprint:        status.KeyFingerprint,
+			assignedSessions:      status.AssignedSessions,
+			sessionsKnown:         status.SessionsKnown,
 		}
 		if status.ProviderModels != nil {
 			row.providerModels = *status.ProviderModels

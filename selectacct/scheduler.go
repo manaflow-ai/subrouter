@@ -19,10 +19,8 @@ type Score struct {
 	ShortHeadroom float64
 	// WeeklyHeadroom is the remaining fraction of the account's long (weekly)
 	// windows only, unlike Headroom which also folds in the short (5h) window.
-	// Paid Claude fallback gates on it: a session-cooked account with weekly
-	// quota left is a temporary wait, never a reason to spend money. It
-	// defaults to 1 (unknown windows read as "not cooked") so paid use stays
-	// fail-closed on missing data.
+	// Status views read it (WeeklyCooked). It defaults to 1 (unknown windows
+	// read as "not cooked").
 	WeeklyHeadroom      float64
 	WeeklyHeadroomKnown bool
 	// WeeklySurplus is the weekly quota the account will lose at reset if it
@@ -195,8 +193,7 @@ func (s Scheduler) ForModel(model string) Scheduler {
 			} else {
 				modelScore = Score{
 					AccountID: score.AccountID, Provider: score.Provider, Headroom: 0, ShortHeadroom: 0,
-					// Weekly headroom is account-level evidence: carry it so the
-					// paid fallback keeps requiring a cooked weekly window.
+					// Weekly headroom is account-level evidence; carry it.
 					WeeklyHeadroom:      score.WeeklyHeadroom,
 					WeeklyHeadroomKnown: score.WeeklyHeadroomKnown,
 					// Paid Claude capacity is account metadata, not model-pool
@@ -340,14 +337,14 @@ func (s Scheduler) sortCandidates(candidates []account.Account) []account.Accoun
 // windows produce, with no per-provider case here.
 func (s Scheduler) spreadPool(sorted []account.Account) []account.Account {
 	topScore := s.score(sorted[0].Provider, sorted[0].ID)
-	if s.tier(sorted[0]) != 0 {
+	if s.tier(sorted[0]) != SelectionTierPlan {
 		return nil
 	}
 	topCapacity := s.CapacityFailures(sorted[0].Provider, sorted[0].ID)
 	end := 1
 	for end < len(sorted) {
 		score := s.score(sorted[end].Provider, sorted[end].ID)
-		if s.tier(sorted[end]) != 0 || score.ExpiryPressure != topScore.ExpiryPressure ||
+		if s.tier(sorted[end]) != SelectionTierPlan || score.ExpiryPressure != topScore.ExpiryPressure ||
 			s.CapacityFailures(sorted[end].Provider, sorted[end].ID) != topCapacity {
 			break
 		}
@@ -448,20 +445,56 @@ func (s Scheduler) tier(acct account.Account) int {
 	return selectionTier(acct, s.measuredScore(acct.Provider, acct.ID))
 }
 
+// Selection tiers, cheapest money first. Pick sorts by tier before any
+// pressure or headroom signal, so a tier is a hard preference and the
+// existing spreading logic only operates inside one tier.
+//
+//   - SelectionTierPlan: subscription quota with room for a new session.
+//   - SelectionTierAPIKey: an API key that has not reported exhaustion. For
+//     Claude these are expected to be funded by free monthly Console credits
+//     (see the cost order in internal/proxy/claude_cost_tiers.go), so they
+//     still cost no money.
+//   - SelectionTierPlanConstrained: subscription quota below the new-session
+//     floor but not exhausted. Still free, but a new conversation placed
+//     there would soon have to move and re-bill its prompt prefix.
+//   - SelectionTierPlanExhausted: subscription accounts with no quota. The
+//     Claude proxy turns a pick here into paid extra usage (tier 3 of the
+//     Claude cost order) or a pool-exhausted 503.
+//   - SelectionTierExhaustedAPIKey: an API key held out by an explicit
+//     exhaustion mark (spent credits, rejected key). It must rank behind
+//     exhausted subscriptions, or it would shadow the extra-usage fallback.
+const (
+	SelectionTierPlan = iota
+	SelectionTierAPIKey
+	SelectionTierPlanConstrained
+	SelectionTierPlanExhausted
+	SelectionTierExhaustedAPIKey
+	SelectionTierOther
+)
+
+// SelectionTier reports the tier Pick sorts this account into, from its
+// measured score. Status views use it to show the routing order.
+func (s Scheduler) SelectionTier(acct account.Account) int {
+	return s.tier(acct)
+}
+
 func selectionTier(acct account.Account, score Score) int {
 	if acct.AuthMode == account.AuthModeOAuth && score.usableForNewSession() {
-		return 0
+		return SelectionTierPlan
 	}
-	if acct.AuthMode == account.AuthModeAPIKey {
-		return 1
+	if acct.AuthMode == account.AuthModeAPIKey && !score.exhausted() {
+		return SelectionTierAPIKey
 	}
 	if acct.AuthMode == account.AuthModeOAuth && !score.exhausted() {
-		return 2
+		return SelectionTierPlanConstrained
 	}
 	if acct.AuthMode == account.AuthModeOAuth {
-		return 3
+		return SelectionTierPlanExhausted
 	}
-	return 4
+	if acct.AuthMode == account.AuthModeAPIKey {
+		return SelectionTierExhaustedAPIKey
+	}
+	return SelectionTierOther
 }
 
 // ScoreFor returns the stored score for an account, or an optimistic default
@@ -590,9 +623,7 @@ func (s Score) ExhaustionClearsAt() (time.Time, bool) {
 	return s.ExhaustedResetAt, true
 }
 
-// WeeklyCooked reports that every long (weekly) window is exhausted. Paid
-// Claude fallback is allowed only in this state; a short-window-only
-// exhaustion is a temporary wait and must not spend credits.
+// WeeklyCooked reports that every long (weekly) window is exhausted.
 func (s Score) WeeklyCooked() bool {
 	return s.WeeklyHeadroomKnown && s.WeeklyHeadroom <= 0
 }
