@@ -207,6 +207,31 @@ func claudeCreditStatusFromView(view claudeCreditView) *ClaudeCreditStatus {
 	}
 }
 
+// claudeAuthMode resolves an account's auth mode. A response tagged by the
+// failover layer carries only the account ID and credential version, so the
+// mode comes from the loaded account list.
+func (s Server) claudeAuthMode(account accounts.Account) accounts.AuthMode {
+	if account.AuthMode != "" {
+		return account.AuthMode
+	}
+	if s.AccountRef != nil {
+		s.AccountRef.mu.RLock()
+		defer s.AccountRef.mu.RUnlock()
+		for _, candidate := range s.AccountRef.accounts {
+			if sameCredentialProvider(candidate.Provider, accounts.ProviderClaude) && candidate.ID == account.ID {
+				return candidate.AuthMode
+			}
+		}
+		return ""
+	}
+	for _, candidate := range s.Accounts {
+		if accountProviderOrCodex(candidate) == accounts.ProviderClaude && candidate.ID == account.ID {
+			return candidate.AuthMode
+		}
+	}
+	return ""
+}
+
 // claudeCredentialIdentity is the current credential identity of a Claude
 // account, or "" when the account is unknown.
 func (s Server) claudeCredentialIdentity(accountID string) string {
@@ -290,7 +315,7 @@ func claudeRevokedMessage(body []byte) bool {
 // it was first seen. The credential is stored only as a fingerprint.
 func (s Server) noteClaudeRevoked(account accounts.Account, status int, body []byte) {
 	if s.claudeCosts == nil || status != http.StatusUnauthorized || account.ID == "" ||
-		account.AuthMode == accounts.AuthModeAPIKey || !claudeRevokedMessage(body) {
+		s.claudeAuthMode(account) == accounts.AuthModeAPIKey || !claudeRevokedMessage(body) {
 		return
 	}
 	identity := account.CredentialIdentity()
@@ -311,7 +336,7 @@ func (s Server) noteClaudeRevoked(account accounts.Account, status int, body []b
 // or nil when the account is not metered.
 func (s Server) meterClaudeCredit(account accounts.Account) func(model string, usage tokenUsage) {
 	if s.claudeCosts == nil || accountProviderOrCodex(account) != accounts.ProviderClaude ||
-		account.AuthMode != accounts.AuthModeAPIKey || account.ID == "" {
+		account.ID == "" || s.claudeAuthMode(account) != accounts.AuthModeAPIKey {
 		return nil
 	}
 	store, id := s.claudeCosts, account.ID

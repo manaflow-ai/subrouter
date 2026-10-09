@@ -3440,7 +3440,7 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 		columns = append(columns, usageGridColumn{Key: "Tier", Title: "Tier", Width: usageGridDesiredWidth(rows, "Tier", "Tier", 36)})
 	}
 	if usageGridRowsHaveValue(rows, "Credit") {
-		columns = append(columns, usageGridColumn{Key: "Credit", Title: "Credit", Width: usageGridDesiredWidth(rows, "Credit", "Credit", 44)})
+		columns = append(columns, usageGridColumn{Key: "Credit", Title: "Credit", Width: usageGridDesiredWidth(rows, "Credit", "Credit", 56)})
 	}
 	shrinkUsageGridColumnsToFit(columns, termWidth, []string{"State", "Account", "Plan", "Pick"})
 	for _, candidate := range []usageGridColumn{
@@ -3567,14 +3567,14 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 }
 
 // usageGridClaudeCreditCell shows a Claude API key's free credit:
-// "$187.20/$200 left, exp 10-24, behind, promoted". A "~" marks a defaulted
+// "$187.20/$200 left, exp 10-24, behind, promoted" (expiry date in UTC). A "~" marks a defaulted
 // grant or expiry (set the real one with `sr key-credit set`).
 func usageGridClaudeCreditCell(row srUsageRow) usageGridCell {
 	credit := row.credit
 	if credit == nil {
 		return usageGridCell{}
 	}
-	text := fmt.Sprintf("$%.2f/$%.0f left, exp %s", credit.RemainingUSD, credit.GrantUSD, credit.ExpiresAt.Local().Format("01-02"))
+	text := fmt.Sprintf("$%.2f/$%.0f left, exp %s", credit.RemainingUSD, credit.GrantUSD, credit.ExpiresAt.UTC().Format("01-02"))
 	if credit.Defaulted {
 		text += "~"
 	}
