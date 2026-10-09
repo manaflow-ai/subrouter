@@ -235,6 +235,10 @@ type Server struct {
 	// claudeWebBalances holds CLI-pushed Claude prepaid balances for the
 	// usage-status overlay; initialized in Handler from the account store dir.
 	claudeWebBalances *claudeWebBalanceStore
+	// claudeCosts holds Claude API-credit grants, metered spend, pacing, and
+	// revoked OAuth credentials (claude_credit_state.go). Nil disables
+	// credit pacing; keys then route in their ordinary tier.
+	claudeCosts *claudeCostStore
 	// FableBedrockPrimary, when true, routes Claude Fable requests to AWS Bedrock
 	// FIRST, before the subscription pool, instead of using Bedrock only as a
 	// fallback. It only takes effect when the Bedrock gateway is configured; a
@@ -752,6 +756,20 @@ func (r *AccountRef) credentialSnapshot(provider accounts.Provider, id string) a
 	return accounts.Account{ID: id, Provider: provider, AuthMode: accounts.AuthModeOAuth}
 }
 
+// credentialSnapshotOr is credentialSnapshot with a static account list
+// fallback for servers built without an AccountRef.
+func (r *AccountRef) credentialSnapshotOr(static []accounts.Account, provider accounts.Provider, id string) accounts.Account {
+	if r != nil {
+		return r.credentialSnapshot(provider, id)
+	}
+	for _, candidate := range static {
+		if sameCredentialProvider(candidate.Provider, provider) && candidate.ID == id {
+			return candidate
+		}
+	}
+	return accounts.Account{ID: id, Provider: provider, AuthMode: accounts.AuthModeOAuth}
+}
+
 // FetchUsageWindowsCached is the single path for reading an account's usage
 // windows. Every consumer (scheduler scoring, the usage-status sweep,
 // auto-switch) used to fetch live, and with many pooled accounts the combined
@@ -1068,6 +1086,12 @@ type AccountUsageStatus struct {
 	CostTier              string    `json:"cost_tier,omitempty"`
 	CostTierRank          int       `json:"cost_tier_rank,omitempty"`
 	CreditsExhaustedUntil time.Time `json:"credits_exhausted_until,omitzero"`
+	// Credit is a Claude API key's grant, metered spend, expiry, and pace.
+	Credit *ClaudeCreditStatus `json:"credit,omitempty"`
+	// RevokedSince is when Anthropic first answered this Claude OAuth
+	// credential with "has been revoked"; the account is out of routing
+	// until it is re-added.
+	RevokedSince time.Time `json:"revoked_since,omitzero"`
 	// ResetAdvice is set when the reset-credit spender, running in warn
 	// mode, would redeem a credit on this account now (see
 	// --reset-credit-autospend).
@@ -2775,6 +2799,9 @@ func (s Server) Handler() http.Handler {
 	if s.claudeWebBalances == nil && s.AccountRef != nil {
 		s.claudeWebBalances = newClaudeWebBalanceStore(filepath.Join(s.AccountRef.store.Dir, "claude-web-balances.json"))
 	}
+	if s.claudeCosts == nil && s.AccountRef != nil {
+		s.claudeCosts = newClaudeCostStore(filepath.Join(s.AccountRef.store.Dir, "claude-cost-state.json"))
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
 	mux.HandleFunc("/internal/v1/session-leases/", s.requireSessionLeaseAdmin(s.handleSessionLease))
@@ -2791,6 +2818,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/account-status", s.requireAdmin(s.handleAccountStatus))
 	mux.HandleFunc("/_subrouter/usage-status", s.requireAdmin(s.handleUsageStatus))
 	mux.HandleFunc("/_subrouter/claude-web-balance", s.requireAdmin(s.handleClaudeWebBalance))
+	mux.HandleFunc("/_subrouter/claude-key-credit", s.requireAdmin(s.handleClaudeKeyCredit))
 	mux.HandleFunc("/_subrouter/qwen-console", s.requireAccountImportAuth(s.handleQwenConsoleImport))
 	mux.HandleFunc("/_subrouter/rate-limit-reset", s.requireAdmin(s.handleRateLimitReset))
 	mux.HandleFunc("/_subrouter/reset-credits", s.requireAdmin(s.handleResetCredits))
@@ -7798,6 +7826,8 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 	// user on that header even though the request "succeeded".
 	claudeUnusable := provider == accounts.ProviderClaude && accountID != "" &&
 		(claudeAccountUnusableStatus(response.StatusCode) || claudeResponseRejectedForPool(response.Header, poolModel))
+	inspectClaudeCredit := provider == accounts.ProviderClaude && accountID != "" &&
+		account.AuthMode == accounts.AuthModeAPIKey && claudeCreditExhaustedStatus(response.StatusCode)
 	if claudeUnusable {
 		// Only poison the routing score when the account is genuinely out of
 		// quota (401, a 429 the upstream marks "rejected", or any response with
@@ -7842,7 +7872,7 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 		(response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusForbidden)
 	inspectModelCompatibility := s.SchedulerRef != nil && accountID != "" && compatibilityModel != "" &&
 		provider == accounts.ProviderCodex && response.StatusCode == http.StatusBadRequest
-	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !inspectCredentialFailure && !inspectModelCompatibility && !inspectKimiUnauthorized && !claudeUnusable) {
+	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !inspectCredentialFailure && !inspectModelCompatibility && !inspectKimiUnauthorized && !claudeUnusable && !inspectClaudeCredit) {
 		return
 	}
 	payload := map[string]any{"status": response.StatusCode}
@@ -7851,9 +7881,15 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 		responseCtx = response.Request.Context()
 	}
 	var inspect func([]byte)
-	if inspectUsageLimit || inspectCredentialFailure || inspectModelCompatibility || inspectKimiUnauthorized || claudeUnusable {
+	if inspectUsageLimit || inspectCredentialFailure || inspectModelCompatibility || inspectKimiUnauthorized || claudeUnusable || inspectClaudeCredit {
 		loggedBody := false
 		inspect = func(body []byte) {
+			if claudeUnusable && response.StatusCode == http.StatusUnauthorized {
+				s.noteClaudeRevoked(account, response.StatusCode, body)
+			}
+			if inspectClaudeCredit && claudeCreditExhaustedMessage(body) {
+				s.markClaudeCreditExhausted(accountID)
+			}
 			if inspectKimiUnauthorized {
 				if kimiModelCapabilityErrorJSON(body) {
 					if compatibilityModel != "" {
@@ -8322,6 +8358,9 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	}
 	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude || provider == accounts.ProviderKimi || provider == accounts.ProviderAntigravity {
 		s.refreshUsageScoresForRequest(r.Context())
+	}
+	if provider == accounts.ProviderClaude {
+		s.ensureClaudeCreditKeys(availableAccounts)
 	}
 	base := s.scheduler()
 	poolModel := model
@@ -10643,6 +10682,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if t.server != nil && claudeCreditExhausted {
 			t.server.markClaudeCreditExhausted(accountID)
 		} else if t.server != nil && credentialFailure && !modelUnsupported {
+			if t.provider == accounts.ProviderClaude {
+				t.server.noteClaudeRevoked(t.server.AccountRef.credentialSnapshotOr(t.server.Accounts, accounts.ProviderClaude, accountID),
+					response.StatusCode, peekResponseBodyPrefix(response))
+			}
 			// Bind auth rejection to the exact credential identity captured for
 			// this attempt. A concurrent key rotation must make this late response
 			// harmless rather than cooking the repaired account generation.
@@ -11764,11 +11807,11 @@ const (
 
 func (s Server) scheduler() selectacct.Scheduler {
 	if s.SchedulerRef != nil {
-		return s.SchedulerRef.Get().
+		return s.withClaudeCostOverlay(s.SchedulerRef.Get().
 			WithLiveDebits(s.SchedulerRef.LiveDebits()).
-			WithInflightCounts(s.SchedulerRef.InflightCounts())
+			WithInflightCounts(s.SchedulerRef.InflightCounts()))
 	}
-	return s.Scheduler
+	return s.withClaudeCostOverlay(s.Scheduler)
 }
 
 func findAccount(haystack []accounts.Account, id string) (accounts.Account, bool) {

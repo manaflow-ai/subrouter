@@ -1437,9 +1437,11 @@ type remoteServerUsageStatus struct {
 	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
 	UsageFetchedAt     time.Time                        `json:"usage_fetched_at,omitzero"`
 	// Claude cost tier (see proxy.ClaudeCostOrder); absent on older servers.
-	CostTier              string    `json:"cost_tier,omitempty"`
-	CostTierRank          int       `json:"cost_tier_rank,omitempty"`
-	CreditsExhaustedUntil time.Time `json:"credits_exhausted_until,omitzero"`
+	CostTier              string                    `json:"cost_tier,omitempty"`
+	CostTierRank          int                       `json:"cost_tier_rank,omitempty"`
+	CreditsExhaustedUntil time.Time                 `json:"credits_exhausted_until,omitzero"`
+	Credit                *proxy.ClaudeCreditStatus `json:"credit,omitempty"`
+	RevokedSince          time.Time                 `json:"revoked_since,omitzero"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
@@ -1655,6 +1657,8 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			costTier:              status.CostTier,
 			costTierRank:          status.CostTierRank,
 			creditsExhaustedUntil: status.CreditsExhaustedUntil,
+			credit:                status.Credit,
+			revokedSince:          status.RevokedSince,
 			provider:              status.Provider,
 			usageThrottled:        status.UsageThrottled || status.QuotaStatus == "throttled" || serverUsageThrottleError(status.Error),
 			providerHealth:        status.ProviderHealth,
@@ -1728,6 +1732,12 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			row.score = scoreFromWindows(email, status.Windows)
 			row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
 			row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
+		}
+		if !status.RevokedSince.IsZero() {
+			// The server excludes a revoked credential from routing; the
+			// last usage reading it still carries is not capacity.
+			row.cooked = true
+			row.cookedReason = "OAuth credential revoked"
 		}
 		rows = append(rows, row)
 	}

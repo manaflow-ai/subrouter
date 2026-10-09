@@ -88,7 +88,18 @@ func claudeNewSessionCandidatesFromScores(
 	modelKey := selectacct.ModelKey(poolModel)
 	hasDedicatedPool := modelKey != "" && base.HasModelPool(poolModel)
 	verified := make([]accounts.Account, 0, len(candidates))
+	promoted := make([]accounts.Account, 0)
 	for _, candidate := range candidates {
+		if candidate.AuthMode == accounts.AuthModeAPIKey {
+			// A credit grant behind pace outranks plan quota for new
+			// sessions (selectacct.SelectionTierPromotedCredits); keep it in
+			// the verified set so Pick can choose it.
+			provider := schedulerAccountProvider(candidate.Provider)
+			if model.ScoreFor(provider, candidate.ID).CreditPromoted && !model.Exhausted(provider, candidate.ID) {
+				promoted = append(promoted, candidate)
+			}
+			continue
+		}
 		if candidate.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
@@ -107,7 +118,7 @@ func claudeNewSessionCandidatesFromScores(
 		verified = append(verified, candidate)
 	}
 	if len(verified) > 0 {
-		return verified
+		return append(verified, promoted...)
 	}
 	return candidates
 }

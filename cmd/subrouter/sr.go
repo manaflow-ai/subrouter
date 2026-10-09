@@ -66,6 +66,8 @@ Usage:
                         (kimi, zai, openrouter, deepseek, together, fireworks,
                         opencode-zen, grok, qwen, qwen-token,
                         qwen-anthropic, claude)
+  sr key-credit         List Claude API-key credit grants (remaining, expiry, pace)
+  sr key-credit set <label> --amount 200 --expires YYYY-MM-DD [--spent N]
   sr import             Import current ~/.codex/auth.json account
   sr list [--ids]        List accounts; --ids adds exact identifiers
   sr switch [email]     Switch active Codex account and sync OpenCode/pi
@@ -318,19 +320,23 @@ type srUsageRow struct {
 	costTier              string
 	costTierRank          int
 	creditsExhaustedUntil time.Time
-	apiKeySpend           *accounts.APIKeyUsageSnapshot
-	apiKeyHint            string
-	usageThrottled        bool
-	err                   error
-	score                 selectacct.Score
-	gtoReason             string
-	gtoRecommended        bool
-	cooked                bool
-	cookedReason          string
-	tempCooked            bool
-	tempCookedReason      string
-	authMode              accounts.AuthMode
-	provider              accounts.Provider
+	// credit is a Claude API key's grant state; revokedSince marks a Claude
+	// OAuth credential Anthropic revoked.
+	credit           *proxy.ClaudeCreditStatus
+	revokedSince     time.Time
+	apiKeySpend      *accounts.APIKeyUsageSnapshot
+	apiKeyHint       string
+	usageThrottled   bool
+	err              error
+	score            selectacct.Score
+	gtoReason        string
+	gtoRecommended   bool
+	cooked           bool
+	cookedReason     string
+	tempCooked       bool
+	tempCookedReason string
+	authMode         accounts.AuthMode
+	provider         accounts.Provider
 }
 
 func cxAlias(args []string) error {
@@ -436,6 +442,9 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 	}
 	if len(args) == 0 {
 		return r.defaultInteractive(ctx, srSwitchOptions{})
+	}
+	if args[0] == "key-credit" || args[0] == "key-credits" {
+		return r.keyCredit(ctx, args[1:])
 	}
 	var source broker.CredentialSource
 	// A named server in the environment is an explicit, one-command target.
@@ -3238,6 +3247,9 @@ func authErrorNeedsReadd(err error) bool {
 // with authoritative quota state. Authentication failures remain last because
 // they require re-verification before the account can be considered usable.
 func usageRowStatusTier(row srUsageRow) int {
+	if !row.revokedSince.IsZero() {
+		return 6
+	}
 	if row.tempCooked {
 		return 3
 	}
@@ -3427,6 +3439,9 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 	if usageGridRowsHaveValue(rows, "Tier") {
 		columns = append(columns, usageGridColumn{Key: "Tier", Title: "Tier", Width: usageGridDesiredWidth(rows, "Tier", "Tier", 36)})
 	}
+	if usageGridRowsHaveValue(rows, "Credit") {
+		columns = append(columns, usageGridColumn{Key: "Credit", Title: "Credit", Width: usageGridDesiredWidth(rows, "Credit", "Credit", 44)})
+	}
 	shrinkUsageGridColumnsToFit(columns, termWidth, []string{"State", "Account", "Plan", "Pick"})
 	for _, candidate := range []usageGridColumn{
 		{Key: "Session", Title: "Session"},
@@ -3528,6 +3543,7 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Sonnet wk":       usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
 		"Extra":           usageGridClaudeExtraCell(row),
 		"Tier":            usageGridClaudeTierCell(row),
+		"Credit":          usageGridClaudeCreditCell(row),
 		"ExtraAutoReload": usageGridClaudeExtraAutoReloadCell(row),
 		"AG Gemini 5h": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
 			return isAntigravityFamilyWindow(window, "gemini", false)
@@ -3550,6 +3566,28 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 	}
 }
 
+// usageGridClaudeCreditCell shows a Claude API key's free credit:
+// "$187.20/$200 left, exp 10-24, behind, promoted". A "~" marks a defaulted
+// grant or expiry (set the real one with `sr key-credit set`).
+func usageGridClaudeCreditCell(row srUsageRow) usageGridCell {
+	credit := row.credit
+	if credit == nil {
+		return usageGridCell{}
+	}
+	text := fmt.Sprintf("$%.2f/$%.0f left, exp %s", credit.RemainingUSD, credit.GrantUSD, credit.ExpiresAt.Local().Format("01-02"))
+	if credit.Defaulted {
+		text += "~"
+	}
+	if credit.Pace != "" {
+		text += ", " + credit.Pace
+	}
+	style := ansiDim
+	if credit.Promoted {
+		style = ansiYellow
+	}
+	return usageGridCell{Text: text, Style: style}
+}
+
 // usageGridClaudeTierCell shows the server's Claude cost tier: "1 plan",
 // "2 api credits", "3 extra usage", and for a key whose credit balance is
 // spent, when one request will probe it again.
@@ -3560,6 +3598,8 @@ func usageGridClaudeTierCell(row srUsageRow) usageGridCell {
 	text := strings.ReplaceAll(row.costTier, "-", " ")
 	if row.costTierRank > 0 {
 		text = strconv.Itoa(row.costTierRank) + " " + text
+	} else if row.credit != nil && row.credit.Promoted {
+		text = "0 " + text + " (deadline)"
 	}
 	if !row.creditsExhaustedUntil.IsZero() {
 		wait := time.Until(row.creditsExhaustedUntil)
@@ -3857,6 +3897,9 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 }
 
 func usageGridState(row srUsageRow) string {
+	if usageProvider(row) == accounts.ProviderClaude && !row.revokedSince.IsZero() {
+		return "revoked"
+	}
 	if usageProvider(row) == accounts.ProviderClaude {
 		if row.cooked {
 			if row.active {
@@ -4015,6 +4058,8 @@ func usageGridState(row srUsageRow) string {
 
 func usageGridStateColor(row srUsageRow) string {
 	switch {
+	case !row.revokedSince.IsZero():
+		return ansiRed
 	case qwenTelemetryOnlyFailure(row) && row.gtoRecommended:
 		return ansiGreen
 	case qwenTelemetryOnlyFailure(row) && (row.active || (row.sessionsKnown && row.assignedSessions > 0)):
@@ -4070,6 +4115,9 @@ func usageGridError(row srUsageRow) string {
 }
 
 func compactPickReason(row srUsageRow) string {
+	if !row.revokedSince.IsZero() {
+		return "revoked since " + row.revokedSince.Local().Format("01-02 15:04") + ", re-add"
+	}
 	if qwenTelemetryOnlyFailure(row) {
 		switch row.quotaStatus {
 		case "login needed":
