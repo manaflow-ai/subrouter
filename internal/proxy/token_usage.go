@@ -1782,7 +1782,26 @@ type tokenUsageRequest struct {
 // Successful model turns are counted in full; a model request that ends in
 // an upstream error response counts only in upstream_errors.
 func (s Server) wrapTokenUsageBody(response *http.Response, r *http.Request, request tokenUsageRequest, account accounts.Account) {
-	if s.TokenUsage == nil || response == nil || r == nil || !tokenUsageCountedRequest(r.Method, r.URL.Path) {
+	if response == nil || r == nil || !tokenUsageCountedRequest(r.Method, r.URL.Path) {
+		return
+	}
+	// A Claude API key is metered against its free credit grant whether or
+	// not token accounting is enabled.
+	meter := s.meterClaudeCredit(account)
+	if meter != nil && response.StatusCode >= 200 && response.StatusCode < 300 && response.Body != nil {
+		model := request.requestModel
+		response.Body = newTokenUsageBody(response.Body, response.Header.Get("Content-Type"), func(result tokenUsageBodyResult) {
+			if !result.ok {
+				return
+			}
+			resultModel := result.model
+			if resultModel == "" {
+				resultModel = model
+			}
+			meter(resultModel, result.usage)
+		})
+	}
+	if s.TokenUsage == nil {
 		return
 	}
 	provider := account.Provider

@@ -106,7 +106,7 @@ func srStatusAccountState(row srUsageRow) string {
 		}
 	}
 	switch {
-	case markers["error"] || srStatusProviderHealthFailed(row):
+	case markers["error"] || markers["revoked"] || srStatusProviderHealthFailed(row):
 		return srStatusStateError
 	case markers["cooked"] || markers["exhausted"]:
 		return srStatusStateCooked

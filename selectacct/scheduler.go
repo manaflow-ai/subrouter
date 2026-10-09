@@ -56,6 +56,12 @@ type Score struct {
 	ClaudeExtraUsageEnabled   bool
 	ClaudeExtraUsageKnown     bool
 	ClaudeExtraUsageRemaining float64
+	// CreditPromoted pulls an API key whose free credit grant would expire
+	// unspent ahead of plan quota for new placements
+	// (SelectionTierPromotedCredits). CreditExpiresAt orders API keys among
+	// themselves: the grant that expires first is spent first.
+	CreditPromoted  bool
+	CreditExpiresAt time.Time
 }
 
 // ModelSupport is the provider-normalized meaning of an omitted model quota
@@ -148,6 +154,28 @@ func (s Scheduler) WithScore(score Score) Scheduler {
 		next.scores[key] = existing
 	}
 	next.scores[ScoreKey(score.Provider, score.AccountID)] = score
+	return next
+}
+
+// WithScores returns a copy with each score replaced or added, in one copy
+// of the score map.
+func (s Scheduler) WithScores(scores []Score) Scheduler {
+	if len(scores) == 0 {
+		return s
+	}
+	next := Scheduler{
+		scores:        make(map[string]Score, len(s.scores)+len(scores)),
+		sessionCounts: s.sessionCounts,
+		liveDebits:    s.liveDebits,
+		inflight:      s.inflight,
+		capacity:      s.capacity,
+	}
+	for key, existing := range s.scores {
+		next.scores[key] = existing
+	}
+	for _, score := range scores {
+		next.scores[ScoreKey(score.Provider, score.AccountID)] = score
+	}
 	return next
 }
 
@@ -284,6 +312,12 @@ func (s Scheduler) sortCandidates(candidates []account.Account) []account.Accoun
 		rightTier := s.tier(sorted[j])
 		if leftTier != rightTier {
 			return leftTier < rightTier
+		}
+		// Credit grants are lost at expiry: spend the one that expires first.
+		if (leftTier == SelectionTierPromotedCredits || leftTier == SelectionTierAPIKey) &&
+			!left.CreditExpiresAt.IsZero() && !right.CreditExpiresAt.IsZero() &&
+			!left.CreditExpiresAt.Equal(right.CreditExpiresAt) {
+			return left.CreditExpiresAt.Before(right.CreditExpiresAt)
 		}
 		// Within a tier, an account shedding this pool's requests goes after
 		// the ones that are not; fewer consecutive failures first.
@@ -464,7 +498,11 @@ func (s Scheduler) tier(acct account.Account) int {
 //     exhaustion mark (spent credits, rejected key). It must rank behind
 //     exhausted subscriptions, or it would shadow the extra-usage fallback.
 const (
-	SelectionTierPlan = iota
+	// SelectionTierPromotedCredits is an API key whose free grant is behind
+	// pace to be spent before it expires (see CreditPromoted). Plan quota
+	// keeps until its own reset; the grant does not, so it goes first.
+	SelectionTierPromotedCredits = iota
+	SelectionTierPlan
 	SelectionTierAPIKey
 	SelectionTierPlanConstrained
 	SelectionTierPlanExhausted
@@ -479,6 +517,9 @@ func (s Scheduler) SelectionTier(acct account.Account) int {
 }
 
 func selectionTier(acct account.Account, score Score) int {
+	if acct.AuthMode == account.AuthModeAPIKey && score.CreditPromoted && !score.exhausted() {
+		return SelectionTierPromotedCredits
+	}
 	if acct.AuthMode == account.AuthModeOAuth && score.usableForNewSession() {
 		return SelectionTierPlan
 	}
