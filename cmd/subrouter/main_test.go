@@ -572,6 +572,8 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"trace",
 		"usage",
 		"use",
+		"key-credit",
+		"key-credits",
 		"whoami",
 		"why",
 	}
