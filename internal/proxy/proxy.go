@@ -756,20 +756,6 @@ func (r *AccountRef) credentialSnapshot(provider accounts.Provider, id string) a
 	return accounts.Account{ID: id, Provider: provider, AuthMode: accounts.AuthModeOAuth}
 }
 
-// credentialSnapshotOr is credentialSnapshot with a static account list
-// fallback for servers built without an AccountRef.
-func (r *AccountRef) credentialSnapshotOr(static []accounts.Account, provider accounts.Provider, id string) accounts.Account {
-	if r != nil {
-		return r.credentialSnapshot(provider, id)
-	}
-	for _, candidate := range static {
-		if sameCredentialProvider(candidate.Provider, provider) && candidate.ID == id {
-			return candidate
-		}
-	}
-	return accounts.Account{ID: id, Provider: provider, AuthMode: accounts.AuthModeOAuth}
-}
-
 // FetchUsageWindowsCached is the single path for reading an account's usage
 // windows. Every consumer (scheduler scoring, the usage-status sweep,
 // auto-switch) used to fetch live, and with many pooled accounts the combined
@@ -10683,7 +10669,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.server.markClaudeCreditExhausted(accountID)
 		} else if t.server != nil && credentialFailure && !modelUnsupported {
 			if t.provider == accounts.ProviderClaude {
-				t.server.noteClaudeRevoked(t.server.AccountRef.credentialSnapshotOr(t.server.Accounts, accounts.ProviderClaude, accountID),
+				// Record the credential this attempt used: a concurrent re-login
+				// must not be marked revoked by a late response.
+				t.server.noteClaudeRevoked(accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential},
 					response.StatusCode, peekResponseBodyPrefix(response))
 			}
 			// Bind auth rejection to the exact credential identity captured for

@@ -3,6 +3,7 @@ package proxy
 import (
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -327,5 +328,22 @@ func TestClaudeRevokedAccountExcludedUntilCredentialChanges(t *testing.T) {
 	}))
 	if server.scheduler().Exhausted(accounts.ProviderClaude, "revoked") {
 		t.Fatal("re-logged account still excluded")
+	}
+}
+
+// A corrupt state file must never be overwritten with defaults: that would
+// silently drop operator-set grants and expiries.
+func TestClaudeCostStoreRefusesToOverwriteCorruptFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := newClaudeCostStore(path)
+	if err := store.set("claude:k", 200, creditTestNow.AddDate(0, 0, 10), nil); err == nil {
+		t.Fatal("set succeeded over a corrupt state file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "{not json" {
+		t.Fatalf("state file = %q, %v; want it left untouched", data, err)
 	}
 }

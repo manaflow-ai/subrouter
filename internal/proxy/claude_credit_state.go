@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -130,17 +132,23 @@ func (s *claudeCostStore) clock() time.Time {
 	return time.Now()
 }
 
-func (s *claudeCostStore) readLocked() claudeCostStateFile {
+// readLocked loads the state file. A missing file is empty state; an
+// unreadable or corrupt one is an error, so a write can never replace
+// operator-set grants with defaults.
+func (s *claudeCostStore) readLocked() (claudeCostStateFile, error) {
 	if s.path == "" {
-		return s.cache.clone()
+		return s.cache.clone(), nil
 	}
 	data, err := os.ReadFile(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return newClaudeCostStateFile(), nil
+	}
 	if err != nil {
-		return newClaudeCostStateFile()
+		return claudeCostStateFile{}, err
 	}
 	file := newClaudeCostStateFile()
 	if err := json.Unmarshal(data, &file); err != nil {
-		return newClaudeCostStateFile()
+		return claudeCostStateFile{}, fmt.Errorf("decode %s: %w", filepath.Base(s.path), err)
 	}
 	if file.Keys == nil {
 		file.Keys = map[string]*claudeCreditKeyState{}
@@ -148,7 +156,7 @@ func (s *claudeCostStore) readLocked() claudeCostStateFile {
 	if file.Revoked == nil {
 		file.Revoked = map[string]claudeRevokedState{}
 	}
-	return file
+	return file, nil
 }
 
 func (s *claudeCostStore) writeLocked(file claudeCostStateFile) error {
@@ -186,7 +194,12 @@ func (s *claudeCostStore) mutate(change func(*claudeCostStateFile, time.Time)) e
 	unlock := lockClaudeCostState(s.path)
 	defer unlock()
 	now := s.clock()
-	file := s.readLocked()
+	file, err := s.readLocked()
+	if err != nil {
+		// Keep the cached view and pending spend; retry on the next write.
+		s.loadedAt = now
+		return err
+	}
 	s.applyPendingLocked(&file, now)
 	if change != nil {
 		change(&file, now)
@@ -236,7 +249,9 @@ func (s *claudeCostStore) snapshot() claudeCostStateFile {
 	} else {
 		s.mu.Lock()
 		unlock := lockClaudeCostState(s.path)
-		s.cache = s.readLocked()
+		if file, err := s.readLocked(); err == nil {
+			s.cache = file
+		}
 		unlock()
 		s.loadedAt = now
 		s.mu.Unlock()
