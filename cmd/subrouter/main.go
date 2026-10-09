@@ -298,6 +298,8 @@ var directSRCommands = map[string]struct{}{
 	"cost":             {},
 	"daemon":           {},
 	"doctor":           {},
+	"key-credit":       {},
+	"key-credits":      {},
 	"g":                {},
 	"az":               {},
 	"azure":            {},
