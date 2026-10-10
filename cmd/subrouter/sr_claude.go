@@ -96,6 +96,10 @@ type claudeRunner struct {
 	// verifyToken proves a pasted setup token against Anthropic before it is
 	// stored. nil selects claude.VerifyAccessToken with the runner's client.
 	verifyToken func(ctx context.Context, token string) error
+	// tokenIdentity reports which Claude organization a token bills against.
+	// nil selects claude.VerifyAccessTokenIdentity with the runner's client,
+	// unless verifyToken is stubbed, in which case no identity is probed.
+	tokenIdentity func(ctx context.Context, token string) (claude.TokenIdentity, error)
 	// now is the clock used to stamp a setup token's expiry. nil selects
 	// time.Now.
 	now func() time.Time
@@ -1233,18 +1237,35 @@ func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOption
 	if r.now != nil {
 		issuedAt = r.now()
 	}
-	verify := r.verifyToken
-	if verify == nil {
-		verify = func(ctx context.Context, token string) error {
-			return claude.VerifyAccessToken(ctx, r.client, token)
+	// One probe both proves the token and identifies the account it bills.
+	// A stubbed verifyToken keeps tests off the network, so identity is then
+	// probed only through an explicit tokenIdentity.
+	identify := r.tokenIdentity
+	if identify == nil && r.verifyToken == nil {
+		identify = func(ctx context.Context, token string) (claude.TokenIdentity, error) {
+			return claude.VerifyAccessTokenIdentity(ctx, r.client, token)
 		}
 	}
+	var identity claude.TokenIdentity
 	fmt.Fprintln(r.out, "Verifying the token with Anthropic...")
-	if err := verify(ctx, token); err != nil {
+	var err error
+	if r.verifyToken != nil {
+		if err = r.verifyToken(ctx, token); err == nil && identify != nil {
+			// Verification already passed; a failed identity lookup only
+			// skips the duplicate-account warning.
+			identity, _ = identify(ctx, token)
+		}
+	} else {
+		identity, err = identify(ctx, token)
+	}
+	if err != nil {
 		if errors.Is(err, claude.ErrSetupTokenRejected) {
 			return fmt.Errorf("%w; mint a fresh one with 'claude setup-token' and retry", err)
 		}
 		return fmt.Errorf("could not verify the Claude setup token: %w", err)
+	}
+	if !r.ephemeral && identify != nil {
+		r.warnSetupTokenSharesOrganization(ctx, name, identity, identify)
 	}
 
 	credential := claude.SetupTokenCredential(token, issuedAt)
@@ -1290,6 +1311,74 @@ func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOption
 	fmt.Fprintf(r.out, "\n  sr claude switch %s\n", name)
 	fmt.Fprintf(r.out, "  sr claude run %s\n", name)
 	return nil
+}
+
+// setupTokenIdentityCheckTimeout bounds the comparison against already stored
+// profiles; it is advisory and must not hold up an add.
+const setupTokenIdentityCheckTimeout = 20 * time.Second
+
+// setupTokenIdentityCheckConcurrency caps how many stored profiles are probed
+// at once.
+const setupTokenIdentityCheckConcurrency = 4
+
+// warnSetupTokenSharesOrganization warns when the token being added bills the
+// same Claude organization as a different stored profile. `claude setup-token`
+// mints for whichever account the browser is signed in to, so a token saved
+// under another account's name stores one account twice and leaves the named
+// account out of the pool. Two seats of one team plan also share an
+// organization, so this is a warning and never a refusal.
+func (r claudeRunner) warnSetupTokenSharesOrganization(
+	ctx context.Context,
+	name string,
+	identity claude.TokenIdentity,
+	identify func(context.Context, string) (claude.TokenIdentity, error),
+) {
+	if identity.OrganizationID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, setupTokenIdentityCheckTimeout)
+	defer cancel()
+	profiles := r.store.ListProfiles()
+	others := make([]claude.TokenIdentity, len(profiles))
+	// Each comparison is a real request on another account, so a large store
+	// must not turn one add into a burst.
+	slots := make(chan struct{}, setupTokenIdentityCheckConcurrency)
+	var wg sync.WaitGroup
+	for i, profile := range profiles {
+		if profile.Name == name {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-ctx.Done():
+				return
+			}
+			credential, err := r.store.ReadCredential(ctx, r.store.PreferredInstancePath(r.store.InstancePath(profile.Name)))
+			if err != nil || credential == nil || credential.AccessToken == "" {
+				return
+			}
+			// An unreadable or rejected stored token is that profile's own
+			// problem; it gives no evidence about this add.
+			others[i], _ = identify(ctx, credential.AccessToken)
+		}()
+	}
+	wg.Wait()
+	for i, other := range others {
+		if other.OrganizationID != identity.OrganizationID {
+			continue
+		}
+		evidence := ""
+		if !identity.WeeklyResetAt.IsZero() && identity.WeeklyResetAt.Equal(other.WeeklyResetAt) {
+			evidence = " and reports the same weekly limit window"
+		}
+		fmt.Fprintf(r.errOut, "warning: this token belongs to the same Claude organization as profile %q%s.\n", profiles[i].Name, evidence)
+		fmt.Fprintf(r.errOut, "Unless both are seats of one team plan, the browser was signed in to that account when the token was minted, and %q now duplicates it.\n", name)
+		fmt.Fprintf(r.errOut, "To fix: sign in to claude.ai as %s only, then re-run 'sr add claude %s'.\n", name, name)
+	}
 }
 
 // mintSetupToken runs `claude setup-token` attached to the user's terminal and
