@@ -62,6 +62,13 @@ func (s Server) allOAuthAccountsWaitingForReset(now time.Time) (time.Time, bool)
 			continue
 		}
 		score := current.ScoreFor(schedulerAccountProvider(account.Provider), account.ID)
+		if account.Provider == accounts.ProviderClaude && score.WeeklyCooked() &&
+			s.AccountRef.claudeUsageThrottleActive(account, now) {
+			// A weekly-cooked score paired with a throttled telemetry endpoint is
+			// stale evidence. Let the request path run one cheap Claude Code-shaped
+			// header probe before treating the whole pool as asleep until reset.
+			return time.Time{}, false
+		}
 		until, known := knownAccountWideQuotaReset(score, now)
 		if !known {
 			return time.Time{}, false
