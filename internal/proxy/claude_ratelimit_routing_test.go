@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -139,6 +140,85 @@ func TestClaude429FailoverEndToEndAndCaptured(t *testing.T) {
 		if !strings.Contains(logs, want) {
 			t.Fatalf("expected rate-limit header %q in logs; logs=\n%s", want, logs)
 		}
+	}
+}
+
+func TestClaudeRequestReverifiesWeeklyCookedAccountAfterTelemetryThrottle(t *testing.T) {
+	account := accounts.Account{ID: "claude@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok"}
+	var usageCalls, probeCalls int
+	ref := cacheTestAccountRef(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/api/oauth/usage":
+			usageCalls++
+			return usage429Response(), nil
+		case "/v1/messages":
+			probeCalls++
+			header := http.Header{}
+			header.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
+			header.Set("Anthropic-Ratelimit-Unified-5h-Utilization", "0.01")
+			header.Set("Anthropic-Ratelimit-Unified-5h-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+			header.Set("Anthropic-Ratelimit-Unified-7d-Status", "allowed")
+			header.Set("Anthropic-Ratelimit-Unified-7d-Utilization", "0.01")
+			header.Set("Anthropic-Ratelimit-Unified-7d-Reset", strconv.FormatInt(time.Now().Add(5*time.Hour).Unix(), 10))
+			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: header, Body: io.NopCloser(strings.NewReader(`{"type":"message"}`))}, nil
+		default:
+			return nil, fmt.Errorf("unexpected probe path %s", req.URL.Path)
+		}
+	}))
+	ref.accounts = []accounts.Account{account}
+	cacheKey := account.ID + "\x00" + string(account.Provider)
+	failureKey := usageWindowsFailureKey(cacheKey, account.CredentialIdentity())
+	ref.usageWindowsMu.Lock()
+	ref.usageWindowsFailures = map[string]usageWindowsFailure{
+		failureKey: {err: errors.New("usage fetch failed: 429 Too Many Requests"), retryAt: time.Now().Add(time.Hour)},
+	}
+	ref.usageWindowsMu.Unlock()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/messages" {
+			t.Fatalf("unexpected Claude request %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"id":"msg-reverified"}`)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reset := time.Now().Add(5 * time.Hour)
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: account.ID, Provider: account.Provider, Headroom: 0, ShortHeadroom: 0,
+		WeeklyHeadroom: 0, WeeklyHeadroomKnown: true, ExhaustedResetAt: reset, Fresh: true,
+	}}))
+	schedulerRef.SetUpdatedAt(time.Time{})
+	handler := Server{
+		AccountRef:     ref,
+		SchedulerRef:   schedulerRef,
+		ClaudeUpstream: upstreamURL,
+		Sessions:       sessions,
+		UsageScoreTTL:  time.Minute,
+		MaxBodyBytes:   1 << 20,
+	}.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after quota re-verification; body=%s", response.Code, response.Body.String())
+	}
+	if usageCalls != 0 {
+		t.Fatalf("throttled telemetry endpoint was retried %d time(s)", usageCalls)
+	}
+	if probeCalls != 1 {
+		t.Fatalf("Fable re-verification probes = %d, want 1", probeCalls)
 	}
 }
 
