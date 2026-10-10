@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -149,33 +150,59 @@ func longLivedCredentialError(profileName string, credential *CredentialInfo, no
 	)
 }
 
+// TokenIdentity is what Anthropic's answer to the verification probe reveals
+// about the account a token bills against. A setup token carries only
+// user:inference, so the profile endpoint that would name the account is
+// closed to it; the response headers are the only identity available.
+type TokenIdentity struct {
+	// OrganizationID is the anthropic-organization-id response header.
+	OrganizationID string
+	// WeeklyResetAt is when the account-wide weekly limit resets, zero when
+	// the response did not say.
+	WeeklyResetAt time.Time
+}
+
 // VerifyAccessToken sends the one-token Messages probe Claude Code itself
 // would send and reports ErrSetupTokenRejected on an authentication failure.
 // Any 2xx or quota response proves the token is accepted; the probe has the
 // Claude Code request shape because Anthropic answers a bare subscription
 // OAuth call with a headerless 429 regardless of the token.
 func VerifyAccessToken(ctx context.Context, client *http.Client, accessToken string) error {
+	_, err := VerifyAccessTokenIdentity(ctx, client, accessToken)
+	return err
+}
+
+// VerifyAccessTokenIdentity is VerifyAccessToken that also returns the
+// identity the same probe response carries.
+func VerifyAccessTokenIdentity(ctx context.Context, client *http.Client, accessToken string) (TokenIdentity, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 20 * time.Second}
 	}
 	req, err := newFableProbeRequest(ctx, accessToken)
 	if err != nil {
-		return err
+		return TokenIdentity{}, err
 	}
 	res, err := client.Do(req)
 	if err != nil {
-		return err
+		return TokenIdentity{}, err
 	}
 	defer res.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 64<<10))
 	switch res.StatusCode {
 	case http.StatusUnauthorized, http.StatusForbidden:
-		return fmt.Errorf("%w: %s", ErrSetupTokenRejected, res.Status)
+		return TokenIdentity{}, fmt.Errorf("%w: %s", ErrSetupTokenRejected, res.Status)
 	}
 	if res.StatusCode >= 500 {
-		return fmt.Errorf("Claude setup token verification failed: %s", res.Status)
+		return TokenIdentity{}, fmt.Errorf("Claude setup token verification failed: %s", res.Status)
 	}
-	return nil
+	identity := TokenIdentity{
+		OrganizationID: strings.TrimSpace(res.Header.Get("anthropic-organization-id")),
+	}
+	rawReset := strings.TrimSpace(res.Header.Get("anthropic-ratelimit-unified-7d-reset"))
+	if epoch, err := strconv.ParseInt(rawReset, 10, 64); err == nil && epoch > 0 {
+		identity.WeeklyResetAt = time.Unix(epoch, 0)
+	}
+	return identity, nil
 }
 
 func newFableProbeRequest(ctx context.Context, accessToken string) (*http.Request, error) {

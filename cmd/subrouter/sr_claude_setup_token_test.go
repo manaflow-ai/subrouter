@@ -347,3 +347,124 @@ func TestSRClaudeHelpDocumentsSetupTokenAndLogin(t *testing.T) {
 		}
 	}
 }
+
+const otherTestSetupToken = "sk-ant-oat01-OTHERTOKENOTHERTOKENOTHERTOKENOTHERTOKENOTHERTOKENOTHERTOKENOTHERTOKENOTHERTOKENOTHER-FAKEFAKEAA"
+
+// A setup token is minted for whichever account the browser happens to be
+// signed in to. Saving it under another account's name stores one account
+// twice and leaves the named account out of the pool, so the add must say so.
+func TestClaudeAddWarnsWhenTokenBillsAnotherProfilesOrganization(t *testing.T) {
+	weeklyReset := time.Unix(1792076400, 0)
+	for _, tc := range []struct {
+		name        string
+		identities  map[string]claude.TokenIdentity
+		wantWarning []string
+	}{
+		{
+			name: "same organization and weekly window",
+			identities: map[string]claude.TokenIdentity{
+				otherTestSetupToken: {OrganizationID: "org-a", WeeklyResetAt: weeklyReset},
+				testSetupToken:      {OrganizationID: "org-a", WeeklyResetAt: weeklyReset},
+			},
+			wantWarning: []string{`"work@example.com"`, "same Claude organization", "same weekly limit window"},
+		},
+		{
+			name: "same organization only",
+			identities: map[string]claude.TokenIdentity{
+				otherTestSetupToken: {OrganizationID: "org-a", WeeklyResetAt: weeklyReset},
+				testSetupToken:      {OrganizationID: "org-a", WeeklyResetAt: weeklyReset.Add(time.Hour)},
+			},
+			wantWarning: []string{`"work@example.com"`, "same Claude organization"},
+		},
+		{
+			name: "different organizations",
+			identities: map[string]claude.TokenIdentity{
+				otherTestSetupToken: {OrganizationID: "org-a", WeeklyResetAt: weeklyReset},
+				testSetupToken:      {OrganizationID: "org-b", WeeklyResetAt: weeklyReset},
+			},
+		},
+		{
+			name: "organization unknown",
+			identities: map[string]claude.TokenIdentity{
+				otherTestSetupToken: {},
+				testSetupToken:      {},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			store := claude.Store{Dir: filepath.Join(root, "store")}
+			t.Setenv("PATH", root+string(os.PathListSeparator)+"/usr/bin"+string(os.PathListSeparator)+"/bin")
+			var out, errOut bytes.Buffer
+			runner := claudeRunner{
+				store:       store,
+				in:          strings.NewReader(""),
+				out:         &out,
+				errOut:      &errOut,
+				verifyToken: func(context.Context, string) error { return nil },
+				tokenIdentity: func(_ context.Context, token string) (claude.TokenIdentity, error) {
+					return tc.identities[token], nil
+				},
+			}
+			if err := runner.run(t.Context(), []string{"add", "--token", otherTestSetupToken, "work@example.com"}); err != nil {
+				t.Fatalf("add first profile: %v\n%s", err, errOut.String())
+			}
+			if errOut.Len() != 0 {
+				t.Fatalf("first profile warned with nothing to compare against: %s", errOut.String())
+			}
+			if err := runner.run(t.Context(), []string{"add", "--token", testSetupToken, "personal@example.com"}); err != nil {
+				t.Fatalf("add second profile: %v\n%s", err, errOut.String())
+			}
+			// The warning never blocks: two seats of one team plan share an
+			// organization legitimately.
+			if credential := readStoredClaudeCredential(t, store, "personal@example.com"); credential.AccessToken != testSetupToken {
+				t.Fatalf("stored credential = %+v", credential)
+			}
+			warning := errOut.String()
+			if len(tc.wantWarning) == 0 {
+				if warning != "" {
+					t.Fatalf("unexpected warning: %s", warning)
+				}
+				return
+			}
+			for _, want := range tc.wantWarning {
+				if !strings.Contains(warning, want) {
+					t.Fatalf("warning = %q, want it to contain %q", warning, want)
+				}
+			}
+			if tc.name == "same organization only" && strings.Contains(warning, "same weekly limit window") {
+				t.Fatalf("warning claims a shared weekly window that differs: %q", warning)
+			}
+			if strings.Contains(warning, testSetupToken) || strings.Contains(warning, otherTestSetupToken) {
+				t.Fatalf("warning leaked a token: %q", warning)
+			}
+		})
+	}
+}
+
+// Re-adding a profile replaces its own token; the token it is replacing is not
+// evidence of a duplicate.
+func TestClaudeReAddDoesNotCompareAgainstItsOwnProfile(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: filepath.Join(root, "store")}
+	t.Setenv("PATH", root+string(os.PathListSeparator)+"/usr/bin"+string(os.PathListSeparator)+"/bin")
+	var out, errOut bytes.Buffer
+	runner := claudeRunner{
+		store:       store,
+		in:          strings.NewReader(""),
+		out:         &out,
+		errOut:      &errOut,
+		verifyToken: func(context.Context, string) error { return nil },
+		tokenIdentity: func(context.Context, string) (claude.TokenIdentity, error) {
+			return claude.TokenIdentity{OrganizationID: "org-a"}, nil
+		},
+	}
+	for _, token := range []string{otherTestSetupToken, testSetupToken} {
+		if err := runner.run(t.Context(), []string{"add", "--token", token, "personal@example.com"}); err != nil {
+			t.Fatalf("add: %v\n%s", err, errOut.String())
+		}
+	}
+	if errOut.Len() != 0 {
+		t.Fatalf("re-add warned about its own profile: %s", errOut.String())
+	}
+}

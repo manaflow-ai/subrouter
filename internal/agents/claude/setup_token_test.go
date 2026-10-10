@@ -213,3 +213,27 @@ func TestVerifyAccessTokenClassifiesAnthropicAnswer(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestVerifyAccessTokenIdentityReadsOrganizationAndWeeklyReset(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("anthropic-organization-id", "org-a")
+		w.Header().Set("anthropic-ratelimit-unified-7d-reset", "1792076400")
+		// A weekly-exhausted account still identifies itself.
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	previous := messagesURL
+	messagesURL = server.URL
+	defer func() { messagesURL = previous }()
+
+	identity, err := VerifyAccessTokenIdentity(context.Background(), server.Client(), testSetupToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.OrganizationID != "org-a" {
+		t.Fatalf("organization = %q, want org-a", identity.OrganizationID)
+	}
+	if want := time.Unix(1792076400, 0); !identity.WeeklyResetAt.Equal(want) {
+		t.Fatalf("weekly reset = %v, want %v", identity.WeeklyResetAt, want)
+	}
+}
