@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -302,6 +303,43 @@ func (s Server) withClaudeCostOverlay(base selectacct.Scheduler) selectacct.Sche
 		scores = append(scores, score)
 	}
 	return base.WithScores(scores)
+}
+
+// claudeCostStore returns the server's Claude cost store, falling back to
+// the account ref's shared one.
+func (s Server) claudeCostStore() *claudeCostStore {
+	if s.claudeCosts != nil {
+		return s.claudeCosts
+	}
+	return s.AccountRef.claudeCostStore()
+}
+
+// claudeCostStore returns the ref's shared Claude cost store, creating it
+// under the store dir on first use so a sweep that starts before Handler
+// still sees revoked credentials. Nil when the ref has no store dir.
+func (r *AccountRef) claudeCostStore() *claudeCostStore {
+	if r == nil {
+		return nil
+	}
+	if costs := r.claudeCosts.Load(); costs != nil {
+		return costs
+	}
+	if r.store.Dir == "" {
+		return nil
+	}
+	r.claudeCosts.CompareAndSwap(nil, newClaudeCostStore(filepath.Join(r.store.Dir, "claude-cost-state.json")))
+	return r.claudeCosts.Load()
+}
+
+// claudeCredentialRevokedSince reports whether account is a Claude OAuth
+// account whose current credential Anthropic has revoked. The record is
+// keyed by credential, so a re-login clears it.
+func claudeCredentialRevokedSince(costs *claudeCostStore, account accounts.Account) (time.Time, bool) {
+	if costs == nil || account.ID == "" || accountProviderOrCodex(account) != accounts.ProviderClaude ||
+		account.AuthMode == accounts.AuthModeAPIKey {
+		return time.Time{}, false
+	}
+	return claudeRevokedSince(costs.snapshot(), account.ID, account.CredentialIdentity())
 }
 
 // claudeRevokedMessage matches Anthropic's 401 for a revoked OAuth token,
