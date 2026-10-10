@@ -443,3 +443,34 @@ func TestClaudeScopeDeniedUsageEndpointIsNotPolledAgain(t *testing.T) {
 		t.Fatalf("new credential inherited the scope denial: usage=%d", transport.usageCalls)
 	}
 }
+
+// The usage endpoint answers repeated scope-denied calls with a one-hour 429.
+// Once the credential is known to lack the scope, that throttle is void: the
+// probe must run instead of waiting it out.
+func TestClaudeScopeDenialClearsUsageEndpointThrottle(t *testing.T) {
+	transport := &supplementalProbeCounter{usageThrottle: true, probePrimary: true}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	account := probeAccount()
+
+	if _, _, _, throttled, err := ref.FetchUsageWindowsCachedWithObservation(context.Background(), client, account); err == nil || throttled {
+		// The first throttled fetch reports the error itself; the flag is set
+		// for the fetches that follow while the retry window is open.
+		t.Fatalf("first fetch err=%v throttled=%v; want the throttle error", err, throttled)
+	}
+	if _, _, _, throttled, _ := ref.FetchUsageWindowsCachedWithObservation(context.Background(), client, account); !throttled {
+		t.Fatal("usage endpoint throttle was not recorded")
+	}
+
+	ref.rememberClaudeUsageScopeDenied(account)
+	windows, fresh, _, throttled, err := ref.FetchUsageWindowsCachedWithObservation(context.Background(), client, account)
+	if err != nil || !fresh || throttled {
+		t.Fatalf("after scope denial fresh=%v throttled=%v err=%v; want a fresh unthrottled probe result", fresh, throttled, err)
+	}
+	if transport.usageCalls != 1 || transport.probeCalls != 1 {
+		t.Fatalf("usage=%d probe=%d; want the single throttled usage call and one probe", transport.usageCalls, transport.probeCalls)
+	}
+	if len(windows) == 0 {
+		t.Fatal("probe windows missing")
+	}
+}

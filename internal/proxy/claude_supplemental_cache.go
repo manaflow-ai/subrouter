@@ -32,6 +32,30 @@ func claudeSupplementalCacheKey(account accounts.Account) string {
 	return string(account.Provider) + "\x00" + account.ID + "\x00" + hex.EncodeToString(digest[:])
 }
 
+// claudeUsageScopeDeniedFor reports whether this exact credential was already
+// refused by the usage endpoint for lacking its scope. The key includes the
+// credential, so a re-login that carries the scope is asked afresh.
+func (r *AccountRef) claudeUsageScopeDeniedFor(account accounts.Account) bool {
+	r.usageWindowsMu.Lock()
+	defer r.usageWindowsMu.Unlock()
+	_, denied := r.claudeUsageScopeDenied[claudeSupplementalCacheKey(account)]
+	return denied
+}
+
+func (r *AccountRef) rememberClaudeUsageScopeDenied(account accounts.Account) {
+	r.usageWindowsMu.Lock()
+	defer r.usageWindowsMu.Unlock()
+	if r.claudeUsageScopeDenied == nil {
+		r.claudeUsageScopeDenied = map[string]struct{}{}
+	}
+	r.claudeUsageScopeDenied[claudeSupplementalCacheKey(account)] = struct{}{}
+	// A throttle recorded for this credential came from that same endpoint.
+	// It says nothing about the Messages probe, so it must not hold the
+	// probe back for the rest of its retry window.
+	cacheKey := account.ID + "\x00" + string(account.Provider)
+	delete(r.usageWindowsFailures, usageWindowsFailureKey(cacheKey, account.CredentialIdentity()))
+}
+
 func supplementalClaudeWindows(windows []accounts.UsageWindow) []accounts.UsageWindow {
 	out := make([]accounts.UsageWindow, 0, len(windows))
 	for _, window := range windows {
@@ -146,7 +170,20 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplemental(
 func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
 	ctx context.Context, client *http.Client, account accounts.Account,
 ) ([]accounts.UsageWindow, bool, error) {
-	usage, err := agentclaude.FetchUsage(ctx, client, account.Token)
+	var usage *agentclaude.UsageResponse
+	var err error
+	if r.claudeUsageScopeDeniedFor(account) {
+		// This credential cannot read the usage endpoint. Asking again only
+		// earns a 429 that would mark a healthy account throttled, so go
+		// straight to the Messages probe, whose headers are its usage source.
+		err = &agentclaude.UsageScopeError{Status: "403 Forbidden"}
+	} else {
+		usage, err = agentclaude.FetchUsage(ctx, client, account.Token)
+		var scope *agentclaude.UsageScopeError
+		if errors.As(err, &scope) {
+			r.rememberClaudeUsageScopeDenied(account)
+		}
+	}
 	windows := claudeUsageWindows(usage)
 	var throttle *agentclaude.UsageThrottleError
 	if errors.As(err, &throttle) {
