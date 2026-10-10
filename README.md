@@ -547,6 +547,27 @@ Remote server-pool launches need neither local Claude profiles nor a local
 Subrouter daemon; Claude arguments such as `--resume <session-id>` pass through
 unchanged.
 
+Pooled launches run Claude with its own config directory under
+`~/.subrouter/codex/claude-proxy/<id>/`, so Claude does not read
+`~/.claude/settings.json` there by itself. Subrouter carries your settings
+over in two ways. Each launch merges your settings into the private
+`--settings` file it hands Claude (credential-source keys such as
+`apiKeyHelper` are dropped, and Subrouter's routing values win). And the
+proxy directory's own `settings.json` gets your `permissions` rule lists
+(`allow`, `deny`, `ask`, `additionalDirectories`) and your `hooks`, so a
+Claude started there by anything other than `sr` still applies them. That
+second step runs every time `sr` prepares the directory: a new directory is
+seeded, and an existing one gains the rules and hook groups it is missing.
+Subrouter records what it added in `settings.subrouter-seeded.json` next to
+that file, so a rule you later delete from `~/.claude/settings.json`, or a hook
+command you edit, is removed from the proxy directory the next time `sr`
+prepares it. Entries the directory had for any other reason, such as a rule
+Claude saved during a pooled session, are never removed; other keys (`theme`,
+`autoMode`, `defaultMode`, choices made with `/config`) are left alone; and a
+file that does not parse is skipped. Set `SUBROUTER_CLAUDE_USER_SETTINGS=0` (or `false`,
+`off`) to launch pooled Claude without any of your settings and leave proxy
+`settings.json` files untouched.
+
 Overload (Anthropic 529 or another 5xx) should be rare and brief, and it is
 API-wide, so by default Subrouter waits it out on the session's own account,
 where its prompt cache lives: it retries after 1s, 2s, 4s and 8s, then every
