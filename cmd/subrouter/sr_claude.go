@@ -1317,6 +1317,10 @@ func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOption
 // profiles; it is advisory and must not hold up an add.
 const setupTokenIdentityCheckTimeout = 20 * time.Second
 
+// setupTokenIdentityCheckConcurrency caps how many stored profiles are probed
+// at once.
+const setupTokenIdentityCheckConcurrency = 4
+
 // warnSetupTokenSharesOrganization warns when the token being added bills the
 // same Claude organization as a different stored profile. `claude setup-token`
 // mints for whichever account the browser is signed in to, so a token saved
@@ -1336,6 +1340,9 @@ func (r claudeRunner) warnSetupTokenSharesOrganization(
 	defer cancel()
 	profiles := r.store.ListProfiles()
 	others := make([]claude.TokenIdentity, len(profiles))
+	// Each comparison is a real request on another account, so a large store
+	// must not turn one add into a burst.
+	slots := make(chan struct{}, setupTokenIdentityCheckConcurrency)
 	var wg sync.WaitGroup
 	for i, profile := range profiles {
 		if profile.Name == name {
@@ -1344,6 +1351,12 @@ func (r claudeRunner) warnSetupTokenSharesOrganization(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-ctx.Done():
+				return
+			}
 			credential, err := r.store.ReadCredential(ctx, r.store.PreferredInstancePath(r.store.InstancePath(profile.Name)))
 			if err != nil || credential == nil || credential.AccessToken == "" {
 				return
