@@ -189,7 +189,12 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
 		if err == nil {
 			r.rememberClaudeSupplemental(account, fableWindows)
 		}
-		if len(fableWindows) > 0 && (err == nil || fableProbeHasPrimaryWindows(fableWindows)) {
+		if err == nil {
+			// The usage endpoint is authoritative for account-wide 5h/7d. A
+			// probe rejection can carry exhausted 5h/7d headers for a healthy
+			// account, so only its model-scoped buckets may be merged.
+			windows = mergeUsageWindows(windows, supplementalClaudeWindows(fableWindows))
+		} else if fableProbeHasPrimaryWindows(fableWindows) {
 			windows = mergeUsageWindows(windows, fableWindows)
 		}
 	} else if err != nil {

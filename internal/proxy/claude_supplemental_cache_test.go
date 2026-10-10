@@ -21,6 +21,9 @@ type supplementalProbeCounter struct {
 	primaryUsed          float64
 	primaryIncludesFable bool
 	primaryFableUsed     float64
+	// probeRejectsPrimary makes the Messages probe answer with exhausted
+	// account-wide 5h/7d headers that contradict the usage endpoint.
+	probeRejectsPrimary bool
 }
 
 func (c *supplementalProbeCounter) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -48,6 +51,12 @@ func (c *supplementalProbeCounter) RoundTrip(req *http.Request) (*http.Response,
 			h.Set("anthropic-ratelimit-unified-7d_oi-status", "allowed")
 			h.Set("anthropic-ratelimit-unified-7d_oi-utilization", "0.3")
 			h.Set("anthropic-ratelimit-unified-7d_oi-reset", fmt.Sprint(time.Now().Add(72*time.Hour).Unix()))
+		}
+		if c.probeRejectsPrimary {
+			h.Set("anthropic-ratelimit-unified-5h-status", "rejected")
+			h.Set("anthropic-ratelimit-unified-5h-reset", fmt.Sprint(time.Now().Add(4*time.Hour).Unix()))
+			h.Set("anthropic-ratelimit-unified-7d-status", "rejected")
+			h.Set("anthropic-ratelimit-unified-7d-reset", fmt.Sprint(time.Now().Add(130*time.Hour).Unix()))
 		}
 		return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader("{}"))}, nil
 	default:
@@ -385,5 +394,41 @@ func TestClaudeSupplementalOlderThanPrimaryCadenceIsStale(t *testing.T) {
 	}
 	if transport.probeCalls != 1 {
 		t.Fatalf("stale supplemental evidence triggered an immediate probe: %d", transport.probeCalls)
+	}
+}
+
+// The Messages probe exists only to read the model-scoped Fable bucket. Its
+// account-wide 5h/7d headers must not overwrite a successful usage endpoint
+// reading: a probe rejection there falsely cooked healthy accounts as weekly
+// exhausted while claude.ai showed 0% used.
+func TestClaudeProbePrimaryHeadersDoNotOverrideUsageEndpoint(t *testing.T) {
+	transport := &supplementalProbeCounter{includeSupplemental: true, probeRejectsPrimary: true, primaryUsed: 0}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+
+	windows, _, err := ref.FetchUsageWindowsCached(context.Background(), client, probeAccount())
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if transport.probeCalls != 1 {
+		t.Fatalf("probe calls=%d; want 1", transport.probeCalls)
+	}
+	for _, window := range windows {
+		switch window.Name {
+		case "5h":
+			if window.UsedPercent != 0 {
+				t.Fatalf("probe overrode usage endpoint 5h: %+v", window)
+			}
+		case "7d":
+			if window.UsedPercent != 12 {
+				t.Fatalf("probe overrode usage endpoint 7d: %+v", window)
+			}
+		}
+	}
+	if window, cooked := accounts.WeeklyCookedWindow(windows); cooked {
+		t.Fatalf("account cooked from probe headers: %+v", window)
+	}
+	if _, ok := fableUsageWindow(windows); !ok {
+		t.Fatal("Fable window from the probe was dropped")
 	}
 }
