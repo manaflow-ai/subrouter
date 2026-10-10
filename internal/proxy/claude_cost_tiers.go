@@ -304,6 +304,29 @@ func (s Server) withClaudeCostOverlay(base selectacct.Scheduler) selectacct.Sche
 	return base.WithScores(scores)
 }
 
+// claudeCostStore returns the server's Claude cost store, falling back to
+// the one Handler attached to the account ref.
+func (s Server) claudeCostStore() *claudeCostStore {
+	if s.claudeCosts != nil {
+		return s.claudeCosts
+	}
+	if s.AccountRef != nil {
+		return s.AccountRef.claudeCosts.Load()
+	}
+	return nil
+}
+
+// claudeCredentialRevokedSince reports whether account is a Claude OAuth
+// account whose current credential Anthropic has revoked. The record is
+// keyed by credential, so a re-login clears it.
+func claudeCredentialRevokedSince(costs *claudeCostStore, account accounts.Account) (time.Time, bool) {
+	if costs == nil || account.ID == "" || accountProviderOrCodex(account) != accounts.ProviderClaude ||
+		account.AuthMode == accounts.AuthModeAPIKey {
+		return time.Time{}, false
+	}
+	return claudeRevokedSince(costs.snapshot(), account.ID, account.CredentialIdentity())
+}
+
 // claudeRevokedMessage matches Anthropic's 401 for a revoked OAuth token,
 // e.g. "OAuth access token has been revoked."
 func claudeRevokedMessage(body []byte) bool {

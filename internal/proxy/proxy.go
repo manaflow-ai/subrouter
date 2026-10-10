@@ -487,6 +487,10 @@ type AccountRef struct {
 	// decisions (warn mode) by account ID, for /_subrouter/usage-status.
 	resetAdviceMu sync.Mutex
 	resetAdvice   map[string]ResetCreditAdvice
+
+	// claudeCosts is the server's Claude cost store, attached by Handler so
+	// the usage-status sweep can skip credentials Anthropic has revoked.
+	claudeCosts atomic.Pointer[claudeCostStore]
 }
 
 func (r *AccountRef) qwenRoot() string {
@@ -1830,7 +1834,7 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 			r.lastGoodUsage[key] = usageStatusSnapshot{status: status, at: snapshotAt}
 			continue
 		}
-		if authLikeUsageError(status.Error) {
+		if authLikeUsageError(status.Error) || !status.RevokedSince.IsZero() {
 			continue
 		}
 		snapshot, ok := r.lastGoodUsage[key]
@@ -2288,6 +2292,14 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.AuthValid = true
 			next.PlanType = details.PlanType()
 			r.replace(account)
+			if since, revoked := claudeCredentialRevokedSince(r.claudeCosts.Load(), account); revoked {
+				// Anthropic answers a revoked token's usage probe with 429, so
+				// polling it only adds noise and a misleading throttle flag.
+				// A re-login changes the credential and resumes polling.
+				next.RevokedSince = since.UTC()
+				out[i] = next
+				return
+			}
 			windows, fresh, fetchedAt, throttled, err := r.FetchUsageWindowsCachedWithObservation(sweepCtx, r.client, account)
 			if err != nil {
 				next.Error = err.Error()
@@ -2793,6 +2805,9 @@ func (s Server) Handler() http.Handler {
 	}
 	if s.claudeCosts == nil && s.AccountRef != nil {
 		s.claudeCosts = newClaudeCostStore(filepath.Join(s.AccountRef.store.Dir, "claude-cost-state.json"))
+	}
+	if s.claudeCosts != nil && s.AccountRef != nil {
+		s.AccountRef.claudeCosts.CompareAndSwap(nil, s.claudeCosts)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
@@ -4833,6 +4848,14 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 				// Successful refresh proves authentication, not quota recovery. Keep
 				// the seed and publish no positive quota evidence so a request-time
 				// exhaustion overlay remains effective until its own expiry.
+				return
+			}
+			if _, revoked := claudeCredentialRevokedSince(s.claudeCostStore(), refreshed); revoked {
+				// The revoked overlay already keeps this account out of
+				// routing; probing usage only draws 429s until re-login.
+				scoreMu.Lock()
+				setZeroScore(scores, scoreByID, schedulerAccountProvider(account.Provider), account.ID)
+				scoreMu.Unlock()
 				return
 			}
 			windows, fresh, err := s.fetchAccountUsageWindows(sweepCtx, client, refreshed)
