@@ -96,6 +96,10 @@ type claudeRunner struct {
 	// verifyToken proves a pasted setup token against Anthropic before it is
 	// stored. nil selects claude.VerifyAccessToken with the runner's client.
 	verifyToken func(ctx context.Context, token string) error
+	// tokenIdentity reports which Claude organization a token bills against.
+	// nil selects claude.VerifyAccessTokenIdentity with the runner's client,
+	// unless verifyToken is stubbed, in which case no identity is probed.
+	tokenIdentity func(ctx context.Context, token string) (claude.TokenIdentity, error)
 	// now is the clock used to stamp a setup token's expiry. nil selects
 	// time.Now.
 	now func() time.Time
