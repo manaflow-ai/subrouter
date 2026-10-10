@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -305,15 +306,29 @@ func (s Server) withClaudeCostOverlay(base selectacct.Scheduler) selectacct.Sche
 }
 
 // claudeCostStore returns the server's Claude cost store, falling back to
-// the one Handler attached to the account ref.
+// the account ref's shared one.
 func (s Server) claudeCostStore() *claudeCostStore {
 	if s.claudeCosts != nil {
 		return s.claudeCosts
 	}
-	if s.AccountRef != nil {
-		return s.AccountRef.claudeCosts.Load()
+	return s.AccountRef.claudeCostStore()
+}
+
+// claudeCostStore returns the ref's shared Claude cost store, creating it
+// under the store dir on first use so a sweep that starts before Handler
+// still sees revoked credentials. Nil when the ref has no store dir.
+func (r *AccountRef) claudeCostStore() *claudeCostStore {
+	if r == nil {
+		return nil
 	}
-	return nil
+	if costs := r.claudeCosts.Load(); costs != nil {
+		return costs
+	}
+	if r.store.Dir == "" {
+		return nil
+	}
+	r.claudeCosts.CompareAndSwap(nil, newClaudeCostStore(filepath.Join(r.store.Dir, "claude-cost-state.json")))
+	return r.claudeCosts.Load()
 }
 
 // claudeCredentialRevokedSince reports whether account is a Claude OAuth

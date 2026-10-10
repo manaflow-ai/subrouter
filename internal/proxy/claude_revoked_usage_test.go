@@ -23,14 +23,15 @@ func TestScoreAccountsSkipsRevokedClaudeCredentialUntilRelogin(t *testing.T) {
 	transport := &usageRoundTripper{responses: []*http.Response{usage429Response(), usageOKResponse()}}
 	ref := cacheTestAccountRef(t, transport)
 	account := accounts.Account{ID: "claude@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok"}
-	costs := newClaudeCostStore(filepath.Join(t.TempDir(), "costs.json"))
+	// The background refresher runs on a Server copy that may sweep before
+	// Handler, so the store comes from the ref, not the Server.
+	costs := ref.claudeCostStore()
 	// The refreshed account carries the on-disk credential version.
 	costs.markRevoked(account.ID, accountpkg.OAuthCredentialVersion("tok", "ref"))
 	costs.loadedAt = time.Time{}
 
 	server := Server{
-		AccountRef:  ref,
-		claudeCosts: costs,
+		AccountRef: ref,
 		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
 			{AccountID: account.ID, Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
 		})),

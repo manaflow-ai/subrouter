@@ -488,8 +488,9 @@ type AccountRef struct {
 	resetAdviceMu sync.Mutex
 	resetAdvice   map[string]ResetCreditAdvice
 
-	// claudeCosts is the server's Claude cost store, attached by Handler so
-	// the usage-status sweep can skip credentials Anthropic has revoked.
+	// claudeCosts is the Claude cost store shared by every Server copy over
+	// this ref (see claudeCostStore), so background sweeps can skip
+	// credentials Anthropic has revoked whether or not Handler ran first.
 	claudeCosts atomic.Pointer[claudeCostStore]
 }
 
@@ -2292,7 +2293,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.AuthValid = true
 			next.PlanType = details.PlanType()
 			r.replace(account)
-			if since, revoked := claudeCredentialRevokedSince(r.claudeCosts.Load(), account); revoked {
+			if since, revoked := claudeCredentialRevokedSince(r.claudeCostStore(), account); revoked {
 				// Anthropic answers a revoked token's usage probe with 429, so
 				// polling it only adds noise and a misleading throttle flag.
 				// A re-login changes the credential and resumes polling.
@@ -2804,9 +2805,11 @@ func (s Server) Handler() http.Handler {
 		s.claudeWebBalances = newClaudeWebBalanceStore(filepath.Join(s.AccountRef.store.Dir, "claude-web-balances.json"))
 	}
 	if s.claudeCosts == nil && s.AccountRef != nil {
-		s.claudeCosts = newClaudeCostStore(filepath.Join(s.AccountRef.store.Dir, "claude-cost-state.json"))
-	}
-	if s.claudeCosts != nil && s.AccountRef != nil {
+		s.claudeCosts = s.AccountRef.claudeCostStore()
+		if s.claudeCosts == nil {
+			s.claudeCosts = newClaudeCostStore(filepath.Join(s.AccountRef.store.Dir, "claude-cost-state.json"))
+		}
+	} else if s.claudeCosts != nil && s.AccountRef != nil {
 		s.AccountRef.claudeCosts.CompareAndSwap(nil, s.claudeCosts)
 	}
 	mux := http.NewServeMux()
