@@ -17,6 +17,8 @@ type supplementalProbeCounter struct {
 	usageCalls           int
 	probeCalls           int
 	usageThrottle        bool
+	usageScopeDenied     bool
+	probePrimary         bool
 	includeSupplemental  bool
 	primaryUsed          float64
 	primaryIncludesFable bool
@@ -27,6 +29,11 @@ func (c *supplementalProbeCounter) RoundTrip(req *http.Request) (*http.Response,
 	switch {
 	case strings.HasSuffix(req.URL.Path, "/api/oauth/usage"):
 		c.usageCalls++
+		if c.usageScopeDenied {
+			// Anthropic's answer to a setup token, which carries user:inference only.
+			body := `{"type":"error","error":{"type":"permission_error","message":"OAuth token does not meet scope requirement user:profile","details":{"error_code":"oauth_scope_insufficient"}}}`
+			return &http.Response{StatusCode: http.StatusForbidden, Status: "403 Forbidden", Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+		}
 		if c.usageThrottle {
 			return &http.Response{
 				StatusCode: http.StatusTooManyRequests,
@@ -44,6 +51,14 @@ func (c *supplementalProbeCounter) RoundTrip(req *http.Request) (*http.Response,
 	case strings.HasSuffix(req.URL.Path, "/v1/messages"):
 		c.probeCalls++
 		h := make(http.Header)
+		if c.probePrimary {
+			h.Set("anthropic-ratelimit-unified-5h-status", "allowed")
+			h.Set("anthropic-ratelimit-unified-5h-utilization", "0.1")
+			h.Set("anthropic-ratelimit-unified-5h-reset", fmt.Sprint(time.Now().Add(4*time.Hour).Unix()))
+			h.Set("anthropic-ratelimit-unified-7d-status", "allowed")
+			h.Set("anthropic-ratelimit-unified-7d-utilization", "0.04")
+			h.Set("anthropic-ratelimit-unified-7d-reset", fmt.Sprint(time.Now().Add(72*time.Hour).Unix()))
+		}
 		if c.includeSupplemental {
 			h.Set("anthropic-ratelimit-unified-7d_oi-status", "allowed")
 			h.Set("anthropic-ratelimit-unified-7d_oi-utilization", "0.3")
@@ -385,5 +400,46 @@ func TestClaudeSupplementalOlderThanPrimaryCadenceIsStale(t *testing.T) {
 	}
 	if transport.probeCalls != 1 {
 		t.Fatalf("stale supplemental evidence triggered an immediate probe: %d", transport.probeCalls)
+	}
+}
+
+// A setup token carries only user:inference, so the usage endpoint answers 403
+// for the token's whole life. Asking again cannot succeed, and Anthropic
+// answers a few such calls with a one-hour 429 that then marks a healthy
+// account throttled. The Messages probe headers are that account's only
+// usage source.
+func TestClaudeScopeDeniedUsageEndpointIsNotPolledAgain(t *testing.T) {
+	transport := &supplementalProbeCounter{usageScopeDenied: true, probePrimary: true, includeSupplemental: true}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	account := probeAccount()
+
+	for fetch := 1; fetch <= 3; fetch++ {
+		windows, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
+		if err != nil || !fresh {
+			t.Fatalf("fetch %d fresh=%v err=%v", fetch, fresh, err)
+		}
+		var weekly bool
+		for _, window := range windows {
+			if window.Name == "7d" && window.UsedPercent == 4 {
+				weekly = true
+			}
+		}
+		if !weekly {
+			t.Fatalf("fetch %d lost the probe's weekly window: %+v", fetch, windows)
+		}
+		if transport.usageCalls != 1 || transport.probeCalls != fetch {
+			t.Fatalf("fetch %d usage=%d probe=%d; want usage=1 probe=%d", fetch, transport.usageCalls, transport.probeCalls, fetch)
+		}
+		expirePrimaryClaudeUsageForTest(t, ref, account)
+	}
+
+	// A different credential for the same account may carry the scope.
+	account.Token = "oauth-login-token"
+	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err != nil {
+		t.Fatal(err)
+	}
+	if transport.usageCalls != 2 {
+		t.Fatalf("new credential inherited the scope denial: usage=%d", transport.usageCalls)
 	}
 }
