@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -194,7 +195,14 @@ func VerifyAccessTokenIdentity(ctx context.Context, client *http.Client, accessT
 	if res.StatusCode >= 500 {
 		return TokenIdentity{}, fmt.Errorf("Claude setup token verification failed: %s", res.Status)
 	}
-	return TokenIdentity{}, nil
+	identity := TokenIdentity{
+		OrganizationID: strings.TrimSpace(res.Header.Get("anthropic-organization-id")),
+	}
+	rawReset := strings.TrimSpace(res.Header.Get("anthropic-ratelimit-unified-7d-reset"))
+	if epoch, err := strconv.ParseInt(rawReset, 10, 64); err == nil && epoch > 0 {
+		identity.WeeklyResetAt = time.Unix(epoch, 0)
+	}
+	return identity, nil
 }
 
 func newFableProbeRequest(ctx context.Context, accessToken string) (*http.Request, error) {
