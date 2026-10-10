@@ -472,7 +472,13 @@ type AccountRef struct {
 	usageWindowsLatest   map[string]string
 	usageWindowsFailures map[string]usageWindowsFailure
 	claudeSupplemental   map[string]claudeSupplementalUsage
-	usageWindowsEpoch    uint64
+	// claudeUsageScopeDenied holds credentials the Claude usage endpoint has
+	// refused for lacking its scope (setup tokens). Guarded by usageWindowsMu.
+	claudeUsageScopeDenied map[string]struct{}
+	// claudeUsageScopeChecked holds credentials whose recorded scopes were
+	// already read from the store, so the read happens once per credential.
+	claudeUsageScopeChecked map[string]struct{}
+	usageWindowsEpoch       uint64
 
 	credFailMu sync.Mutex
 	credFail   map[string]credFailure

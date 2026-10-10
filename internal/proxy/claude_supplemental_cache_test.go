@@ -17,6 +17,9 @@ type supplementalProbeCounter struct {
 	usageCalls           int
 	probeCalls           int
 	usageThrottle        bool
+	usageScopeDenied     bool
+	probePrimary         bool
+	probeEmpty           bool
 	includeSupplemental  bool
 	primaryUsed          float64
 	primaryIncludesFable bool
@@ -27,6 +30,11 @@ func (c *supplementalProbeCounter) RoundTrip(req *http.Request) (*http.Response,
 	switch {
 	case strings.HasSuffix(req.URL.Path, "/api/oauth/usage"):
 		c.usageCalls++
+		if c.usageScopeDenied {
+			// Anthropic's answer to a setup token, which carries user:inference only.
+			body := `{"type":"error","error":{"type":"permission_error","message":"OAuth token does not meet scope requirement user:profile","details":{"error_code":"oauth_scope_insufficient"}}}`
+			return &http.Response{StatusCode: http.StatusForbidden, Status: "403 Forbidden", Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+		}
 		if c.usageThrottle {
 			return &http.Response{
 				StatusCode: http.StatusTooManyRequests,
@@ -44,6 +52,18 @@ func (c *supplementalProbeCounter) RoundTrip(req *http.Request) (*http.Response,
 	case strings.HasSuffix(req.URL.Path, "/v1/messages"):
 		c.probeCalls++
 		h := make(http.Header)
+		if c.probeEmpty {
+			// A headerless overload answer carries no limits at all.
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests", Header: h, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+		}
+		if c.probePrimary {
+			h.Set("anthropic-ratelimit-unified-5h-status", "allowed")
+			h.Set("anthropic-ratelimit-unified-5h-utilization", "0.1")
+			h.Set("anthropic-ratelimit-unified-5h-reset", fmt.Sprint(time.Now().Add(4*time.Hour).Unix()))
+			h.Set("anthropic-ratelimit-unified-7d-status", "allowed")
+			h.Set("anthropic-ratelimit-unified-7d-utilization", "0.04")
+			h.Set("anthropic-ratelimit-unified-7d-reset", fmt.Sprint(time.Now().Add(72*time.Hour).Unix()))
+		}
 		if c.includeSupplemental {
 			h.Set("anthropic-ratelimit-unified-7d_oi-status", "allowed")
 			h.Set("anthropic-ratelimit-unified-7d_oi-utilization", "0.3")
@@ -385,5 +405,137 @@ func TestClaudeSupplementalOlderThanPrimaryCadenceIsStale(t *testing.T) {
 	}
 	if transport.probeCalls != 1 {
 		t.Fatalf("stale supplemental evidence triggered an immediate probe: %d", transport.probeCalls)
+	}
+}
+
+// A setup token carries only user:inference, so the usage endpoint answers 403
+// for the token's whole life. Asking again cannot succeed, and Anthropic
+// answers a few such calls with a one-hour 429 that then marks a healthy
+// account throttled. The Messages probe headers are that account's only
+// usage source.
+func TestClaudeScopeDeniedUsageEndpointIsNotPolledAgain(t *testing.T) {
+	transport := &supplementalProbeCounter{usageScopeDenied: true, probePrimary: true, includeSupplemental: true}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	account := probeAccount()
+
+	for fetch := 1; fetch <= 3; fetch++ {
+		windows, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
+		if err != nil || !fresh {
+			t.Fatalf("fetch %d fresh=%v err=%v", fetch, fresh, err)
+		}
+		var weekly bool
+		for _, window := range windows {
+			if window.Name == "7d" && window.UsedPercent == 4 {
+				weekly = true
+			}
+		}
+		if !weekly {
+			t.Fatalf("fetch %d lost the probe's weekly window: %+v", fetch, windows)
+		}
+		if transport.usageCalls != 1 || transport.probeCalls != fetch {
+			t.Fatalf("fetch %d usage=%d probe=%d; want usage=1 probe=%d", fetch, transport.usageCalls, transport.probeCalls, fetch)
+		}
+		expirePrimaryClaudeUsageForTest(t, ref, account)
+	}
+
+	// A different credential for the same account may carry the scope.
+	account.Token = "oauth-login-token"
+	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err != nil {
+		t.Fatal(err)
+	}
+	if transport.usageCalls != 2 {
+		t.Fatalf("new credential inherited the scope denial: usage=%d", transport.usageCalls)
+	}
+}
+
+// The usage endpoint answers repeated scope-denied calls with a one-hour 429.
+// Once the credential is known to lack the scope, that throttle is void: the
+// probe must run instead of waiting it out.
+func TestClaudeScopeDenialClearsUsageEndpointThrottle(t *testing.T) {
+	transport := &supplementalProbeCounter{usageThrottle: true, probePrimary: true}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	account := probeAccount()
+
+	if _, _, _, throttled, err := ref.FetchUsageWindowsCachedWithObservation(context.Background(), client, account); err == nil || throttled {
+		// The first throttled fetch reports the error itself; the flag is set
+		// for the fetches that follow while the retry window is open.
+		t.Fatalf("first fetch err=%v throttled=%v; want the throttle error", err, throttled)
+	}
+	if _, _, _, throttled, _ := ref.FetchUsageWindowsCachedWithObservation(context.Background(), client, account); !throttled {
+		t.Fatal("usage endpoint throttle was not recorded")
+	}
+
+	ref.rememberClaudeUsageScopeDenied(account)
+	windows, fresh, _, throttled, err := ref.FetchUsageWindowsCachedWithObservation(context.Background(), client, account)
+	if err != nil || !fresh || throttled {
+		t.Fatalf("after scope denial fresh=%v throttled=%v err=%v; want a fresh unthrottled probe result", fresh, throttled, err)
+	}
+	if transport.usageCalls != 1 || transport.probeCalls != 1 {
+		t.Fatalf("usage=%d probe=%d; want the single throttled usage call and one probe", transport.usageCalls, transport.probeCalls)
+	}
+	if len(windows) == 0 {
+		t.Fatal("probe windows missing")
+	}
+}
+
+// The routing-score sweep has no credential details, only the account. A setup
+// token's recorded scopes must still keep it off the usage endpoint there.
+func TestClaudeSetupTokenNeverReachesUsageEndpoint(t *testing.T) {
+	store := agentclaude.Store{Dir: t.TempDir()}
+	const name = "setup@example.com"
+	const token = "sk-ant-oat01-TESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOK-FAKEFAKEAA"
+	if err := store.ImportProfileCredential(name, agentclaude.SetupTokenCredential(token, time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	transport := &supplementalProbeCounter{usageScopeDenied: true, probePrimary: true}
+	ref := &AccountRef{claudeStore: store}
+	client := &http.Client{Transport: transport}
+	account := accounts.Account{
+		ID: name, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth,
+		Token: token, Source: store.ClaudeConfigDir(name),
+	}
+
+	windows, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
+	if err != nil || !fresh || len(windows) == 0 {
+		t.Fatalf("fresh=%v err=%v windows=%+v", fresh, err, windows)
+	}
+	if transport.usageCalls != 0 || transport.probeCalls != 1 {
+		t.Fatalf("usage=%d probe=%d; want no usage call and one probe", transport.usageCalls, transport.probeCalls)
+	}
+}
+
+// The Messages probe comes back without limits on a transient overload. For a
+// credential whose only usage source is that probe, the miss must not read as
+// an authentication failure, which would zero the account's routing score and
+// discard its last known usage.
+func TestClaudeScopeDeniedEmptyProbeKeepsLastKnownUsage(t *testing.T) {
+	transport := &supplementalProbeCounter{usageScopeDenied: true, probePrimary: true}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	account := probeAccount()
+
+	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err != nil {
+		t.Fatal(err)
+	}
+	expirePrimaryClaudeUsageForTest(t, ref, account)
+	transport.probeEmpty = true
+
+	windows, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
+	if err != nil {
+		t.Fatalf("empty probe err=%v; want the last known usage", err)
+	}
+	if fresh || len(windows) == 0 {
+		t.Fatalf("fresh=%v windows=%+v; want stale last known windows", fresh, windows)
+	}
+
+	// With nothing cached, the error must still not look like bad auth or a throttle.
+	_, _, err = (&AccountRef{}).FetchUsageWindowsCached(context.Background(), &http.Client{Transport: &supplementalProbeCounter{usageScopeDenied: true, probeEmpty: true}}, account)
+	if err == nil {
+		t.Fatal("expected an error with no usage source at all")
+	}
+	if authLikeUsageError(err.Error()) || usageWindowsIsThrottle(err) {
+		t.Fatalf("error %q reads as an auth failure or a throttle", err)
 	}
 }

@@ -80,6 +80,24 @@ func (credential *CredentialInfo) LongLived() bool {
 	return credential != nil && credential.AccessToken != "" && credential.RefreshToken == ""
 }
 
+// usageEndpointScope is the scope Anthropic's OAuth usage endpoint requires.
+const usageEndpointScope = "user:profile"
+
+// LacksUsageScope reports whether the recorded scopes rule out the usage
+// endpoint, as a setup token's do. A credential with no recorded scopes is
+// unknown, not denied.
+func (credential *CredentialInfo) LacksUsageScope() bool {
+	if credential == nil || len(credential.Scopes) == 0 {
+		return false
+	}
+	for _, scope := range credential.Scopes {
+		if scope == usageEndpointScope {
+			return false
+		}
+	}
+	return true
+}
+
 // ExpiresAtTime returns the recorded expiry, if any.
 func (credential *CredentialInfo) ExpiresAtTime() (time.Time, bool) {
 	if credential == nil || credential.ExpiresAt <= 0 {

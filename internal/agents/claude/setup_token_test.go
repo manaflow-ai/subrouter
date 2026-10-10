@@ -3,6 +3,7 @@ package claude
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -213,6 +214,50 @@ func TestVerifyAccessTokenClassifiesAnthropicAnswer(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestFetchUsageReportsScopeDenialDistinctly(t *testing.T) {
+	var body string
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusForbidden,
+			Status:     "403 Forbidden",
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
+
+	body = `{"type":"error","error":{"type":"permission_error","message":"OAuth token does not meet scope requirement user:profile","details":{"error_code":"oauth_scope_insufficient"}}}`
+	_, err := FetchUsage(context.Background(), client, testSetupToken)
+	var scope *UsageScopeError
+	if !errors.As(err, &scope) {
+		t.Fatalf("scope 403 err = %v, want UsageScopeError", err)
+	}
+	if err.Error() != "usage fetch failed: 403 Forbidden" {
+		t.Fatalf("scope error message = %q, want the generic usage failure text", err.Error())
+	}
+
+	// Any other 403 may be transient or account-level; it must keep being retried.
+	body = `{"type":"error","error":{"type":"permission_error","message":"account disabled"}}`
+	_, err = FetchUsage(context.Background(), client, testSetupToken)
+	if err == nil || errors.As(err, &scope) {
+		t.Fatalf("plain 403 err = %v, want a generic failure", err)
+	}
+}
+
+func TestLacksUsageScopeOnlyForRecordedScopesWithoutProfile(t *testing.T) {
+	setup := SetupTokenCredential(testSetupToken, time.Now())
+	if !setup.LacksUsageScope() {
+		t.Fatal("a setup token carries only user:inference and cannot read usage")
+	}
+	login := CredentialInfo{AccessToken: "a", RefreshToken: "r", Scopes: []string{"user:inference", "user:profile"}}
+	if login.LacksUsageScope() {
+		t.Fatal("a login credential with user:profile can read usage")
+	}
+	unknown := CredentialInfo{AccessToken: "a", RefreshToken: "r"}
+	if unknown.LacksUsageScope() {
+		t.Fatal("a credential with no recorded scopes must still be asked")
+	}
+}
 
 func TestVerifyAccessTokenIdentityReadsOrganizationAndWeeklyReset(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

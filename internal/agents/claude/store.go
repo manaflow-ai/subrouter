@@ -4301,6 +4301,18 @@ func usageThrottleRetryAt(raw string, now time.Time) time.Time {
 	return now.Add(usageThrottleFallbackWait)
 }
 
+// UsageScopeError means the token lacks the scope the usage endpoint requires.
+// A setup token carries only user:inference, so for it this is permanent: no
+// later call with the same token can succeed. Its message matches the generic
+// usage failure so existing error classification is unchanged.
+type UsageScopeError struct {
+	Status string
+}
+
+func (e *UsageScopeError) Error() string {
+	return "usage fetch failed: " + e.Status
+}
+
 func FetchUsage(ctx context.Context, client *http.Client, accessToken string) (*UsageResponse, error) {
 	if accessToken == "" {
 		return nil, nil
@@ -4326,6 +4338,12 @@ func FetchUsage(ctx context.Context, client *http.Client, accessToken string) (*
 			Status:  res.Status,
 			RetryAt: usageThrottleRetryAt(res.Header.Get("Retry-After"), now),
 			Windows: usageWindowsFromFableHeaders(res.Header, now),
+		}
+	}
+	if res.StatusCode == http.StatusForbidden {
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 8<<10))
+		if bytes.Contains(body, []byte("oauth_scope_insufficient")) {
+			return nil, &UsageScopeError{Status: res.Status}
 		}
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
