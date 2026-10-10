@@ -472,6 +472,10 @@ type AccountRef struct {
 	usageWindowsLatest   map[string]string
 	usageWindowsFailures map[string]usageWindowsFailure
 	claudeSupplemental   map[string]claudeSupplementalUsage
+	// claudeQuotaProbeAt rate-limits forced Messages header probes used to
+	// reverify a weekly-cooked account while its usage endpoint is throttled.
+	// Guarded by usageWindowsMu and scoped to the credential identity.
+	claudeQuotaProbeAt map[string]time.Time
 	// claudeUsageScopeDenied holds credentials the Claude usage endpoint has
 	// refused for lacking its scope (setup tokens). Guarded by usageWindowsMu.
 	claudeUsageScopeDenied map[string]struct{}
@@ -678,6 +682,34 @@ func usageWindowsIsThrottle(err error) bool {
 
 const usageWindowsTTL = 2 * time.Minute
 const usageWindowsLastGoodTTL = 15 * time.Minute
+
+func (r *AccountRef) claudeUsageThrottleActive(account accounts.Account, now time.Time) bool {
+	if r == nil || account.Provider != accounts.ProviderClaude {
+		return false
+	}
+	key := usageWindowsFailureKey(account.ID+"\x00"+string(account.Provider), account.CredentialIdentity())
+	r.usageWindowsMu.Lock()
+	failure, throttled := r.usageWindowsFailures[key]
+	r.usageWindowsMu.Unlock()
+	return throttled && now.Before(failure.retryAt)
+}
+
+func (r *AccountRef) claimClaudeQuotaProbe(account accounts.Account, now time.Time) bool {
+	if r == nil || !r.claudeUsageThrottleActive(account, now) {
+		return false
+	}
+	key := usageWindowsCredentialKey(account)
+	r.usageWindowsMu.Lock()
+	defer r.usageWindowsMu.Unlock()
+	if last, ok := r.claudeQuotaProbeAt[key]; ok && now.Sub(last) < usageWindowsThrottleTTL {
+		return false
+	}
+	if r.claudeQuotaProbeAt == nil {
+		r.claudeQuotaProbeAt = make(map[string]time.Time)
+	}
+	r.claudeQuotaProbeAt[key] = now
+	return true
+}
 
 // Keep one account's refresh and usage request from holding an interactive
 // status sweep open indefinitely. The sweep runs accounts concurrently, so a
@@ -4805,12 +4837,19 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 		if account.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
-		if s.SchedulerRef != nil && !s.SchedulerRef.UpdatedAt().IsZero() {
-			if _, blocked := knownAccountWideQuotaReset(current.ScoreFor(schedulerAccountProvider(account.Provider), account.ID), time.Now()); blocked {
-				// The provider has already supplied every binding account-wide
-				// reset time. Preserve the measured state without a new probe.
-				// A re-login invalidates the score timestamp and bypasses this.
-				continue
+		reverifyClaudeQuota := false
+		if s.SchedulerRef != nil {
+			currentScore := current.ScoreFor(schedulerAccountProvider(account.Provider), account.ID)
+			if _, blocked := knownAccountWideQuotaReset(currentScore, time.Now()); blocked {
+				if account.Provider == accounts.ProviderClaude && currentScore.WeeklyCooked() &&
+					s.AccountRef.claimClaudeQuotaProbe(account, time.Now()) {
+					reverifyClaudeQuota = true
+				} else if !s.SchedulerRef.UpdatedAt().IsZero() {
+					// The provider has already supplied every binding account-wide
+					// reset time. Preserve the measured state without a new probe.
+					// A re-login invalidates the score timestamp and bypasses this.
+					continue
+				}
 			}
 		}
 		if failure, dead := s.AccountRef.terminalCredFailure(account); dead {
@@ -4861,7 +4900,17 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 				scoreMu.Unlock()
 				return
 			}
-			windows, fresh, err := s.fetchAccountUsageWindows(sweepCtx, client, refreshed)
+			var windows []accounts.UsageWindow
+			var fresh bool
+			if reverifyClaudeQuota {
+				windows, err = agentclaude.FetchFableUsageWindows(sweepCtx, client, refreshed.Token)
+				fresh = err == nil && fableProbeHasPrimaryWindows(windows)
+				if err == nil && !fresh {
+					return
+				}
+			} else {
+				windows, fresh, err = s.fetchAccountUsageWindows(sweepCtx, client, refreshed)
+			}
 			if err != nil {
 				if s.Logger != nil {
 					s.Logger.Warn("account reload usage fetch failed", "account", account.ID, "error", err)
