@@ -19,6 +19,7 @@ type supplementalProbeCounter struct {
 	usageThrottle        bool
 	usageScopeDenied     bool
 	probePrimary         bool
+	probeEmpty           bool
 	includeSupplemental  bool
 	primaryUsed          float64
 	primaryIncludesFable bool
@@ -51,6 +52,10 @@ func (c *supplementalProbeCounter) RoundTrip(req *http.Request) (*http.Response,
 	case strings.HasSuffix(req.URL.Path, "/v1/messages"):
 		c.probeCalls++
 		h := make(http.Header)
+		if c.probeEmpty {
+			// A headerless overload answer carries no limits at all.
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests", Header: h, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+		}
 		if c.probePrimary {
 			h.Set("anthropic-ratelimit-unified-5h-status", "allowed")
 			h.Set("anthropic-ratelimit-unified-5h-utilization", "0.1")
@@ -472,5 +477,65 @@ func TestClaudeScopeDenialClearsUsageEndpointThrottle(t *testing.T) {
 	}
 	if len(windows) == 0 {
 		t.Fatal("probe windows missing")
+	}
+}
+
+// The routing-score sweep has no credential details, only the account. A setup
+// token's recorded scopes must still keep it off the usage endpoint there.
+func TestClaudeSetupTokenNeverReachesUsageEndpoint(t *testing.T) {
+	store := agentclaude.Store{Dir: t.TempDir()}
+	const name = "setup@example.com"
+	const token = "sk-ant-oat01-TESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOK-FAKEFAKEAA"
+	if err := store.ImportProfileCredential(name, agentclaude.SetupTokenCredential(token, time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	transport := &supplementalProbeCounter{usageScopeDenied: true, probePrimary: true}
+	ref := &AccountRef{claudeStore: store}
+	client := &http.Client{Transport: transport}
+	account := accounts.Account{
+		ID: name, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth,
+		Token: token, Source: store.ClaudeConfigDir(name),
+	}
+
+	windows, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
+	if err != nil || !fresh || len(windows) == 0 {
+		t.Fatalf("fresh=%v err=%v windows=%+v", fresh, err, windows)
+	}
+	if transport.usageCalls != 0 || transport.probeCalls != 1 {
+		t.Fatalf("usage=%d probe=%d; want no usage call and one probe", transport.usageCalls, transport.probeCalls)
+	}
+}
+
+// The Messages probe comes back without limits on a transient overload. For a
+// credential whose only usage source is that probe, the miss must not read as
+// an authentication failure, which would zero the account's routing score and
+// discard its last known usage.
+func TestClaudeScopeDeniedEmptyProbeKeepsLastKnownUsage(t *testing.T) {
+	transport := &supplementalProbeCounter{usageScopeDenied: true, probePrimary: true}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	account := probeAccount()
+
+	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err != nil {
+		t.Fatal(err)
+	}
+	expirePrimaryClaudeUsageForTest(t, ref, account)
+	transport.probeEmpty = true
+
+	windows, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
+	if err != nil {
+		t.Fatalf("empty probe err=%v; want the last known usage", err)
+	}
+	if fresh || len(windows) == 0 {
+		t.Fatalf("fresh=%v windows=%+v; want stale last known windows", fresh, windows)
+	}
+
+	// With nothing cached, the error must still not look like bad auth or a throttle.
+	_, _, err = (&AccountRef{}).FetchUsageWindowsCached(context.Background(), &http.Client{Transport: &supplementalProbeCounter{usageScopeDenied: true, probeEmpty: true}}, account)
+	if err == nil {
+		t.Fatal("expected an error with no usage source at all")
+	}
+	if authLikeUsageError(err.Error()) || usageWindowsIsThrottle(err) {
+		t.Fatalf("error %q reads as an auth failure or a throttle", err)
 	}
 }

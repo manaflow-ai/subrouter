@@ -32,14 +32,46 @@ func claudeSupplementalCacheKey(account accounts.Account) string {
 	return string(account.Provider) + "\x00" + account.ID + "\x00" + hex.EncodeToString(digest[:])
 }
 
-// claudeUsageScopeDeniedFor reports whether this exact credential was already
-// refused by the usage endpoint for lacking its scope. The key includes the
-// credential, so a re-login that carries the scope is asked afresh.
-func (r *AccountRef) claudeUsageScopeDeniedFor(account accounts.Account) bool {
+// errClaudeUsageProbeEmpty is returned when a credential that cannot read the
+// usage endpoint also got no limits from the Messages probe. The probe comes
+// back empty on a transient overload, so this must not read as an
+// authentication failure: its text is neither auth-like nor throttle-like,
+// which keeps the last known usage and routing score in place.
+var errClaudeUsageProbeEmpty = errors.New("Claude usage unavailable: the Messages probe returned no limits")
+
+// claudeUsageScopeDeniedFor reports whether this exact credential cannot read
+// the usage endpoint: either the endpoint already refused it for scope, or its
+// recorded scopes rule the endpoint out. The recorded scopes are read once per
+// credential, so a setup token never reaches the endpoint, on either the
+// status sweep or the routing-score sweep, including right after a restart.
+// The key includes the credential, so a re-login that carries the scope is
+// asked afresh.
+func (r *AccountRef) claudeUsageScopeDeniedFor(ctx context.Context, account accounts.Account) bool {
+	key := claudeSupplementalCacheKey(account)
 	r.usageWindowsMu.Lock()
-	defer r.usageWindowsMu.Unlock()
-	_, denied := r.claudeUsageScopeDenied[claudeSupplementalCacheKey(account)]
-	return denied
+	_, denied := r.claudeUsageScopeDenied[key]
+	_, checked := r.claudeUsageScopeChecked[key]
+	r.usageWindowsMu.Unlock()
+	if denied || checked || account.Source == "" {
+		return denied
+	}
+	credential, err := r.claudeStore.ReadCredential(ctx, account.Source)
+	if err != nil || credential == nil || credential.AccessToken != account.Token {
+		// Unreadable, or the store has moved on to another credential. Leave
+		// it unknown; the endpoint's own answer still teaches the denial.
+		return false
+	}
+	r.usageWindowsMu.Lock()
+	if r.claudeUsageScopeChecked == nil {
+		r.claudeUsageScopeChecked = map[string]struct{}{}
+	}
+	r.claudeUsageScopeChecked[key] = struct{}{}
+	r.usageWindowsMu.Unlock()
+	if !credential.LacksUsageScope() {
+		return false
+	}
+	r.rememberClaudeUsageScopeDenied(account)
+	return true
 }
 
 func (r *AccountRef) rememberClaudeUsageScopeDenied(account accounts.Account) {
@@ -172,7 +204,7 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
 ) ([]accounts.UsageWindow, bool, error) {
 	var usage *agentclaude.UsageResponse
 	var err error
-	if r.claudeUsageScopeDeniedFor(account) {
+	if r.claudeUsageScopeDeniedFor(ctx, account) {
 		// This credential cannot read the usage endpoint. Asking again only
 		// earns a 429 that would mark a healthy account throttled, so go
 		// straight to the Messages probe, whose headers are its usage source.
@@ -233,6 +265,12 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
 		return nil, true, probeErr
 	}
 	if err != nil && len(windows) == 0 {
+		var scope *agentclaude.UsageScopeError
+		if errors.As(err, &scope) {
+			// The token works for inference; only its usage reading is
+			// missing this time. That is not a bad credential.
+			return nil, true, errClaudeUsageProbeEmpty
+		}
 		return nil, true, err
 	}
 	return windows, true, nil

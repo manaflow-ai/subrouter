@@ -475,7 +475,10 @@ type AccountRef struct {
 	// claudeUsageScopeDenied holds credentials the Claude usage endpoint has
 	// refused for lacking its scope (setup tokens). Guarded by usageWindowsMu.
 	claudeUsageScopeDenied map[string]struct{}
-	usageWindowsEpoch      uint64
+	// claudeUsageScopeChecked holds credentials whose recorded scopes were
+	// already read from the store, so the read happens once per credential.
+	claudeUsageScopeChecked map[string]struct{}
+	usageWindowsEpoch       uint64
 
 	credFailMu sync.Mutex
 	credFail   map[string]credFailure
@@ -2285,11 +2288,6 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.AuthValid = true
 			next.PlanType = details.PlanType()
 			r.replace(account)
-			if details.LacksUsageScope() {
-				// Known before the first poll, so a setup token never asks
-				// the usage endpoint at all, even right after a restart.
-				r.rememberClaudeUsageScopeDenied(account)
-			}
 			windows, fresh, fetchedAt, throttled, err := r.FetchUsageWindowsCachedWithObservation(sweepCtx, r.client, account)
 			if err != nil {
 				next.Error = err.Error()
