@@ -1043,11 +1043,20 @@ func TestClaudeHeaderless429FailsOverWithoutPoisoningScore(t *testing.T) {
 	if _, err := store.Put("claude", "session-plain-429", "cooked@example.com", ""); err != nil {
 		t.Fatal(err)
 	}
+	var cookedHits, freshHits int
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
 		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
-			return &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(realisticAnthropic429Body))}
+			cookedHits++
+			if cookedHits == 1 {
+				return &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(realisticAnthropic429Body))}
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_ok"}`))}
 		}
-		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_ok"}`))}
+		freshHits++
+		if strings.Contains(req.Header.Get("Authorization"), "tok-fresh") {
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_ok"}`))}
+		}
+		return &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"error":"unexpected account"}`))}
 	}}
 	transport := usageLimitRetryTransport{
 		base: stub, server: &server, provider: accounts.ProviderClaude,
@@ -1065,7 +1074,13 @@ func TestClaudeHeaderless429FailsOverWithoutPoisoningScore(t *testing.T) {
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200 after transient failover", response.StatusCode)
+		t.Fatalf("status = %d, want 200 after same-account retry", response.StatusCode)
+	}
+	if cookedHits != 2 {
+		t.Fatalf("cooked upstream hits = %d, want 2 (429 then same-account retry)", cookedHits)
+	}
+	if freshHits != 0 {
+		t.Fatalf("fresh upstream hits = %d, want 0 (transient 429 must not fail over)", freshHits)
 	}
 	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("a headerless 429 must not mark the account exhausted")
