@@ -25,9 +25,13 @@ const (
 // srStatusFixtureServer serves the recorded usage-status fixture and answers
 // every other status section with 404, so the trailing best-effort sections
 // stay silent and the rendered text depends only on the fixture.
-func srStatusFixtureServer(t *testing.T) *httptest.Server {
+func srStatusFixtureServer(t *testing.T, fixturePaths ...string) *httptest.Server {
 	t.Helper()
-	fixture, err := os.ReadFile(srStatusUsageFixture)
+	fixturePath := srStatusUsageFixture
+	if len(fixturePaths) > 0 {
+		fixturePath = fixturePaths[0]
+	}
+	fixture, err := os.ReadFile(fixturePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +50,7 @@ func srStatusFixtureServer(t *testing.T) *httptest.Server {
 // runSRStatusAgainstFixture runs `sr <args>` against a default remote server
 // that serves the fixture, the path `sr status` takes on a client whose
 // credential storage points at a team router.
-func runSRStatusAgainstFixture(t *testing.T, args []string) (string, error) {
+func runSRStatusAgainstFixture(t *testing.T, args []string, fixturePaths ...string) (string, error) {
 	t.Helper()
 	t.Setenv("COLUMNS", "200")
 	t.Setenv("NO_COLOR", "1")
@@ -54,7 +58,7 @@ func runSRStatusAgainstFixture(t *testing.T, args []string) (string, error) {
 	t.Setenv("HOME", home)
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(home, "cloud.json"))
 	store := accounts.DefaultCodexStore()
-	server := srStatusFixtureServer(t)
+	server := srStatusFixtureServer(t, fixturePaths...)
 	if err := defaultSRServerStore(store).save(srServerFile{
 		Default: "team",
 		Servers: []srServerConfig{{Name: "team", URL: server.URL, AdminToken: "fixture-admin-token"}},
@@ -71,6 +75,53 @@ func runSRStatusAgainstFixture(t *testing.T, args []string) (string, error) {
 	}
 	err := runner.run(context.Background(), args)
 	return strings.ReplaceAll(out.String(), server.URL, srStatusServerURLKey), err
+}
+
+// Exercise the status command through the remote usage-status response, including
+// tier/credit metadata and revoked credentials that previously crowded out quota.
+func TestSRStatusQuotaTableFitsTerminal(t *testing.T) {
+	got, err := runSRStatusAgainstFixture(t, []string{"status"}, "testdata/sr_status_layout.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claudeStart := strings.Index(got, "Claude profiles")
+	if claudeStart < 0 {
+		t.Fatalf("missing Claude table:\n%s", got)
+	}
+	for _, section := range []string{got[:claudeStart], got[claudeStart:]} {
+		var header string
+		for _, line := range strings.Split(section, "\n") {
+			if strings.Contains(line, "Account") && strings.Contains(line, "State") {
+				header = line
+				break
+			}
+		}
+		if !strings.Contains(header, "5h") || !strings.Contains(header, "7d") {
+			t.Fatalf("missing explicit quota columns: %q", header)
+		}
+	}
+	claude := got[claudeStart:]
+	for _, unwanted := range []string{"Plan", "unknown", "ac...", "co...", "re..."} {
+		if strings.Contains(claude, unwanted) {
+			t.Fatalf("Claude table contains %q:\n%s", unwanted, got)
+		}
+	}
+	for _, want := range []string{
+		"primary.subscription.account@example.test", "primary.codex.account@example.test",
+		"active, cooked", "revoked", "100%/4h4m", "0%/5d13h",
+		"$187.20/$200 exp 10-24", "revoked 10-09 01:00Z",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q:\n%s", want, got)
+		}
+	}
+	for _, line := range strings.Split(claude, "\n") {
+		if strings.Contains(line, "Account") && !strings.HasSuffix(strings.TrimSpace(line), "Detail") {
+			t.Fatalf("Detail must be the last column: %q", line)
+		}
+	}
+	assertUsageGridLineWidths(t, got, 200)
+	t.Logf("200-column status:\n%s", got)
 }
 
 // TestSRStatusTextMatchesGolden pins the human `sr status` table byte for
