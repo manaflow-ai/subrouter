@@ -662,6 +662,8 @@ type usageWindowsFailure struct {
 // Used only if a provider reports 429 without a typed retry deadline.
 const usageWindowsThrottleTTL = time.Minute
 
+// usageWindowsThrottleUntil returns the provider deadline or the short
+// fallback hold used when a 429 has no typed Retry-After value.
 func usageWindowsThrottleUntil(err error, now time.Time) time.Time {
 	if !usageWindowsIsThrottle(err) {
 		return time.Time{}
@@ -673,6 +675,8 @@ func usageWindowsThrottleUntil(err error, now time.Time) time.Time {
 	return now.Add(usageWindowsThrottleTTL)
 }
 
+// usageWindowsIsThrottle reports whether an error represents a telemetry
+// throttle that should honor the provider's retry deadline.
 func usageWindowsIsThrottle(err error) bool {
 	if err == nil {
 		return false
@@ -684,6 +688,8 @@ func usageWindowsIsThrottle(err error) bool {
 const usageWindowsTTL = 2 * time.Minute
 const usageWindowsLastGoodTTL = 15 * time.Minute
 
+// claudeUsageThrottleActive checks the account-scoped telemetry hold without
+// touching the provider, so routing can avoid another doomed quota request.
 func (r *AccountRef) claudeUsageThrottleActive(account accounts.Account, now time.Time) bool {
 	if r == nil || account.Provider != accounts.ProviderClaude {
 		return false
@@ -695,6 +701,8 @@ func (r *AccountRef) claudeUsageThrottleActive(account accounts.Account, now tim
 	return throttled && now.Before(failure.retryAt)
 }
 
+// claimClaudeQuotaProbe rate-limits the supplementary Claude probe while the
+// ordinary usage endpoint is under an active account throttle.
 func (r *AccountRef) claimClaudeQuotaProbe(account accounts.Account, now time.Time) bool {
 	if r == nil || !r.claudeUsageThrottleActive(account, now) {
 		return false
@@ -1170,6 +1178,8 @@ func withWeeklyCooked(statuses []AccountUsageStatus) []AccountUsageStatus {
 	return out
 }
 
+// NewAccountRef creates an account reference and restores durable usage state
+// before serving status or routing requests.
 func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client *http.Client) *AccountRef {
 	claudeStore := agentclaude.DefaultStore()
 	ref := &AccountRef{
