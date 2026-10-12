@@ -74,9 +74,10 @@ func (r *AccountRef) claudeUsageScopeDeniedFor(ctx context.Context, account acco
 	return true
 }
 
+// rememberClaudeUsageScopeDenied records that this credential cannot use the
+// ordinary usage endpoint and releases any persisted hold for that endpoint.
 func (r *AccountRef) rememberClaudeUsageScopeDenied(account accounts.Account) {
 	r.usageWindowsMu.Lock()
-	defer r.usageWindowsMu.Unlock()
 	if r.claudeUsageScopeDenied == nil {
 		r.claudeUsageScopeDenied = map[string]struct{}{}
 	}
@@ -86,6 +87,8 @@ func (r *AccountRef) rememberClaudeUsageScopeDenied(account accounts.Account) {
 	// probe back for the rest of its retry window.
 	cacheKey := account.ID + "\x00" + string(account.Provider)
 	delete(r.usageWindowsFailures, usageWindowsFailureKey(cacheKey))
+	r.usageWindowsMu.Unlock()
+	r.clearUsageThrottleState(cacheKey)
 }
 
 func supplementalClaudeWindows(windows []accounts.UsageWindow) []accounts.UsageWindow {

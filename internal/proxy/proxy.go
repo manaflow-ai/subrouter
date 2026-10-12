@@ -941,6 +941,8 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 				if recovered := recover(); recovered != nil {
 					flight.windows, flight.err = nil, fmt.Errorf("usage fetch panicked: %v", recovered)
 				}
+				var persistedFailure *usageWindowsFailure
+				var clearPersistedFailure bool
 				r.usageWindowsMu.Lock()
 				now := time.Now()
 				// Expire old account failures whenever a live fetch completes.
@@ -961,6 +963,7 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 							supplementalFresh: flight.supplementalFresh, credentialKey: credentialKey,
 						}
 						delete(r.usageWindowsFailures, failureKey)
+						clearPersistedFailure = true
 					}
 				} else if usageWindowsIsThrottle(flight.err) && flight.epoch == r.usageWindowsEpoch && latest {
 					var throttle *agentclaude.UsageThrottleError
@@ -978,11 +981,17 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 						failure.fetchedAt = flight.fetchedAt
 					}
 					r.usageWindowsFailures[failureKey] = failure
+					persistedFailure = &failure
 				}
 				if r.usageWindowsFlights[flightKey] == flight {
 					delete(r.usageWindowsFlights, flightKey)
 				}
 				r.usageWindowsMu.Unlock()
+				if persistedFailure != nil {
+					r.persistUsageThrottleState(cacheKey, *persistedFailure)
+				} else if clearPersistedFailure {
+					r.clearUsageThrottleState(cacheKey)
+				}
 				close(flight.done)
 			}()
 			flight.windows, flight.supplementalFresh, flight.err = r.fetchAccountUsageWindowsLiveWithFreshness(fetchCtx, client, account)
@@ -1173,12 +1182,14 @@ func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client
 	transactionLock, err := lockAccountImportTransaction(context.Background(), store.StoreDir())
 	if err != nil {
 		ref.restoreUsageStatusSnapshot()
+		ref.restoreUsageThrottleState()
 		return ref
 	}
 	defer transactionLock.Close()
 	diskGeneration, err := readAccountDiskGeneration(store.StoreDir())
 	if err != nil {
 		ref.restoreUsageStatusSnapshot()
+		ref.restoreUsageThrottleState()
 		return ref
 	}
 	// A generation marker means an HTTP import has occurred. Reload while the
@@ -1191,10 +1202,12 @@ func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client
 			ref.diskGeneration = diskGeneration
 		}
 		ref.restoreUsageStatusSnapshot()
+		ref.restoreUsageThrottleState()
 		return ref
 	}
 	ref.diskGeneration = diskGeneration
 	ref.restoreUsageStatusSnapshot()
+	ref.restoreUsageThrottleState()
 	return ref
 }
 
@@ -1303,6 +1316,7 @@ func OpenAccountRefWithSources(ctx context.Context, store accounts.CodexStore, c
 		qwenConsoleRoot: agentqwen.ConsoleRootForStore(store),
 	}
 	ref.restoreUsageStatusSnapshot()
+	ref.restoreUsageThrottleState()
 	return ref, nil
 }
 

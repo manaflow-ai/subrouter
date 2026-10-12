@@ -54,6 +54,9 @@ func (r *AccountRef) invalidateReplacedAccountUsage(previous, current []accounts
 		delete(r.claudeSupplemental, claudeSupplementalCacheKey(account))
 	}
 	r.usageWindowsMu.Unlock()
+	for _, account := range replaced {
+		r.clearUsageThrottleState(account.ID + "\x00" + string(account.Provider))
+	}
 
 	// A failed status refresh must not resurrect the previous login's
 	// last-known-good quota. The caller separately invalidates the status
