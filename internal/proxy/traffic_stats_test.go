@@ -274,6 +274,8 @@ func TestTrafficCountsHandlerGeneratedFailuresAsProxy(t *testing.T) {
 	}
 }
 
+// TestTrafficFailureReportIncludesRouteAccountAndRetryPath verifies the
+// supervisor-facing failure sample at the HTTP traffic boundary.
 func TestTrafficFailureReportIncludesRouteAccountAndRetryPath(t *testing.T) {
 	stats := NewTrafficStats(time.Now())
 	handler := stats.trafficCounted(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

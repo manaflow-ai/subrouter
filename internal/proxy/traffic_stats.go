@@ -99,7 +99,7 @@ type StreamDropSummary struct {
 	Total uint64 `json:"total"`
 }
 
-// Snapshot reads the counters. drops may be nil.
+// Snapshot reads the counters and copies the bounded failure samples. drops may be nil.
 func (t *TrafficStats) Snapshot(drops *StreamDropStats, now time.Time) TrafficSnapshot {
 	snapshot := TrafficSnapshot{Version: buildversion.Version()}
 	streams := drops.Snapshot()
