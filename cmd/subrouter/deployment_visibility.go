@@ -29,10 +29,12 @@ type recoveryCountersView struct {
 
 var buildCommitPattern = regexp.MustCompile(`(?i)[0-9a-f]{7,40}`)
 
+// buildCommits extracts hexadecimal revision identifiers from a build string.
 func buildCommits(value string) []string {
 	return buildCommitPattern.FindAllString(strings.ToLower(value), -1)
 }
 
+// sameBuildCommit accepts full and abbreviated forms of the same revision.
 func sameBuildCommit(left, right string) bool {
 	for _, a := range buildCommits(left) {
 		for _, b := range buildCommits(right) {
@@ -44,6 +46,7 @@ func sameBuildCommit(left, right string) bool {
 	return false
 }
 
+// sameBuildIdentity compares semantic versions first, then stamped revisions.
 func sameBuildIdentity(client buildversion.Info, serverVersion, serverCommit string) bool {
 	if sameVersion(client.Version, serverVersion) {
 		return true

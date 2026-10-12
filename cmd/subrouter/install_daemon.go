@@ -348,6 +348,7 @@ func (commandRunner) Run(name string, args ...string) error {
 	return nil
 }
 
+// Output runs a command and returns its standard output with a contextual error.
 func (commandRunner) Output(name string, args ...string) ([]byte, error) {
 	cmd := exec.Command(name, args...)
 	output, err := cmd.Output()

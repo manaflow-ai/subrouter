@@ -212,6 +212,7 @@ func (u *updater) defaultController(kind installKind) serviceController {
 	return nil
 }
 
+// probeLaunchAgent reports whether launchd has disabled or unloaded an agent.
 func probeLaunchAgent(label string) (launchAgentState, error) {
 	domain := "gui/" + strconv.Itoa(os.Getuid())
 	disabled, disabledErr := (commandRunner{}).Output("launchctl", "print-disabled", domain)
@@ -231,6 +232,7 @@ func probeLaunchAgent(label string) (launchAgentState, error) {
 	return launchAgentNotLoaded, nil
 }
 
+// launchAgentDisabled reports whether launchctl marked label as disabled.
 func launchAgentDisabled(output []byte, label string) bool {
 	quoted := `"` + label + `"`
 	for _, line := range strings.Split(string(output), "\n") {
@@ -242,6 +244,7 @@ func launchAgentDisabled(output []byte, label string) bool {
 	return false
 }
 
+// launchAgentInactive returns true only when launchd conclusively says the agent is inactive.
 func (u *updater) launchAgentInactive(label string) bool {
 	probe := u.launchdProbe
 	if probe == nil {
@@ -345,6 +348,7 @@ func (u *updater) detect() (installTarget, error) {
 	return target, nil
 }
 
+// detectService finds a local supervisor definition and its worker binary.
 func (u *updater) detectService() (installTarget, bool, error) {
 	switch u.goos {
 	case "darwin":
@@ -631,6 +635,7 @@ func normalizeVersion(version string) string {
 	return strings.TrimPrefix(strings.TrimSpace(version), "v")
 }
 
+// sameVersion compares release identities while ignoring semver build metadata.
 func sameVersion(left, right string) bool {
 	if left == "" || right == "" {
 		return false
