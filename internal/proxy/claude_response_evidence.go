@@ -12,32 +12,32 @@ import (
 // responses, eliminating a later synthetic model probe when possible. It also
 // publishes account-wide reset headers to the scheduler so exhausted accounts
 // can sleep until the provider's next reset instead of being polled on TTL.
-func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header http.Header, requestStarted time.Time) ([]accounts.UsageWindow, bool, uint64) {
+func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header http.Header, requestStarted time.Time) ([]accounts.UsageWindow, bool, uint64, time.Time) {
 	if r == nil || routed.Provider != accounts.ProviderClaude || routed.ID == "" ||
 		routed.CredentialIdentity() == "" {
-		return nil, false, 0
+		return nil, false, 0, time.Time{}
 	}
 	now := time.Now()
 	observed := agentclaude.ObservedUsageWindows(header, now)
 	if len(observed) == 0 {
-		return nil, false, 0
+		return nil, false, 0, time.Time{}
 	}
 	// A failed-over reply belongs to the actual serving credential, not
 	// necessarily the initial choice. Ignore results from a superseded login.
 	current := r.credentialSnapshot(accounts.ProviderClaude, routed.ID)
 	if current.AuthMode != accounts.AuthModeOAuth || current.Token == "" ||
 		current.CredentialIdentity() != routed.CredentialIdentity() {
-		return nil, false, 0
+		return nil, false, 0, time.Time{}
 	}
 	generation := r.Generation()
+	if requestStarted.IsZero() {
+		requestStarted = now
+	}
 	windows := make([]accounts.UsageWindow, 0, len(observed))
 	for _, window := range observed {
 		if window.Feature != "" {
 			windows = append(windows, window)
 		}
-	}
-	if requestStarted.IsZero() {
-		requestStarted = now
 	}
 	key := claudeSupplementalCacheKey(current)
 	r.usageWindowsMu.Lock()
@@ -52,12 +52,18 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 			// started before that probe cannot supersede its later evidence.
 			previousStart = existing.at
 		}
-		if hadAccountPrevious && accountEntry.at.After(previousStart) {
-			previousStart = accountEntry.at
+		if hadAccountPrevious {
+			accountOrder := accountEntry.orderAt
+			if accountOrder.IsZero() {
+				accountOrder = accountEntry.at
+			}
+			if accountOrder.After(previousStart) {
+				previousStart = accountOrder
+			}
 		}
 		if !requestStarted.After(previousStart) {
 			// Older concurrent requests must not overwrite newer quota evidence.
-			return nil, false, 0
+			return nil, false, 0, time.Time{}
 		}
 	}
 
@@ -66,7 +72,7 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 			// An exhausted window without a reset time cannot be cached
 			// safely. The next regular usage check will reassess it.
 			delete(r.claudeSupplemental, key)
-			return observed, true, generation
+			return observed, true, generation, requestStarted
 		}
 	}
 	observedAt := now // the headers arrived now, regardless of request duration
@@ -131,9 +137,10 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 				}
 			}
 			entry.at = entryAt
+			entry.orderAt = requestStarted
 			entry.credentialKey = usageWindowsCredentialKey(current)
 			r.usageWindows[cacheKey] = entry
 		}
 	}
-	return observed, true, generation
+	return observed, true, generation, requestStarted
 }

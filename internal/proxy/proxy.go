@@ -636,8 +636,11 @@ func irreparableClaudeRefreshFailure(err error) bool {
 }
 
 type usageWindowsEntry struct {
-	windows           []accounts.UsageWindow
-	at                time.Time
+	windows []accounts.UsageWindow
+	at      time.Time
+	// orderAt is the request start of the newest accepted response. It is
+	// separate from at because partial headers may retain an older bucket age.
+	orderAt           time.Time
 	supplementalFresh bool
 	// credentialKey binds an observation to the credential that produced it.
 	// Account IDs survive re-login, so ID-only quota data cannot cross a
@@ -5936,9 +5939,9 @@ func (s Server) proxyHandler() http.Handler {
 				!claudeResponseRejected(response.Header) {
 				// Learn usable model quota from an ordinary response. No
 				// additional upstream request is made at this boundary.
-				observed, ok, generation := s.AccountRef.observeClaudeQuotaHeaders(responseAccount, response.Header, requestStarted)
+				observed, ok, generation, orderAt := s.AccountRef.observeClaudeQuotaHeaders(responseAccount, response.Header, requestStarted)
 				if ok {
-					s.mergeClaudeResponseQuotaScore(responseAccount, observed, generation, responseAccount.CredentialIdentity())
+					s.mergeClaudeResponseQuotaScore(responseAccount, observed, generation, responseAccount.CredentialIdentity(), orderAt)
 				}
 			}
 			s.captureResponseBodyForAccount(response, r.Context(), sessionAgentType, sessionID, responseAccount, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)

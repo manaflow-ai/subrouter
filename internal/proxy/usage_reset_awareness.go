@@ -20,7 +20,7 @@ func knownAccountWideQuotaReset(score selectacct.Score, now time.Time) (time.Tim
 // mergeClaudeResponseQuotaScore publishes account-wide reset headers learned
 // from a successful model response. This is a partial observation, so merge it
 // into the current scheduler instead of replacing other providers' scores.
-func (s Server) mergeClaudeResponseQuotaScore(account accounts.Account, windows []accounts.UsageWindow, generation uint64, credentialIdentity string) {
+func (s Server) mergeClaudeResponseQuotaScore(account accounts.Account, windows []accounts.UsageWindow, generation uint64, credentialIdentity string, orderAt time.Time) {
 	if s.AccountRef == nil || s.SchedulerRef == nil || account.ID == "" {
 		return
 	}
@@ -41,7 +41,13 @@ func (s Server) mergeClaudeResponseQuotaScore(account accounts.Account, windows 
 	s.AccountRef.usageWindowsMu.Lock()
 	if entry, ok := s.AccountRef.usageWindows[cacheKey]; ok &&
 		(entry.credentialKey == "" || entry.credentialKey == usageWindowsCredentialKey(account)) {
-		accountWindows = mergeUsageWindows(entry.windows, accountWindows)
+		if !entry.orderAt.IsZero() && entry.orderAt.After(orderAt) {
+			// A newer response won the cache while this handler was waiting to
+			// publish. Use its complete account view and discard this older one.
+			accountWindows = append([]accounts.UsageWindow(nil), entry.windows...)
+		} else {
+			accountWindows = mergeUsageWindows(entry.windows, accountWindows)
+		}
 	}
 	s.AccountRef.usageWindowsMu.Unlock()
 	if len(accountWindows) == 0 {

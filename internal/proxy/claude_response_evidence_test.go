@@ -176,6 +176,39 @@ func TestPassiveClaudeOlderReplyDoesNotOverwriteNewerQuota(t *testing.T) {
 	}
 }
 
+// TestPassiveClaudeAccountWindowsKeepOrderAndPartialBuckets verifies that a
+// partial account response preserves the other window and a late response
+// cannot replace the newer account-wide evidence.
+func TestPassiveClaudeAccountWindowsKeepOrderAndPartialBuckets(t *testing.T) {
+	account := passiveClaudeAccount("token", "grant-v1")
+	ref := &AccountRef{accounts: []accounts.Account{account}}
+	first := time.Now().Add(-2 * time.Second)
+	ref.observeClaudeQuotaHeaders(account, passiveClaudeAccountQuotaHeaders(), first)
+	partial := make(http.Header)
+	partial.Set("Anthropic-Ratelimit-Unified-5h-Utilization", "0.7")
+	partial.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
+	partial.Set("Anthropic-Ratelimit-Unified-5h-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+	ref.observeClaudeQuotaHeaders(account, partial, first.Add(time.Second))
+	late := passiveClaudeHeader("5h", "0.1")
+	late.Set("Anthropic-Ratelimit-Unified-5h-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+	ref.observeClaudeQuotaHeaders(account, late, first)
+	ref.usageWindowsMu.Lock()
+	entry := ref.usageWindows[account.ID+"\x00"+string(account.Provider)]
+	ref.usageWindowsMu.Unlock()
+	var fiveHour, sevenDay accounts.UsageWindow
+	for _, window := range entry.windows {
+		if window.Name == "5h" {
+			fiveHour = window
+		}
+		if window.Name == "7d" {
+			sevenDay = window
+		}
+	}
+	if fiveHour.UsedPercent != 70 || sevenDay.UsedPercent != 20 {
+		t.Fatalf("account windows = %+v, want newer 5h and retained 7d evidence", entry.windows)
+	}
+}
+
 func TestPassiveClaudePartialFeatureHeadersKeepOlderBucketsAged(t *testing.T) {
 	account := passiveClaudeAccount("token", "grant-v1")
 	ref := &AccountRef{accounts: []accounts.Account{account}}
