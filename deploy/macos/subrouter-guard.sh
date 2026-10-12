@@ -74,9 +74,6 @@ if [ -f "$BAKE_LIB" ]; then
   # shellcheck disable=SC1090
   . "$BAKE_LIB" && BAKE_GATE=1
 fi
-if [ "$BAKE_GATE" -eq 1 ]; then
-  bake_prepare_release_state || true
-fi
 CANARY=0
 if [ "$BAKE_GATE" -eq 1 ] && declare -F canary_reconcile >/dev/null; then
   CANARY=1
@@ -91,6 +88,10 @@ emit() { # level msg...
   echo "SUBROUTER-GUARD $line"
   echo "guard $line" >>"$ALERTS" 2>/dev/null || true
 }
+
+if [ "$BAKE_GATE" -eq 1 ] && ! bake_prepare_release_state; then
+  emit ALERT "could not prepare $RELEASE_STATE_FILE for the service user"
+fi
 
 canary_log() { emit "$1" "canary: $2"; }
 
