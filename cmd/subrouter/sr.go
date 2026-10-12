@@ -3302,7 +3302,7 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 		for _, column := range []usageGridColumn{
 			{Key: "Account", Title: "Account", Width: 48},
 			{Key: "Plan", Title: "Plan", Width: 16},
-			{Key: "State", Title: "State", Width: 24},
+			{Key: "State", Title: "State", Width: 0},
 			{Key: "Pick", Title: "Use", Width: 34},
 			{Key: "5h", Title: "5h", Width: 12},
 			{Key: "7d", Title: "7d", Width: 12},
@@ -3450,7 +3450,7 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 	}
 	for _, column := range []usageGridColumn{
 		{Key: "Account", Title: "Account", Width: usageGridDesiredWidth(rows, "Account", "Account", 48)},
-		{Key: "State", Title: "State", Width: usageGridDesiredWidth(rows, "State", "State", termWidth)},
+		{Key: "State", Title: "State", Width: usageGridDesiredWidth(rows, "State", "State", 0)},
 		{Key: "Pick", Title: "Use", Width: usageGridDesiredWidth(rows, "Pick", "Use", 30)},
 		{Key: "5h", Title: "5h", Width: usageGridDesiredWidth(rows, "5h", "5h", 12)},
 		{Key: "7d", Title: "7d", Width: usageGridDesiredWidth(rows, "7d", "7d", 12)},
@@ -3528,6 +3528,9 @@ func usageGridDesiredWidth(rows []srUsageRow, key, title string, capWidth int) i
 	desired := runewidth.StringWidth(title)
 	for _, row := range rows {
 		desired = max(desired, runewidth.StringWidth(usageGridValues(row, "")[key].Text))
+	}
+	if capWidth <= 0 {
+		return desired
 	}
 	return min(desired, capWidth)
 }
