@@ -159,6 +159,7 @@ func newUpdateFixture(t *testing.T, installed string) *updateFixture {
 		linuxTeamUnits: []string{filepath.Join(root, "etc", "subrouter-autoupdate.timer")},
 		systemUnitPath: filepath.Join(root, "etc", "subrouter.service"),
 		controllerFor:  func(installKind) serviceController { return f.controller },
+		launchdProbe:   func(string) (launchAgentState, error) { return launchAgentLoaded, nil },
 		runBinary:      runBinaryOutput,
 		upgradeWorker: func(_ context.Context, socket string) error {
 			f.mu.Lock()
@@ -343,6 +344,37 @@ func TestUpdateSupervisedLaunchAgentUsesControlSocket(t *testing.T) {
 	}
 	if got := f.installedVersion(); got != "v1.1.0" {
 		t.Fatalf("worker version = %q", got)
+	}
+}
+
+func TestUpdateSkipsInactiveLaunchAgentService(t *testing.T) {
+	for _, state := range []launchAgentState{launchAgentDisabledState, launchAgentNotLoaded} {
+		t.Run(fmt.Sprint(state), func(t *testing.T) {
+			f := newUpdateFixture(t, "v1.0.0")
+			f.u.goos = "darwin"
+			f.u.goarch = "arm64"
+			f.u.launchdProbe = func(string) (launchAgentState, error) { return state, nil }
+			plist := launchAgentPath(f.u.home, defaultDaemonLabel)
+			if err := os.MkdirAll(filepath.Dir(plist), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			body := `<?xml version="1.0"?><plist version="1.0"><dict>
+<key>Label</key><string>ai.manaflow.subrouter</string>
+<key>ProgramArguments</key><array><string>` + f.binary + `</string><string>serve</string></array>
+</dict></plist>`
+			if err := os.WriteFile(plist, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.u.runUpdateArgs(context.Background(), []string{"--yes"}); err != nil {
+				t.Fatalf("update: %v\n%s", err, f.out)
+			}
+			if got := f.installedVersion(); got != "v1.1.0" {
+				t.Fatalf("installed version = %q, want v1.1.0", got)
+			}
+			if f.restarts != 0 {
+				t.Fatalf("inactive LaunchAgent was restarted %d times", f.restarts)
+			}
+		})
 	}
 }
 
@@ -585,6 +617,12 @@ func TestCompareReleaseVersions(t *testing.T) {
 				t.Errorf("compareReleaseVersions(%q, %q) = %d, not the inverse", tc.right, tc.left, back)
 			}
 		}
+	}
+}
+
+func TestSameVersionIgnoresBuildMetadata(t *testing.T) {
+	if !sameVersion("v0.1.146+main.f8124b9f", "v0.1.146") {
+		t.Fatal("sameVersion treated a main build of the same release as newer")
 	}
 }
 

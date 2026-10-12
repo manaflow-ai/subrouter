@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -84,14 +85,27 @@ type installTarget struct {
 	binary        string
 	controller    serviceController
 	controlSocket string
+	// skipService is set when a local LaunchAgent is intentionally disabled or
+	// no longer loaded. The binary is still owned by that plist, but update and
+	// rollback must not try to bootstrap a service that a tunnel owns instead.
+	skipService bool
 	// leasePath is the supervisor mutation lease the LaunchAgent migration
 	// and rollback scripts hold; empty when nothing else mutates the binary.
 	leasePath string
 }
 
 func (t installTarget) hasDaemon() bool {
-	return t.controller != nil || t.controlSocket != ""
+	return !t.skipService && (t.controller != nil || t.controlSocket != "")
 }
+
+type launchAgentState uint8
+
+const (
+	launchAgentUnknown launchAgentState = iota
+	launchAgentLoaded
+	launchAgentDisabledState
+	launchAgentNotLoaded
+)
 
 // updater carries every host dependency so tests can point it at temp dirs,
 // httptest servers and fake service controllers.
@@ -118,6 +132,7 @@ type updater struct {
 	systemUnitPath string
 
 	controllerFor  func(kind installKind) serviceController
+	launchdProbe   func(label string) (launchAgentState, error)
 	runBinary      func(ctx context.Context, path string, args ...string) (string, error)
 	upgradeWorker  func(ctx context.Context, socket string) error
 	now            func() time.Time
@@ -195,6 +210,45 @@ func (u *updater) defaultController(kind installKind) serviceController {
 		return windowsController{name: defaultWindowsTaskName, xmlPath: filepath.Join(paths.TaskXMLDir, "daemon.xml"), runner: commandRunner{}}
 	}
 	return nil
+}
+
+func probeLaunchAgent(label string) (launchAgentState, error) {
+	domain := "gui/" + strconv.Itoa(os.Getuid())
+	disabled, disabledErr := (commandRunner{}).Output("launchctl", "print-disabled", domain)
+	if disabledErr == nil && launchAgentDisabled(disabled, label) {
+		return launchAgentDisabledState, nil
+	}
+	_, printErr := (commandRunner{}).Output("launchctl", "print", domain+"/"+label)
+	if printErr == nil {
+		return launchAgentLoaded, nil
+	}
+	// A missing launchctl is not evidence that the service is inactive. On a
+	// real Darwin host launchctl is present; preserving the old behavior here
+	// keeps cross-platform and restricted environments safe.
+	if errors.Is(printErr, exec.ErrNotFound) || errors.Is(disabledErr, exec.ErrNotFound) {
+		return launchAgentUnknown, printErr
+	}
+	return launchAgentNotLoaded, nil
+}
+
+func launchAgentDisabled(output []byte, label string) bool {
+	quoted := `"` + label + `"`
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if (strings.Contains(line, quoted) || strings.HasPrefix(line, label+" ")) && strings.Contains(line, "=> true") {
+			return true
+		}
+	}
+	return false
+}
+
+func (u *updater) launchAgentInactive(label string) bool {
+	probe := u.launchdProbe
+	if probe == nil {
+		probe = probeLaunchAgent
+	}
+	state, err := probe(label)
+	return err == nil && (state == launchAgentDisabledState || state == launchAgentNotLoaded)
 }
 
 func runUpdateCommand(program string, args []string) error {
@@ -311,15 +365,23 @@ func (u *updater) detectService() (installTarget, bool, error) {
 			if worker == "" {
 				return installTarget{}, false, fmt.Errorf("%s runs a supervisor without --worker-bin", plist)
 			}
-			return installTarget{
+			target := installTarget{
 				kind:          installKindLaunchAgentSupervised,
 				binary:        resolvePath(worker),
 				controller:    u.controllerFor(installKindLaunchAgentSupervised),
 				controlSocket: argumentValue(arguments, "--control-socket"),
 				leasePath:     plist + ".supervisor-mutation.lock",
-			}, true, nil
+			}
+			if u.launchAgentInactive(defaultDaemonLabel) {
+				target.skipService = true
+			}
+			return target, true, nil
 		}
-		return installTarget{kind: installKindLaunchAgent, binary: resolvePath(arguments[0]), controller: u.controllerFor(installKindLaunchAgent)}, true, nil
+		target := installTarget{kind: installKindLaunchAgent, binary: resolvePath(arguments[0]), controller: u.controllerFor(installKindLaunchAgent)}
+		if u.launchAgentInactive(defaultDaemonLabel) {
+			target.skipService = true
+		}
+		return target, true, nil
 	case "linux":
 		for _, candidate := range []struct {
 			kind installKind
@@ -570,7 +632,13 @@ func normalizeVersion(version string) string {
 }
 
 func sameVersion(left, right string) bool {
-	return left != "" && right != "" && normalizeVersion(left) == normalizeVersion(right)
+	if left == "" || right == "" {
+		return false
+	}
+	if cmp, ok := compareReleaseVersions(left, right); ok {
+		return cmp == 0
+	}
+	return normalizeVersion(left) == normalizeVersion(right)
 }
 
 // compareReleaseVersions orders two versions with semver precedence, the

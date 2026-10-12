@@ -348,6 +348,15 @@ func (commandRunner) Run(name string, args ...string) error {
 	return nil
 }
 
+func (commandRunner) Output(name string, args ...string) ([]byte, error) {
+	cmd := exec.Command(name, args...)
+	output, err := cmd.Output()
+	if err != nil {
+		return output, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+	}
+	return output, nil
+}
+
 func launchAgentPath(home, label string) string {
 	return filepath.Join(home, "Library", "LaunchAgents", label+".plist")
 }
