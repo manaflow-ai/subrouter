@@ -10904,6 +10904,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		accountID = nextAccount.ID
 		accountCredential = nextAccount.CredentialIdentity()
+		markTrafficAccount(attemptReq.Context(), accountID)
 		claudeTransient429Retries = 0
 		tried[accountID] = struct{}{}
 		if t.server != nil && t.server.SchedulerRef != nil {

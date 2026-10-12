@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net"
@@ -291,9 +293,11 @@ func TestTrafficFailureReportIncludesRouteAccountAndRetryPath(t *testing.T) {
 		t.Fatalf("failures = %+v, want one sample", snapshot.Failures)
 	}
 	failure := snapshot.Failures[0]
+	digest := sha256.Sum256([]byte("claude-account@example.com"))
+	wantAccountHash := "sha256:" + hex.EncodeToString(digest[:8])
 	if failure.Status != http.StatusBadGateway || failure.UpstreamStatus != http.StatusBadGateway ||
 		failure.Method != http.MethodPost || failure.Path != "/v1/messages" ||
-		failure.Account != "claude-account@example.com" || failure.RetryPath != "account_failover" ||
+		failure.AccountHash != wantAccountHash || failure.RetryPath != "account_failover" ||
 		failure.ErrorClass != "proxy_error" {
 		t.Fatalf("failure = %+v, want route/account/retry classification", failure)
 	}

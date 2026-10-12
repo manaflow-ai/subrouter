@@ -3,6 +3,8 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net"
 	"net/http"
@@ -14,6 +16,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/buildversion"
 )
 
+// trafficErrorClass reduces transport errors to a stable report label.
 func trafficErrorClass(err error) string {
 	if errors.Is(err, context.Canceled) {
 		return "context_canceled"
@@ -57,7 +60,7 @@ type TrafficFailure struct {
 	UpstreamStatus int    `json:"upstream_status,omitempty"`
 	Method         string `json:"method"`
 	Path           string `json:"path"`
-	Account        string `json:"account,omitempty"`
+	AccountHash    string `json:"account_hash,omitempty"`
 	RetryPath      string `json:"retry_path,omitempty"`
 	ErrorClass     string `json:"error_class,omitempty"`
 }
@@ -163,14 +166,17 @@ type trafficRecord struct {
 	errorClass        string
 }
 
+// markTrafficAccount records the selected credential fingerprint for a request.
 func markTrafficAccount(ctx context.Context, account string) {
 	if record, ok := ctx.Value(trafficRecordKey{}).(*trafficRecord); ok {
 		record.mu.Lock()
-		record.account = account
+		digest := sha256.Sum256([]byte(account))
+		record.account = "sha256:" + hex.EncodeToString(digest[:8])
 		record.mu.Unlock()
 	}
 }
 
+// markTrafficRetryPath records the retry or handoff path used by a request.
 func markTrafficRetryPath(ctx context.Context, path string) {
 	if record, ok := ctx.Value(trafficRecordKey{}).(*trafficRecord); ok {
 		record.mu.Lock()
@@ -179,6 +185,7 @@ func markTrafficRetryPath(ctx context.Context, path string) {
 	}
 }
 
+// markTrafficUpstreamStatus records the status passed through from upstream.
 func markTrafficUpstreamStatus(ctx context.Context, status int) {
 	if record, ok := ctx.Value(trafficRecordKey{}).(*trafficRecord); ok {
 		record.mu.Lock()
@@ -187,6 +194,7 @@ func markTrafficUpstreamStatus(ctx context.Context, status int) {
 	}
 }
 
+// markTrafficErrorClass records the coarse class of a proxy-generated error.
 func markTrafficErrorClass(ctx context.Context, class string) {
 	if record, ok := ctx.Value(trafficRecordKey{}).(*trafficRecord); ok {
 		record.mu.Lock()
@@ -195,6 +203,7 @@ func markTrafficErrorClass(ctx context.Context, class string) {
 	}
 }
 
+// recordFailure appends one bounded diagnostic sample for a failed request.
 func (t *TrafficStats) recordFailure(record *trafficRecord, status int, now time.Time) {
 	if t == nil || record == nil {
 		return
@@ -202,7 +211,7 @@ func (t *TrafficStats) recordFailure(record *trafficRecord, status int, now time
 	record.mu.Lock()
 	failure := TrafficFailure{
 		At: now.UTC().Format(time.RFC3339), Status: status, UpstreamStatus: record.upstreamStatus,
-		Method: record.method, Path: record.path, Account: record.account,
+		Method: record.method, Path: record.path, AccountHash: record.account,
 		RetryPath: record.retryPath, ErrorClass: record.errorClass,
 	}
 	record.mu.Unlock()
