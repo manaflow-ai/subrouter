@@ -61,6 +61,7 @@ func sameBuildIdentity(client buildversion.Info, serverVersion, serverCommit str
 	return false
 }
 
+// printDeploymentVisibilityStatus prints server rollout and build identity details.
 func (r srRunner) printDeploymentVisibilityStatus(ctx context.Context, server srServerConfig) {
 	baseURL, err := serverControlBaseURL(server)
 	if err != nil {

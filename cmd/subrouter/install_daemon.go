@@ -339,6 +339,7 @@ func restartLaunchAgent(plistPath, label string, runner taskRunner) error {
 
 type commandRunner struct{}
 
+// Run executes a command and includes its combined output in failures.
 func (commandRunner) Run(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	output, err := cmd.CombinedOutput()

@@ -68,6 +68,7 @@ func (f *updateFixture) restartFromDisk() {
 	f.healthy = !f.broken[version]
 }
 
+// newUpdateFixture builds an isolated release server and binary install.
 func newUpdateFixture(t *testing.T, installed string) *updateFixture {
 	t.Helper()
 	root := t.TempDir()
@@ -317,6 +318,7 @@ func TestUpdatePlainBinaryWithoutService(t *testing.T) {
 	}
 }
 
+// TestUpdateSupervisedLaunchAgentUsesControlSocket verifies worker handoff via the supervisor socket.
 func TestUpdateSupervisedLaunchAgentUsesControlSocket(t *testing.T) {
 	f := newUpdateFixture(t, "v1.0.0")
 	f.u.goos = "darwin"
@@ -347,6 +349,7 @@ func TestUpdateSupervisedLaunchAgentUsesControlSocket(t *testing.T) {
 	}
 }
 
+// TestUpdateSkipsInactiveLaunchAgentService verifies binary-only updates for inactive agents.
 func TestUpdateSkipsInactiveLaunchAgentService(t *testing.T) {
 	for _, state := range []launchAgentState{launchAgentDisabledState, launchAgentNotLoaded} {
 		t.Run(fmt.Sprint(state), func(t *testing.T) {
@@ -583,6 +586,7 @@ func TestPlistProgramArgumentsIgnoresNestedArrays(t *testing.T) {
 	}
 }
 
+// TestCompareReleaseVersions verifies semver and pseudo-version ordering.
 func TestCompareReleaseVersions(t *testing.T) {
 	const pseudo = "v0.1.134-0.20260927095747-b5bd50354af3"
 	for _, tc := range []struct {
@@ -620,6 +624,7 @@ func TestCompareReleaseVersions(t *testing.T) {
 	}
 }
 
+// TestSameVersionIgnoresBuildMetadata verifies semver build metadata is non-ordering.
 func TestSameVersionIgnoresBuildMetadata(t *testing.T) {
 	if !sameVersion("v0.1.146+main.f8124b9f", "v0.1.146") {
 		t.Fatal("sameVersion treated a main build of the same release as newer")

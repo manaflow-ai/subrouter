@@ -94,6 +94,7 @@ type installTarget struct {
 	leasePath string
 }
 
+// hasDaemon reports whether update owns a service that it should restart.
 func (t installTarget) hasDaemon() bool {
 	return !t.skipService && (t.controller != nil || t.controlSocket != "")
 }
@@ -631,6 +632,7 @@ func systemdExecStartBinary(unit string) string {
 // ---------------------------------------------------------------------------
 // Versions
 
+// normalizeVersion removes surrounding whitespace and a leading v prefix.
 func normalizeVersion(version string) string {
 	return strings.TrimPrefix(strings.TrimSpace(version), "v")
 }

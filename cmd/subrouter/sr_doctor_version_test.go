@@ -65,6 +65,7 @@ func TestDoctorSuggestsUpdateOnVersionSkew(t *testing.T) {
 	}
 }
 
+// TestSameBuildIdentityAcceptsReleaseAndRevisionForms verifies revision-based identity matching.
 func TestSameBuildIdentityAcceptsReleaseAndRevisionForms(t *testing.T) {
 	client := buildversion.Info{Version: "v0.1.146+main.f8124b9f", Commit: "f8124b9f"}
 	if !sameBuildIdentity(client, "rev-f8124b9f87f3", "f8124b9f87f3") {
