@@ -11067,7 +11067,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 	}
 	addressed := accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential}
-	response, err := a.send(base, req, addressed)
+	response, err := a.send(base, attemptReq, addressed)
 	return tagRoutedResponseAccount(response, addressed), err
 }
 
