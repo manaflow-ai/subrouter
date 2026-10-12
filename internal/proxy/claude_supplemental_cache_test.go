@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -477,6 +478,28 @@ func TestClaudeScopeDenialClearsUsageEndpointThrottle(t *testing.T) {
 	}
 	if len(windows) == 0 {
 		t.Fatal("probe windows missing")
+	}
+}
+
+func TestClaudeStaleScopeDenialDoesNotClearNewCredentialThrottle(t *testing.T) {
+	ref := &AccountRef{}
+	old := probeAccount()
+	current := old
+	current.Token = "new-oauth-token"
+	current.CredentialVersion = "new-refresh-chain"
+	cacheKey := current.ID + "\x00" + string(current.Provider)
+	ref.usageWindowsFailures = map[string]usageWindowsFailure{
+		usageWindowsFailureKey(cacheKey): {
+			err: errors.New("429 Too Many Requests"), retryAt: time.Now().Add(time.Hour),
+			credentialKey: usageWindowsCredentialKey(current),
+		},
+	}
+
+	// A late scope-denial result from the replaced credential must not remove
+	// the newer login's account throttle.
+	ref.rememberClaudeUsageScopeDenied(old)
+	if _, ok := ref.usageWindowsFailures[usageWindowsFailureKey(cacheKey)]; !ok {
+		t.Fatal("stale credential scope denial cleared the newer throttle")
 	}
 }
 

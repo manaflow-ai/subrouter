@@ -653,6 +653,10 @@ type usageWindowsFailure struct {
 	err     error
 	at      time.Time
 	retryAt time.Time
+	// credentialKey identifies the credential that observed the throttle.
+	// The hold is account-scoped across ordinary refreshes, but cleanup from
+	// an older credential must not erase a newer credential's failure.
+	credentialKey string
 	// windows preserve provider-supplied reset metadata across the throttle
 	// cache window so repeated status reads remain display-only.
 	windows   []accounts.UsageWindow
@@ -983,6 +987,7 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 					}
 					failure := usageWindowsFailure{
 						err: flight.err, at: now, retryAt: usageWindowsThrottleUntil(flight.err, now),
+						credentialKey: credentialKey,
 					}
 					if errors.As(flight.err, &throttle) && len(throttle.Windows) > 0 {
 						failure.windows = append([]accounts.UsageWindow(nil), throttle.Windows...)

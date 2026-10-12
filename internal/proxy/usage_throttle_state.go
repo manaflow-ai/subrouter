@@ -23,6 +23,7 @@ var errPersistedUsageThrottle = errors.New("usage fetch failed: 429 Too Many Req
 type durableUsageThrottle struct {
 	SchemaVersion int                    `json:"schema_version"`
 	CacheKey      string                 `json:"cache_key"`
+	CredentialKey string                 `json:"credential_key,omitempty"`
 	RetryAt       time.Time              `json:"retry_at"`
 	Windows       []accounts.UsageWindow `json:"windows,omitempty"`
 	FetchedAt     time.Time              `json:"fetched_at,omitempty"`
@@ -84,7 +85,8 @@ func (r *AccountRef) restoreUsageThrottleState() {
 		if prior, ok := r.usageWindowsFailures[saved.CacheKey]; !ok || saved.RetryAt.After(prior.retryAt) {
 			r.usageWindowsFailures[saved.CacheKey] = usageWindowsFailure{
 				err: errPersistedUsageThrottle, retryAt: saved.RetryAt,
-				windows: append([]accounts.UsageWindow(nil), saved.Windows...), fetchedAt: saved.FetchedAt,
+				credentialKey: saved.CredentialKey,
+				windows:       append([]accounts.UsageWindow(nil), saved.Windows...), fetchedAt: saved.FetchedAt,
 			}
 		}
 	}
@@ -106,6 +108,7 @@ func (r *AccountRef) persistUsageThrottleState(cacheKey string, failure usageWin
 	saved := durableUsageThrottle{
 		SchemaVersion: usageThrottleStateSchemaVersion,
 		CacheKey:      cacheKey,
+		CredentialKey: failure.credentialKey,
 		RetryAt:       failure.retryAt,
 		Windows:       append([]accounts.UsageWindow(nil), failure.windows...),
 		FetchedAt:     failure.fetchedAt,
