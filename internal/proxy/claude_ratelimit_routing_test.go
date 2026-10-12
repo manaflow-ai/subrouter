@@ -1038,6 +1038,8 @@ func TestClaudeTransient429FailsOverWithoutPoisoningScore(t *testing.T) {
 	}
 }
 
+// TestClaudeHeaderless429FailsOverWithoutPoisoningScore proves a transient
+// headerless 429 retries the sticky account before any account switch.
 func TestClaudeHeaderless429FailsOverWithoutPoisoningScore(t *testing.T) {
 	server, store := claudeFailoverServer(t)
 	if _, err := store.Put("claude", "session-plain-429", "cooked@example.com", ""); err != nil {

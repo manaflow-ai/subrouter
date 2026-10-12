@@ -9779,6 +9779,8 @@ const providerOverloadMaxRetries = 2
 // transient throttle does not discard its warm prompt cache.
 const claudeTransient429MaxRetries = 2
 
+// claudeTransient429Backoff returns the short delay before a same-account
+// retry after a headerless Claude 429.
 func claudeTransient429Backoff(retry int) time.Duration {
 	if retry <= 0 {
 		return 250 * time.Millisecond
