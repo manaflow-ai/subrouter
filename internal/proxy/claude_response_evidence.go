@@ -29,6 +29,7 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 		current.CredentialIdentity() != routed.CredentialIdentity() {
 		return nil, false, 0
 	}
+	generation := r.Generation()
 	windows := make([]accounts.UsageWindow, 0, len(observed))
 	for _, window := range observed {
 		if window.Feature != "" {
@@ -65,7 +66,7 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 			// An exhausted window without a reset time cannot be cached
 			// safely. The next regular usage check will reassess it.
 			delete(r.claudeSupplemental, key)
-			return observed, true, r.Generation()
+			return observed, true, generation
 		}
 	}
 	observedAt := now // the headers arrived now, regardless of request duration
@@ -134,5 +135,5 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 			r.usageWindows[cacheKey] = entry
 		}
 	}
-	return observed, true, r.Generation()
+	return observed, true, generation
 }

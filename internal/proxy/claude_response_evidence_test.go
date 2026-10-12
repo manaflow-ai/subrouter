@@ -18,6 +18,7 @@ import (
 	"github.com/manaflow-ai/subrouter/session"
 )
 
+// passiveClaudeAccount returns a minimal OAuth account for response evidence tests.
 func passiveClaudeAccount(token, version string) accounts.Account {
 	return accounts.Account{
 		ID:                "claude-test",
@@ -28,6 +29,7 @@ func passiveClaudeAccount(token, version string) accounts.Account {
 	}
 }
 
+// passiveClaudeHeader builds one model quota header family for a test response.
 func passiveClaudeHeader(prefix, utilization string) http.Header {
 	h := make(http.Header)
 	h.Set("anthropic-ratelimit-unified-"+prefix+"-utilization", utilization)
@@ -49,6 +51,7 @@ func passiveClaudeAccountQuotaHeaders() http.Header {
 	return h
 }
 
+// findFeatureWindow locates a model-specific quota bucket in observed windows.
 func findFeatureWindow(windows []accounts.UsageWindow, feature string) (accounts.UsageWindow, bool) {
 	for _, window := range windows {
 		if window.Feature == feature {
@@ -63,6 +66,7 @@ type partialSupplementalTransport struct {
 	fableCalls int
 }
 
+// RoundTrip serves the primary usage endpoint and a partial model probe.
 func (t *partialSupplementalTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	switch req.URL.Path {
 	case "/api/oauth/usage":

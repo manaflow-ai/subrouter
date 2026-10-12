@@ -5369,6 +5369,8 @@ func (s Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// proxyHandler builds the routing handler and publishes successful quota
+// response evidence before the response is written to the client.
 func (s Server) proxyHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Token usage latency runs from here, when the request arrived.
