@@ -85,7 +85,7 @@ func (r *AccountRef) rememberClaudeUsageScopeDenied(account accounts.Account) {
 	// It says nothing about the Messages probe, so it must not hold the
 	// probe back for the rest of its retry window.
 	cacheKey := account.ID + "\x00" + string(account.Provider)
-	delete(r.usageWindowsFailures, usageWindowsFailureKey(cacheKey, account.CredentialIdentity()))
+	delete(r.usageWindowsFailures, usageWindowsFailureKey(cacheKey))
 }
 
 func supplementalClaudeWindows(windows []accounts.UsageWindow) []accounts.UsageWindow {

@@ -47,9 +47,10 @@ func (r *AccountRef) invalidateReplacedAccountUsage(previous, current []accounts
 		if flightKey := r.usageWindowsLatest[key]; strings.HasPrefix(flightKey, key+"\x00"+oldKey+"\x00") {
 			delete(r.usageWindowsLatest, key)
 		}
-		// Cached telemetry failures and supplementary quota are already
-		// credential-scoped. Keep newer grants' evidence intact.
-		delete(r.usageWindowsFailures, usageWindowsFailureKey(key, account.CredentialIdentity()))
+		// Cached telemetry failures are account-scoped so a true re-login must
+		// clear the shared Retry-After hold. Supplementary quota remains
+		// credential-scoped, so newer grants' evidence stays intact.
+		delete(r.usageWindowsFailures, usageWindowsFailureKey(key))
 		delete(r.claudeSupplemental, claudeSupplementalCacheKey(account))
 	}
 	r.usageWindowsMu.Unlock()

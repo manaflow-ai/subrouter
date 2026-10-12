@@ -117,12 +117,8 @@ func TestUnchangedCredentialAndOrdinaryRefreshKeepUsageCache(t *testing.T) {
 	if _, ok := ref.usageWindows[key]; !ok || ref.usageWindowsEpoch != 0 {
 		t.Fatal("ordinary token refresh needlessly invalidated successful quota readings")
 	}
-	newFailureKey := usageWindowsFailureKey(key, refreshed.CredentialIdentity())
-	if _, ok := ref.usageWindowsFailures[oldFailureKey]; ok {
-		t.Fatal("ordinary token refresh retained cooldown under the old credential key")
-	}
-	if failure, ok := ref.usageWindowsFailures[newFailureKey]; !ok || !failure.retryAt.Equal(retryAt) {
-		t.Fatalf("ordinary token refresh lost active cooldown: %+v", ref.usageWindowsFailures)
+	if failure, ok := ref.usageWindowsFailures[oldFailureKey]; !ok || !failure.retryAt.Equal(retryAt) {
+		t.Fatalf("ordinary token refresh lost the account cooldown: %+v", ref.usageWindowsFailures)
 	}
 	if _, ok := ref.usageWindowsLatest[key]; ok {
 		t.Fatal("ordinary token refresh left an old-credential fetch owning the cache")
@@ -160,7 +156,7 @@ func TestReloadSnapshotDropsPreviousLoginQuota(t *testing.T) {
 	}
 }
 
-func TestRepairedGrantReplaceDoesNotCarryThrottle(t *testing.T) {
+func TestReplacedLoginDoesNotCarryThrottle(t *testing.T) {
 	old := accounts.Account{
 		ID: "claude-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth,
 		Token: "same-access", CredentialVersion: "old-grant",
@@ -175,9 +171,8 @@ func TestRepairedGrantReplaceDoesNotCarryThrottle(t *testing.T) {
 	}
 	repaired := old
 	repaired.CredentialVersion = "repaired-grant"
-	ref.replace(repaired)
-	newFailureKey := usageWindowsFailureKey(key, repaired.CredentialIdentity())
-	if _, ok := ref.usageWindowsFailures[newFailureKey]; ok {
-		t.Fatal("repaired refresh grant inherited the old credential throttle")
+	ref.invalidateReplacedAccountUsage([]accounts.Account{old}, []accounts.Account{repaired})
+	if _, ok := ref.usageWindowsFailures[oldFailureKey]; ok {
+		t.Fatal("replacement login inherited the old account throttle")
 	}
 }
