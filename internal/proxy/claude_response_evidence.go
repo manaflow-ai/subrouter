@@ -12,22 +12,22 @@ import (
 // responses, eliminating a later synthetic model probe when possible. It also
 // publishes account-wide reset headers to the scheduler so exhausted accounts
 // can sleep until the provider's next reset instead of being polled on TTL.
-func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header http.Header, requestStarted time.Time) ([]accounts.UsageWindow, bool) {
+func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header http.Header, requestStarted time.Time) ([]accounts.UsageWindow, bool, uint64) {
 	if r == nil || routed.Provider != accounts.ProviderClaude || routed.ID == "" ||
 		routed.CredentialIdentity() == "" {
-		return nil, false
+		return nil, false, 0
 	}
 	now := time.Now()
 	observed := agentclaude.ObservedUsageWindows(header, now)
 	if len(observed) == 0 {
-		return nil, false
+		return nil, false, 0
 	}
 	// A failed-over reply belongs to the actual serving credential, not
 	// necessarily the initial choice. Ignore results from a superseded login.
 	current := r.credentialSnapshot(accounts.ProviderClaude, routed.ID)
 	if current.AuthMode != accounts.AuthModeOAuth || current.Token == "" ||
 		current.CredentialIdentity() != routed.CredentialIdentity() {
-		return nil, false
+		return nil, false, 0
 	}
 	windows := make([]accounts.UsageWindow, 0, len(observed))
 	for _, window := range observed {
@@ -42,16 +42,21 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 	r.usageWindowsMu.Lock()
 	defer r.usageWindowsMu.Unlock()
 	existing, hadPrevious := r.claudeSupplemental[key]
-	if hadPrevious && len(windows) > 0 {
+	cacheKey := current.ID + "\x00" + string(current.Provider)
+	accountEntry, hadAccountPrevious := r.usageWindows[cacheKey]
+	if hadPrevious || hadAccountPrevious {
 		previousStart := existing.requestStarted
 		if previousStart.IsZero() {
 			// Ordinary quota probes do not represent a model request. A reply
 			// started before that probe cannot supersede its later evidence.
 			previousStart = existing.at
 		}
+		if hadAccountPrevious && accountEntry.at.After(previousStart) {
+			previousStart = accountEntry.at
+		}
 		if !requestStarted.After(previousStart) {
 			// Older concurrent requests must not overwrite newer quota evidence.
-			return observed, true
+			return nil, false, 0
 		}
 	}
 
@@ -60,7 +65,7 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 			// An exhausted window without a reset time cannot be cached
 			// safely. The next regular usage check will reassess it.
 			delete(r.claudeSupplemental, key)
-			return observed, true
+			return observed, true, r.Generation()
 		}
 	}
 	observedAt := now // the headers arrived now, regardless of request duration
@@ -103,14 +108,31 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 		if r.usageWindows == nil {
 			r.usageWindows = map[string]usageWindowsEntry{}
 		}
-		cacheKey := current.ID + "\x00" + string(current.Provider)
-		entry := r.usageWindows[cacheKey]
+		entry := accountEntry
 		if entry.credentialKey == "" || entry.credentialKey == usageWindowsCredentialKey(current) {
-			entry.windows = mergeUsageWindows(entry.windows, accountWindows)
-			entry.at = now
+			base := make([]accounts.UsageWindow, 0, len(entry.windows))
+			for _, window := range entry.windows {
+				if !window.ResetAt.IsZero() && !now.Before(window.ResetAt) {
+					continue
+				}
+				base = append(base, window)
+			}
+			entry.windows = mergeUsageWindows(base, accountWindows)
+			entryAt := now
+			replaced := make(map[string]bool, len(accountWindows))
+			for _, window := range accountWindows {
+				replaced[usageWindowMergeKey(window)] = true
+			}
+			for _, window := range base {
+				if window.Feature == "" && !replaced[usageWindowMergeKey(window)] {
+					entryAt = entry.at
+					break
+				}
+			}
+			entry.at = entryAt
 			entry.credentialKey = usageWindowsCredentialKey(current)
 			r.usageWindows[cacheKey] = entry
 		}
 	}
-	return observed, true
+	return observed, true, r.Generation()
 }

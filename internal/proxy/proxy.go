@@ -5934,9 +5934,9 @@ func (s Server) proxyHandler() http.Handler {
 				!claudeResponseRejected(response.Header) {
 				// Learn usable model quota from an ordinary response. No
 				// additional upstream request is made at this boundary.
-				observed, ok := s.AccountRef.observeClaudeQuotaHeaders(responseAccount, response.Header, requestStarted)
+				observed, ok, generation := s.AccountRef.observeClaudeQuotaHeaders(responseAccount, response.Header, requestStarted)
 				if ok {
-					s.mergeClaudeResponseQuotaScore(responseAccount, observed)
+					s.mergeClaudeResponseQuotaScore(responseAccount, observed, generation, responseAccount.CredentialIdentity())
 				}
 			}
 			s.captureResponseBodyForAccount(response, r.Context(), sessionAgentType, sessionID, responseAccount, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)

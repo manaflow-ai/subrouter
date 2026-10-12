@@ -281,6 +281,16 @@ func TestRealClaudeProxyResponseSeedsLaterModelQuotaCache(t *testing.T) {
 	if fable, ok := findFeatureWindow(windows, agentclaude.FableFeature); !ok || fable.UsedPercent != 40 {
 		t.Fatalf("real response did not retain model quota alongside account windows: %+v", windows)
 	}
+	var account7d bool
+	for _, window := range windows {
+		if window.Feature == "" && window.LimitWindowSeconds == 7*24*60*60 && window.UsedPercent == 20 {
+			account7d = true
+			break
+		}
+	}
+	if !account7d {
+		t.Fatalf("real response did not retain the account-wide 7d quota window: %+v", windows)
+	}
 	for range 3 {
 		if _, scored := s.scoreAccounts(context.Background(), []accounts.Account{account}); scored != 0 {
 			t.Fatalf("future account reset triggered a quota poll on repeated score refresh: scored=%d", scored)

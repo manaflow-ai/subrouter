@@ -20,8 +20,12 @@ func knownAccountWideQuotaReset(score selectacct.Score, now time.Time) (time.Tim
 // mergeClaudeResponseQuotaScore publishes account-wide reset headers learned
 // from a successful model response. This is a partial observation, so merge it
 // into the current scheduler instead of replacing other providers' scores.
-func (s Server) mergeClaudeResponseQuotaScore(account accounts.Account, windows []accounts.UsageWindow) {
+func (s Server) mergeClaudeResponseQuotaScore(account accounts.Account, windows []accounts.UsageWindow, generation uint64, credentialIdentity string) {
 	if s.AccountRef == nil || s.SchedulerRef == nil || account.ID == "" {
+		return
+	}
+	current := s.AccountRef.credentialSnapshot(accounts.ProviderClaude, account.ID)
+	if current.CredentialIdentity() != credentialIdentity || current.CredentialIdentity() != account.CredentialIdentity() || s.AccountRef.Generation() != generation {
 		return
 	}
 	accountWindows := make([]accounts.UsageWindow, 0, len(windows))
@@ -30,13 +34,22 @@ func (s Server) mergeClaudeResponseQuotaScore(account accounts.Account, windows 
 			accountWindows = append(accountWindows, window)
 		}
 	}
+	// The response may carry only one account-wide bucket. Reuse the cache
+	// merged by observeClaudeQuotaHeaders so a partial response cannot drop a
+	// still-valid 5h or 7d window from the replacement scheduler score.
+	cacheKey := account.ID + "\x00" + string(account.Provider)
+	s.AccountRef.usageWindowsMu.Lock()
+	if entry, ok := s.AccountRef.usageWindows[cacheKey]; ok &&
+		(entry.credentialKey == "" || entry.credentialKey == usageWindowsCredentialKey(account)) {
+		accountWindows = mergeUsageWindows(entry.windows, accountWindows)
+	}
+	s.AccountRef.usageWindowsMu.Unlock()
 	if len(accountWindows) == 0 {
 		return
 	}
 	provider := schedulerAccountProvider(account.Provider)
 	score := scoreFromUsageWindows(provider, account.ID, accountWindows)
 	score.Fresh = true
-	generation := s.AccountRef.Generation()
 	if _, ok := s.SchedulerRef.MergeScoresForAccountGeneration([]selectacct.Score{score}, generation); !ok {
 		return
 	}
