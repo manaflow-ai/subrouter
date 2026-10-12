@@ -74,6 +74,9 @@ if [ -f "$BAKE_LIB" ]; then
   # shellcheck disable=SC1090
   . "$BAKE_LIB" && BAKE_GATE=1
 fi
+if [ "$BAKE_GATE" -eq 1 ]; then
+  bake_prepare_release_state || true
+fi
 CANARY=0
 if [ "$BAKE_GATE" -eq 1 ] && declare -F canary_reconcile >/dev/null; then
   CANARY=1

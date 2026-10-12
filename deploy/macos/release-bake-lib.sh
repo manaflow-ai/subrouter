@@ -33,6 +33,41 @@ BAKE_5XX_MARGIN="${SUBROUTER_BAKE_5XX_MARGIN:-0.05}"
 # roll it back.
 BAKE_MAX_RESTARTS="${SUBROUTER_BAKE_MAX_RESTARTS:-2}"
 
+# The supervisor and worker run as the LaunchDaemon's service user, while the
+# deploy and guard jobs run as root. Canary transitions write this file with an
+# atomic same-directory rename, so the service user needs to create and remove
+# its temporary file in the state directory as well as read the final file.
+# The directory is dedicated to deploy bookkeeping; the service group needs
+# directory write access because an atomic rename replaces the old state file.
+bake_prepare_release_state() {
+  [ "$(id -u 2>/dev/null || echo 1)" -eq 0 ] || return 0
+  [ -f "${PLIST:-}" ] || return 0
+
+  local service_user service_group state_dir
+  service_user="$(PLIST="$PLIST" python3 - <<'PY' 2>/dev/null || true
+import os, plistlib
+try:
+    with open(os.environ["PLIST"], "rb") as stream:
+        value = plistlib.load(stream).get("UserName")
+except (OSError, ValueError, TypeError):
+    value = ""
+print(value or "")
+PY
+)"
+  [ -n "$service_user" ] || return 0
+  [ "$service_user" != root ] || return 0
+  service_group="$(id -gn "$service_user" 2>/dev/null || true)"
+  [ -n "$service_group" ] || return 0
+  state_dir="$(dirname "$RELEASE_STATE_FILE")"
+  mkdir -p "$state_dir" || return 1
+  chown "root:${service_group}" "$state_dir" || return 1
+  chmod 0770 "$state_dir" || return 1
+  if [ -e "$RELEASE_STATE_FILE" ]; then
+    chown "root:${service_group}" "$RELEASE_STATE_FILE" || return 1
+    chmod 0660 "$RELEASE_STATE_FILE" || return 1
+  fi
+}
+
 bake_enabled() { [ "${BAKE_SECONDS:-0}" -gt 0 ] 2>/dev/null; }
 
 bake_traffic_url() {
