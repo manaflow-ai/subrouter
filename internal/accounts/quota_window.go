@@ -3,6 +3,7 @@ package accounts
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // longQuotaWindowMinSeconds is the shortest window length treated as an
@@ -39,6 +40,12 @@ func WeeklyCookedWindow(windows []UsageWindow) (UsageWindow, bool) {
 	shortFull := false
 	for i, window := range windows {
 		if IsModelScopedWindow(window) {
+			continue
+		}
+		// Cached status can outlive the provider's quota window when the
+		// usage endpoint is throttled. An absolute reset is authoritative:
+		// once it has passed, the old 100% reading no longer means cooked.
+		if !window.ResetAt.IsZero() && !window.ResetAt.After(time.Now()) {
 			continue
 		}
 		if window.Name == "reached" {

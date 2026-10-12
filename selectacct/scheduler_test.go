@@ -446,6 +446,17 @@ func TestWeeklyHeadroomTracksOnlyLongWindows(t *testing.T) {
 	}
 }
 
+func TestScoreFromLimitWindowsClearsExpiredAbsoluteReset(t *testing.T) {
+	weekly := int64(7 * 24 * 60 * 60)
+	score := ScoreFromLimitWindows("acct", 0, []LimitWindow{{
+		Name: "7d", UsedPercent: 100, LimitWindowSeconds: weekly,
+		ResetAt: time.Now().Add(-time.Minute),
+	}})
+	if score.exhausted() || score.WeeklyCooked() {
+		t.Fatalf("expired weekly window stayed cooked: %+v", score)
+	}
+}
+
 func TestWeeklyHeadroomUsesSixDayLongWindowThreshold(t *testing.T) {
 	day := int64(24 * 60 * 60)
 	session := int64(5 * 60 * 60)

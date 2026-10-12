@@ -111,6 +111,13 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 	var exhaustedResetAt time.Time
 	exhaustedResetUnknown := false
 	for _, window := range windows {
+		// Usage snapshots can be served after their provider reset when the
+		// telemetry endpoint is throttled. An absolute reset supersedes the
+		// old utilization reading so a stale 100% window cannot keep routing
+		// or status cooked past its reset.
+		if !window.ResetAt.IsZero() && !window.ResetAt.After(time.Now()) {
+			continue
+		}
 		remaining := 1 - clampPercent(window.UsedPercent)/100
 		if remaining <= 0 {
 			if window.ResetAt.IsZero() {

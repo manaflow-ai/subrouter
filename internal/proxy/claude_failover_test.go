@@ -354,6 +354,17 @@ func TestReuseStickyAssignmentClaudeExhausted(t *testing.T) {
 	}
 }
 
+func TestReuseStickyAssignmentClaudeKeepsSubFloorSession(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	account := accounts.Account{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}
+	scheduler := selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: account.ID, Provider: accounts.ProviderClaude, Headroom: 0.30, ShortHeadroom: 0.30},
+	})
+	if !server.reuseStickyAssignment("claude", "session-1", account, scheduler) {
+		t.Fatal("Claude session below the 40% new-session floor should stay sticky while headroom remains")
+	}
+}
+
 func TestCaptureResponseBodyClaude429MarksExhausted(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
 	// A quota 429 carries the authoritative rejected header; that is what marks
