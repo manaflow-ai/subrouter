@@ -9774,6 +9774,18 @@ func (t usageLimitRetryTransport) headerConfirmedClaudeQuota429(response *http.R
 // overload reroute (SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1).
 const providerOverloadMaxRetries = 2
 
+// A healthy Claude account can return a headerless 429 during a short request
+// burst. Keep the session on that account for a couple of quick retries so a
+// transient throttle does not discard its warm prompt cache.
+const claudeTransient429MaxRetries = 2
+
+func claudeTransient429Backoff(retry int) time.Duration {
+	if retry <= 0 {
+		return 250 * time.Millisecond
+	}
+	return time.Second
+}
+
 // Claude overload ladder. Anthropic overload (529/5xx) is API-wide and
 // should be rare and brief, and the session's prompt cache lives on its
 // account, so by default the request stays there and waits it out: 1s, 2s,
@@ -10475,6 +10487,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	overloadRerouted, quotaFailedOver := false, false
 	failoverReason := accountMoveUsageLimit
 	claudeExtraUsageRetried := false
+	claudeTransient429Retries := 0
 	sealedStripped := false
 	// replayReq is what later attempts rebuild from. It starts as the client's
 	// request and becomes the stripped one once sealed reasoning is dropped,
@@ -10687,6 +10700,28 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				t.logAntigravityUnusableResponse(response, accountID)
 			}
 		}
+		if t.provider == accounts.ProviderClaude && response.StatusCode == http.StatusTooManyRequests &&
+			usageLimited && !exhausted && !credentialFailure && claudeUnifiedStatus(response.Header) == "" &&
+			claudeTransient429Retries < claudeTransient429MaxRetries && attempt < maxAttempts && a.consume() {
+			wait := claudeTransient429Backoff(claudeTransient429Retries)
+			claudeTransient429Retries++
+			if response.Body != nil {
+				_ = response.Body.Close()
+			}
+			if sleepErr := t.sleepCtx(req.Context(), wait); sleepErr != nil {
+				return nil, sleepErr
+			}
+			nextReq, replayErr := a.replay(replayReq, nil)
+			if replayErr != nil {
+				return nil, replayErr
+			}
+			// Preserve the current account's auth headers when replaying. The
+			// session stays sticky; only the transient request is repeated.
+			nextReq.Header = attemptReq.Header.Clone()
+			attemptReq = nextReq
+			attempt--
+			continue
+		}
 		if !usageLimited && !modelUnsupported {
 			if overloadRerouted && !quotaFailedOver && !t.commitFirstSuccess {
 				// Served by the one-shot overload reroute: the sticky account is
@@ -10861,6 +10896,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		accountID = nextAccount.ID
 		accountCredential = nextAccount.CredentialIdentity()
+		claudeTransient429Retries = 0
 		tried[accountID] = struct{}{}
 		if t.server != nil && t.server.SchedulerRef != nil {
 			t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
