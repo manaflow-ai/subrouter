@@ -36,6 +36,8 @@ func passiveClaudeHeader(prefix, utilization string) http.Header {
 	return h
 }
 
+// passiveClaudeAccountQuotaHeaders builds a response carrying both account
+// quota windows and the Fable model bucket.
 func passiveClaudeAccountQuotaHeaders() http.Header {
 	h := passiveClaudeHeader("7d_oi", "0.4")
 	h.Set("Anthropic-Ratelimit-Unified-5h-Utilization", "1")
@@ -98,6 +100,8 @@ func TestPassiveClaudeReplyEliminatesSupplementaryQuotaProbe(t *testing.T) {
 	}
 }
 
+// TestObservedClaudeResponseQuotaIncludesAccountAndModelWindows verifies that
+// response parsing preserves account-wide and model-specific quota windows.
 func TestObservedClaudeResponseQuotaIncludesAccountAndModelWindows(t *testing.T) {
 	windows := agentclaude.ObservedUsageWindows(passiveClaudeAccountQuotaHeaders(), time.Now())
 	var accountWindows, modelWindows int
@@ -216,6 +220,8 @@ func TestPassiveClaudeLongRequestStillPublishesFreshArrivingHeaders(t *testing.T
 	}
 }
 
+// TestRealClaudeProxyResponseSeedsLaterModelQuotaCache verifies that a real
+// response updates reset scheduling and suppresses redundant quota polling.
 func TestRealClaudeProxyResponseSeedsLaterModelQuotaCache(t *testing.T) {
 	account := passiveClaudeAccount("real-response-token", "grant-v1")
 	ref := &AccountRef{accounts: []accounts.Account{account}, store: accounts.CodexStore{Dir: t.TempDir()}}
