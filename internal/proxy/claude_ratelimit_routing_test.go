@@ -131,9 +131,10 @@ func TestClaude429FailoverEndToEndAndCaptured(t *testing.T) {
 	}
 
 	logs := logBuf.String()
-	// The genuine upstream message must be captured so operators can see it.
-	if !strings.Contains(logs, "This request would exceed your account") {
-		t.Fatalf("expected the 429 body to be logged; logs=\n%s", logs)
+	// Response bodies stay out of logs; bounded headers carry the actionable
+	// reset evidence without risking provider error payloads or credentials.
+	if strings.Contains(logs, "This request would exceed your account") {
+		t.Fatalf("429 response body must not be logged; logs=\n%s", logs)
 	}
 	// The rate-limit headers must be captured too.
 	for _, want := range []string{"retry-after", "anthropic-ratelimit-unified-reset"} {

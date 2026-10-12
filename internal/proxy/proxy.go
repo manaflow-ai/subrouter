@@ -7259,12 +7259,7 @@ func (s Server) markAccountExhaustedFromResponseForAccount(account accounts.Acco
 	}
 	// Kimi is the exception: its documented quota limits are 403s, and the
 	// caller reaches this method only after matching an exact quota message.
-	if status == http.StatusForbidden && account.Provider != accounts.ProviderKimi {
-		// Org-level OAuth disablement is account state, not credential state:
-		// not a rate-limit window, no reset header exists, and neither
-		// self-heals on a schedule. A longer TTL avoids probing every few
-		// minutes while still picking the account back up within the hour after
-		// an org re-enable. Token rotation must not clear this exclusion.
+	if status == http.StatusForbidden && account.Provider != accounts.ProviderKimi && account.Provider != accounts.ProviderClaude {
 		s.SchedulerRef.MarkAccountUnavailableUntil(
 			schedulerAccountProvider(account.Provider), account.ID, time.Now().Add(credentialExhaustionTTL),
 		)
@@ -7360,6 +7355,29 @@ func (s Server) markAccountExhaustedCredentialForAccount(account accounts.Accoun
 	}
 	s.SchedulerRef.MarkCredentialExhaustedForSnapshot(
 		schedulerAccountProvider(account.Provider), account.ID, account.CredentialIdentity(), time.Now().Add(credentialExhaustionTTL),
+		generation, credentialRevision, SchedulerAccounts(loaded),
+	)
+}
+
+// markPersistentAuthorizationDenial excludes an account's exact credential
+// until a credential update restores it. The scheduler keeps this separate
+// from expiring quota and refresh marks, so stale usage snapshots cannot make
+// a denied OAuth credential selectable again.
+func (s Server) markPersistentAuthorizationDenial(account accounts.Account) {
+	if s.SchedulerRef == nil || account.ID == "" {
+		return
+	}
+	if s.AccountRef == nil {
+		// Legacy/test servers without an AccountRef cannot bind a denial to a
+		// credential generation. Keep their historical bounded exclusion.
+		s.SchedulerRef.MarkAccountUnavailableUntil(
+			schedulerAccountProvider(account.Provider), account.ID, time.Now().Add(credentialExhaustionTTL),
+		)
+		return
+	}
+	loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
+	s.SchedulerRef.MarkCredentialUnavailableForSnapshot(
+		schedulerAccountProvider(account.Provider), account.ID, account.CredentialIdentity(),
 		generation, credentialRevision, SchedulerAccounts(loaded),
 	)
 }
@@ -7612,6 +7630,58 @@ func credentialUnauthorizedJSON(body []byte) bool {
 		return false
 	}
 	return credentialUnauthorizedMap(event)
+}
+
+// persistentAuthorizationDenialJSON recognizes provider responses that say an
+// OAuth credential is no longer permitted for its organization. This is
+// account state, not a transient 403 or an expired access token.
+func persistentAuthorizationDenialJSON(body []byte) bool {
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil {
+		return false
+	}
+	return persistentAuthorizationDenialMap(event)
+}
+
+func persistentAuthorizationDenialMap(event map[string]any) bool {
+	for _, key := range []string{"type", "code", "error_code"} {
+		value := strings.ToLower(strings.TrimSpace(stringField(event, key)))
+		if value == "oauth_not_allowed_for_organization" || value == "oauth_not_allowed_for_org" {
+			return true
+		}
+	}
+	message := strings.ToLower(strings.TrimSpace(stringField(event, "message")))
+	if strings.Contains(message, "oauth") && strings.Contains(message, "not allowed") && strings.Contains(message, "organization") {
+		return true
+	}
+	for _, key := range []string{"error", "details", "response"} {
+		if nested, ok := event[key].(map[string]any); ok && persistentAuthorizationDenialMap(nested) {
+			return true
+		}
+	}
+	return false
+}
+
+func responsePersistentAuthorizationDenial(response *http.Response) (bool, error) {
+	if response == nil || response.StatusCode != http.StatusForbidden || response.Body == nil {
+		return false, nil
+	}
+	body := response.Body
+	prefix, err := io.ReadAll(io.LimitReader(body, usageLimitInspectMaxBytes+1))
+	if err != nil {
+		response.Body = prefixReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), Closer: body}
+		return false, err
+	}
+	if int64(len(prefix)) > usageLimitInspectMaxBytes {
+		response.Body = prefixReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), Closer: body}
+		return false, nil
+	}
+	closeErr := body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(prefix))
+	if closeErr != nil {
+		return false, closeErr
+	}
+	return persistentAuthorizationDenialJSON(prefix), nil
 }
 
 func credentialUnauthorizedMap(event map[string]any) bool {
@@ -7957,6 +8027,9 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 			if claudeUnusable && response.StatusCode == http.StatusUnauthorized {
 				s.noteClaudeRevoked(account, response.StatusCode, body)
 			}
+			if claudeUnusable && response.StatusCode == http.StatusForbidden && persistentAuthorizationDenialJSON(body) {
+				s.markPersistentAuthorizationDenial(account)
+			}
 			if inspectClaudeCredit && claudeCreditExhaustedMessage(body) {
 				s.markClaudeCreditExhausted(accountID)
 			}
@@ -7998,7 +8071,8 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 					"account", accountID,
 					"path", path,
 					"status", response.StatusCode,
-					"body", string(body))
+					"persistent_authorization_denial", response.StatusCode == http.StatusForbidden && persistentAuthorizationDenialJSON(body),
+					"credential_denial", response.StatusCode == http.StatusUnauthorized && credentialUnauthorizedJSON(body))
 			}
 		}
 	}
@@ -10502,6 +10576,32 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	// providers that never strip.
 	replayReq := req
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// A denial can arrive while another request still holds the sticky
+		// assignment. Re-check the controller immediately before every physical
+		// attempt so queued concurrent callers move to a different credential
+		// instead of repeating the denied upstream request.
+		if a.replayable() && t.server != nil && t.server.SchedulerRef != nil {
+			if _, blocked := t.server.SchedulerRef.ExplicitBlockedUntilFor(
+				schedulerAccountProvider(t.provider), accountID, t.poolModel, time.Now(),
+			); blocked {
+				tried[accountID] = struct{}{}
+				next, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
+				if pickErr != nil {
+					return nil, pickErr
+				}
+				nextReq, replayErr := a.replay(replayReq, &next)
+				if replayErr != nil {
+					return nil, replayErr
+				}
+				accountID = next.ID
+				accountCredential = next.CredentialIdentity()
+				tried[accountID] = struct{}{}
+				attemptReq = nextReq
+				quotaFailedOver = true
+				failoverReason = accountMoveCredential
+				continue
+			}
+		}
 		addressed := accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential}
 		response, err := a.send(base, attemptReq, addressed)
 		response = tagRoutedResponseAccount(response, addressed)
@@ -10522,8 +10622,14 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// A 200 SSE stream whose first decisive event is overloaded_error is the
 		// same overload arriving after the headers; nothing has reached the
 		// client yet, so it is retried exactly like a 529.
+		claudeStreamOverload := false
+		claudeStreamDenial := false
+		if t.provider == accounts.ProviderClaude {
+			claudeStreamOverload = claudeStreamOverloaded(response)
+			claudeStreamDenial = claudeStreamPersistentAuthorizationDenied(response)
+		}
 		claudeOverload := t.provider == accounts.ProviderClaude && !claudeResponseRejectedForPool(response.Header, t.poolModel) &&
-			(claudeOverloadStatus(response.StatusCode) || claudeStreamOverloaded(response))
+			(claudeOverloadStatus(response.StatusCode) || claudeStreamOverload)
 		kimiOverload := t.provider == accounts.ProviderKimi && response.StatusCode == http.StatusTooManyRequests
 		if claudeOverload || kimiOverload {
 			if claudeOverload && overloadRerouted {
@@ -10680,6 +10786,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			return response, nil
 		}
 		usageLimited, exhausted, credentialFailure := false, false, false
+		persistentAuthorizationDenial := claudeStreamDenial
 		claudeCreditExhausted := false
 		if !modelUnsupported && t.provider == accounts.ProviderClaude {
 			claudeCreditExhausted, inspectErr = responseClaudeCreditExhausted(response)
@@ -10704,6 +10811,21 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			if t.provider == accounts.ProviderAntigravity && usageLimited {
 				t.logAntigravityUnusableResponse(response, accountID)
+			}
+			if t.provider == accounts.ProviderClaude && response.StatusCode == http.StatusForbidden {
+				persistentAuthorizationDenial, inspectErr = responsePersistentAuthorizationDenial(response)
+				if inspectErr != nil {
+					if t.logger != nil {
+						t.logger.Warn("persistent authorization response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
+					}
+					return response, nil
+				}
+				if persistentAuthorizationDenial {
+					usageLimited, exhausted = true, true
+				}
+			}
+			if persistentAuthorizationDenial {
+				usageLimited, exhausted = true, true
 			}
 		}
 		if t.provider == accounts.ProviderClaude && response.StatusCode == http.StatusTooManyRequests &&
@@ -10770,6 +10892,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// Only poison the score on genuine quota exhaustion; a transient
 			// "allowed"/"allowed_warning" 429 still fails over for this request.
 			exhausted = claudeAccountExhaustedByResponseForPool(response.StatusCode, response.Header, t.poolModel)
+			if response.StatusCode == http.StatusForbidden && !persistentAuthorizationDenial {
+				// A plain Claude 403 is request-scoped unless its structured body
+				// proves the organization entitlement denial.
+				exhausted = false
+			}
 			if exhausted && claudeRejectionIsExplicitlyAccountWide(response.StatusCode, response.Header) {
 				// Account-wide Claude windows apply across every model pool. The
 				// direct retry path sees the headers before passive response
@@ -10790,6 +10917,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		if t.server != nil && claudeCreditExhausted {
 			t.server.markClaudeCreditExhausted(accountID)
+		} else if t.server != nil && persistentAuthorizationDenial && !modelUnsupported {
+			t.server.markPersistentAuthorizationDenial(accounts.Account{
+				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
+			})
 		} else if t.server != nil && credentialFailure && !modelUnsupported {
 			if t.provider == accounts.ProviderClaude {
 				// Record the credential this attempt used: a concurrent re-login
@@ -11284,30 +11415,8 @@ func (t usageLimitRetryTransport) logClaudeUnusableResponse(response *http.Respo
 			"upstream", t.upstream,
 			"status", response.StatusCode,
 		}, claudeRateLimitHeaderFields(response.Header)...)...)
-	// Only the original hard rate-limit statuses (429/401) carry a known
-	// rate-limit/auth error envelope worth logging. A rejected-header response on
-	// any other status (a 200 served via overage, or an unrelated 4xx/5xx that
-	// merely carries the header) may contain a real completion or request details,
-	// so log headers only; the headers above already convey the rejected signal.
-	if response.Body == nil || !claudeAccountUnusableStatus(response.StatusCode) {
-		return
-	}
-	prefix, err := io.ReadAll(io.LimitReader(response.Body, usageLimitInspectMaxBytes+1))
-	response.Body = prefixReadCloser{
-		Reader: io.MultiReader(bytes.NewReader(prefix), response.Body),
-		Closer: response.Body,
-	}
-	if err != nil {
-		return
-	}
-	t.logger.Warn("claude account unusable upstream body",
-		"agent", t.agent,
-		"session", t.session,
-		"account", accountID,
-		"method", t.method,
-		"path", t.path,
-		"status", response.StatusCode,
-		"body", string(prefix))
+	// Keep response bodies out of logs. The classifier records only a safe
+	// refusal class elsewhere, while the headers above retain reset evidence.
 }
 
 // logAntigravityUnusableResponse records only bounded, non-content metadata for
