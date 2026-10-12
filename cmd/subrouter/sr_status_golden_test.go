@@ -52,7 +52,9 @@ func srStatusFixtureServer(t *testing.T, fixturePaths ...string) *httptest.Serve
 // credential storage points at a team router.
 func runSRStatusAgainstFixture(t *testing.T, args []string, fixturePaths ...string) (string, error) {
 	t.Helper()
-	t.Setenv("COLUMNS", "200")
+	if os.Getenv("COLUMNS") == "" {
+		t.Setenv("COLUMNS", "200")
+	}
 	t.Setenv("NO_COLOR", "1")
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -80,6 +82,16 @@ func runSRStatusAgainstFixture(t *testing.T, args []string, fixturePaths ...stri
 // Exercise the status command through the remote usage-status response, including
 // tier/credit metadata and revoked credentials that previously crowded out quota.
 func TestSRStatusQuotaTableFitsTerminal(t *testing.T) {
+	for _, width := range []string{"200", "0"} {
+		t.Run(width, func(t *testing.T) {
+			t.Setenv("COLUMNS", width)
+			assertSRStatusQuotaTable(t)
+		})
+	}
+}
+
+func assertSRStatusQuotaTable(t *testing.T) {
+	t.Helper()
 	got, err := runSRStatusAgainstFixture(t, []string{"status"}, "testdata/sr_status_layout.json")
 	if err != nil {
 		t.Fatal(err)
@@ -105,6 +117,9 @@ func TestSRStatusQuotaTableFitsTerminal(t *testing.T) {
 		if strings.Contains(claude, unwanted) {
 			t.Fatalf("Claude table contains %q:\n%s", unwanted, got)
 		}
+	}
+	if !strings.Contains(claude, "State") || !strings.Contains(claude, "active, cooked") {
+		t.Fatalf("Claude state must remain visible without a terminal:\n%s", claude)
 	}
 	for _, want := range []string{
 		"primary.subscription.account@example.test", "primary.codex.account@example.test",
