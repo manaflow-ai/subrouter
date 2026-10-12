@@ -11514,7 +11514,7 @@ func codexRateLimitHeaderFields(header http.Header) []any {
 	sort.Strings(keys)
 	fields := make([]any, 0, len(keys)*2)
 	for _, key := range keys {
-		fields = append(fields, strings.ToLower(key), header.Get(key))
+		fields = append(fields, strings.ToLower(key), truncateLogValue(header.Get(key)))
 	}
 	return fields
 }
@@ -11534,7 +11534,7 @@ func codexErrorBodyFields(body []byte) []any {
 	if message == "" {
 		message = strings.TrimSpace(stringField(payload, "detail"))
 	}
-	fields := []any{"error_code", code, "error_message", truncateLogValue(strings.Join(strings.Fields(message), " "))}
+	fields := []any{"error_code", truncateLogValue(code), "error_message", truncateLogValue(strings.Join(strings.Fields(message), " "))}
 	if nested, ok := payload["error"].(map[string]any); ok {
 		for _, key := range []string{"resets_in_seconds", "resets_at", "plan_type", "rate_limit_reached_type"} {
 			// Scalars only: an object or array here is not a field this log

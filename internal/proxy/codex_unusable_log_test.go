@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -78,5 +79,23 @@ func TestCodexUnusableResponseLogsReasonWithoutConsumingBody(t *testing.T) {
 				t.Fatalf("diagnostic log includes credentials: %s", got)
 			}
 		})
+	}
+}
+
+func TestCodexUnusableLogBoundsAndFiltersFields(t *testing.T) {
+	long := strings.Repeat("é", codexErrorLogMaxBytes)
+	fields := codexErrorBodyFields([]byte(`{"error":{"type":"` + long + `","message":"ok","plan_type":{"secret":"drop"},"resets_at":"2030-01-01T00:00:00Z"}}`))
+	got := fmt.Sprint(fields)
+	if strings.Contains(got, long) || !strings.Contains(got, "…") {
+		t.Fatalf("error code was not bounded on a rune boundary: %q", got)
+	}
+	if strings.Contains(got, "secret") {
+		t.Fatalf("nested plan_type object leaked into fields: %q", got)
+	}
+	if got := fmt.Sprint(codexErrorBodyFields([]byte("not json"))); !strings.Contains(got, "non_json") {
+		t.Fatalf("non-JSON body lost its bounded classification: %q", got)
+	}
+	if got := truncateLogValue(strings.Repeat("x", codexErrorLogMaxBytes+1)); len(got) != codexErrorLogMaxBytes+len("…") {
+		t.Fatalf("ASCII truncation length=%d, want %d", len(got), codexErrorLogMaxBytes+len("…"))
 	}
 }
