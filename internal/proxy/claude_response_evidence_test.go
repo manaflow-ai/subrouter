@@ -36,6 +36,17 @@ func passiveClaudeHeader(prefix, utilization string) http.Header {
 	return h
 }
 
+func passiveClaudeAccountQuotaHeaders() http.Header {
+	h := passiveClaudeHeader("7d_oi", "0.4")
+	h.Set("Anthropic-Ratelimit-Unified-5h-Utilization", "1")
+	h.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
+	h.Set("Anthropic-Ratelimit-Unified-5h-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+	h.Set("Anthropic-Ratelimit-Unified-7d-Utilization", "0.2")
+	h.Set("Anthropic-Ratelimit-Unified-7d-Status", "allowed")
+	h.Set("Anthropic-Ratelimit-Unified-7d-Reset", strconv.FormatInt(time.Now().Add(72*time.Hour).Unix(), 10))
+	return h
+}
+
 func findFeatureWindow(windows []accounts.UsageWindow, feature string) (accounts.UsageWindow, bool) {
 	for _, window := range windows {
 		if window.Feature == feature {
@@ -84,6 +95,21 @@ func TestPassiveClaudeReplyEliminatesSupplementaryQuotaProbe(t *testing.T) {
 	}
 	if transport.calls != 1 {
 		t.Fatalf("expected only the normal usage fetch, got %d upstream calls", transport.calls)
+	}
+}
+
+func TestObservedClaudeResponseQuotaIncludesAccountAndModelWindows(t *testing.T) {
+	windows := agentclaude.ObservedUsageWindows(passiveClaudeAccountQuotaHeaders(), time.Now())
+	var accountWindows, modelWindows int
+	for _, window := range windows {
+		if window.Feature == "" {
+			accountWindows++
+		} else {
+			modelWindows++
+		}
+	}
+	if accountWindows != 2 || modelWindows != 1 {
+		t.Fatalf("observed windows = %+v, want two account-wide and one model window", windows)
 	}
 }
 
@@ -195,9 +221,11 @@ func TestRealClaudeProxyResponseSeedsLaterModelQuotaCache(t *testing.T) {
 	ref := &AccountRef{accounts: []accounts.Account{account}, store: accounts.CodexStore{Dir: t.TempDir()}}
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		_, _ = io.Copy(io.Discard, req.Body)
-		w.Header().Set("Anthropic-Ratelimit-Unified-7d_oi-Utilization", "0.4")
-		w.Header().Set("Anthropic-Ratelimit-Unified-7d_oi-Status", "allowed")
-		w.Header().Set("Anthropic-Ratelimit-Unified-7d_oi-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+		for key, values := range passiveClaudeAccountQuotaHeaders() {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"id":"msg_real","type":"message"}`)
 	}))
@@ -235,10 +263,25 @@ func TestRealClaudeProxyResponseSeedsLaterModelQuotaCache(t *testing.T) {
 	} else if fable, ok := findFeatureWindow(observed, agentclaude.FableFeature); !ok || fable.UsedPercent != 40 {
 		t.Fatalf("incorrect passive quota evidence: %+v", observed)
 	}
+	score := s.SchedulerRef.RefreshSeed().ScoreFor(accounts.ProviderClaude, account.ID)
+	if score.Headroom != 0 || score.ExhaustedResetAt.Before(time.Now().Add(59*time.Minute)) {
+		t.Fatalf("response quota did not publish the one-hour account reset: %+v", score)
+	}
 	transport := &countingTransport{responses: claudeUsageOK}
 	windows, _, err := ref.FetchUsageWindowsCached(context.Background(), &http.Client{Transport: transport}, account)
-	if err != nil || len(windows) == 0 || transport.calls != 1 {
-		t.Fatalf("real response did not prevent model quota probe: windows=%+v calls=%d err=%v", windows, transport.calls, err)
+	if err != nil || len(windows) == 0 || transport.calls != 0 {
+		t.Fatalf("real response did not prevent quota polling: windows=%+v calls=%d err=%v", windows, transport.calls, err)
+	}
+	if fable, ok := findFeatureWindow(windows, agentclaude.FableFeature); !ok || fable.UsedPercent != 40 {
+		t.Fatalf("real response did not retain model quota alongside account windows: %+v", windows)
+	}
+	for range 3 {
+		if _, scored := s.scoreAccounts(context.Background(), []accounts.Account{account}); scored != 0 {
+			t.Fatalf("future account reset triggered a quota poll on repeated score refresh: scored=%d", scored)
+		}
+	}
+	if transport.calls != 0 {
+		t.Fatalf("future reset triggered %d provider quota calls", transport.calls)
 	}
 }
 

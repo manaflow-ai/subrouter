@@ -17,6 +17,32 @@ func knownAccountWideQuotaReset(score selectacct.Score, now time.Time) (time.Tim
 	return until, known && !until.IsZero() && until.After(now)
 }
 
+// mergeClaudeResponseQuotaScore publishes account-wide reset headers learned
+// from a successful model response. This is a partial observation, so merge it
+// into the current scheduler instead of replacing other providers' scores.
+func (s Server) mergeClaudeResponseQuotaScore(account accounts.Account, windows []accounts.UsageWindow) {
+	if s.AccountRef == nil || s.SchedulerRef == nil || account.ID == "" {
+		return
+	}
+	accountWindows := make([]accounts.UsageWindow, 0, len(windows))
+	for _, window := range windows {
+		if window.Feature == "" {
+			accountWindows = append(accountWindows, window)
+		}
+	}
+	if len(accountWindows) == 0 {
+		return
+	}
+	provider := schedulerAccountProvider(account.Provider)
+	score := scoreFromUsageWindows(provider, account.ID, accountWindows)
+	score.Fresh = true
+	generation := s.AccountRef.Generation()
+	if _, ok := s.SchedulerRef.MergeScoresForAccountGeneration([]selectacct.Score{score}, generation); !ok {
+		return
+	}
+	s.AccountRef.RefreshUsageStatusSnapshotFromWindows(score)
+}
+
 // allOAuthAccountsWaitingForReset is true only when every locally managed
 // OAuth account is measured exhausted, with a future authoritative reset.
 // A missing/unknown score or any healthy account keeps the normal background

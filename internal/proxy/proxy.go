@@ -851,7 +851,15 @@ func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context,
 	failure, throttled := r.usageWindowsFailures[failureKey]
 	r.usageWindowsMu.Unlock()
 	if entryMatchesCredential && now.Sub(entry.at) < usageWindowsTTL {
-		return append([]accounts.UsageWindow(nil), entry.windows...), entry.supplementalFresh, entry.at, false, nil
+		windows := append([]accounts.UsageWindow(nil), entry.windows...)
+		supplementalFresh := entry.supplementalFresh
+		if account.Provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth {
+			if supplemental, _, ok := r.cachedClaudeSupplementalWithObservation(account, now); ok {
+				windows = mergeUsageWindows(windows, supplemental)
+				supplementalFresh = true
+			}
+		}
+		return windows, supplementalFresh, entry.at, false, nil
 	}
 	// A quota-status poll should never turn one upstream 429 into a storm of
 	// identical follow-up 429s. No waiting: serve last-good or return the
@@ -5926,7 +5934,10 @@ func (s Server) proxyHandler() http.Handler {
 				!claudeResponseRejected(response.Header) {
 				// Learn usable model quota from an ordinary response. No
 				// additional upstream request is made at this boundary.
-				s.AccountRef.observeClaudeQuotaHeaders(responseAccount, response.Header, requestStarted)
+				observed, ok := s.AccountRef.observeClaudeQuotaHeaders(responseAccount, response.Header, requestStarted)
+				if ok {
+					s.mergeClaudeResponseQuotaScore(responseAccount, observed)
+				}
 			}
 			s.captureResponseBodyForAccount(response, r.Context(), sessionAgentType, sessionID, responseAccount, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
 			usageSessionKey := ""

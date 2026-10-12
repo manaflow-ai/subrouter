@@ -9,25 +9,31 @@ import (
 )
 
 // observeClaudeQuotaHeaders learns model-specific quota from real upstream
-// responses, eliminating a later synthetic model probe when possible.
-// It never starts a network request or mutates the active scheduler score.
-// Normal usage refreshes continue to supply account-wide headroom.
-func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header http.Header, requestStarted time.Time) {
+// responses, eliminating a later synthetic model probe when possible. It also
+// publishes account-wide reset headers to the scheduler so exhausted accounts
+// can sleep until the provider's next reset instead of being polled on TTL.
+func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header http.Header, requestStarted time.Time) ([]accounts.UsageWindow, bool) {
 	if r == nil || routed.Provider != accounts.ProviderClaude || routed.ID == "" ||
 		routed.CredentialIdentity() == "" {
-		return
+		return nil, false
 	}
 	now := time.Now()
-	windows := agentclaude.ObservedFeatureUsageWindows(header, now)
-	if len(windows) == 0 {
-		return
+	observed := agentclaude.ObservedUsageWindows(header, now)
+	if len(observed) == 0 {
+		return nil, false
 	}
 	// A failed-over reply belongs to the actual serving credential, not
 	// necessarily the initial choice. Ignore results from a superseded login.
 	current := r.credentialSnapshot(accounts.ProviderClaude, routed.ID)
 	if current.AuthMode != accounts.AuthModeOAuth || current.Token == "" ||
 		current.CredentialIdentity() != routed.CredentialIdentity() {
-		return
+		return nil, false
+	}
+	windows := make([]accounts.UsageWindow, 0, len(observed))
+	for _, window := range observed {
+		if window.Feature != "" {
+			windows = append(windows, window)
+		}
 	}
 	if requestStarted.IsZero() {
 		requestStarted = now
@@ -36,7 +42,7 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 	r.usageWindowsMu.Lock()
 	defer r.usageWindowsMu.Unlock()
 	existing, hadPrevious := r.claudeSupplemental[key]
-	if hadPrevious {
+	if hadPrevious && len(windows) > 0 {
 		previousStart := existing.requestStarted
 		if previousStart.IsZero() {
 			// Ordinary quota probes do not represent a model request. A reply
@@ -45,16 +51,16 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 		}
 		if !requestStarted.After(previousStart) {
 			// Older concurrent requests must not overwrite newer quota evidence.
-			return
+			return observed, true
 		}
 	}
 
-	for _, window := range windows {
+	for _, window := range observed {
 		if window.UsedPercent >= 100 && window.ResetAt.IsZero() {
 			// An exhausted window without a reset time cannot be cached
 			// safely. The next regular usage check will reassess it.
 			delete(r.claudeSupplemental, key)
-			return
+			return observed, true
 		}
 	}
 	observedAt := now // the headers arrived now, regardless of request duration
@@ -73,12 +79,38 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 		}
 		windows = mergeUsageWindows(existing.windows, windows)
 	}
-	if r.claudeSupplemental == nil {
-		r.claudeSupplemental = map[string]claudeSupplementalUsage{}
+	if len(windows) > 0 {
+		if r.claudeSupplemental == nil {
+			r.claudeSupplemental = map[string]claudeSupplementalUsage{}
+		}
+		r.claudeSupplemental[key] = claudeSupplementalUsage{
+			windows:        append([]accounts.UsageWindow(nil), windows...),
+			at:             observedAt,
+			requestStarted: requestStarted,
+		}
 	}
-	r.claudeSupplemental[key] = claudeSupplementalUsage{
-		windows:        append([]accounts.UsageWindow(nil), windows...),
-		at:             observedAt,
-		requestStarted: requestStarted,
+
+	// Account-wide windows are the scheduler's reset clock. Keep them in the
+	// shared usage cache as well, so a later score sweep can reuse the same
+	// response evidence without a second provider request.
+	var accountWindows []accounts.UsageWindow
+	for _, window := range observed {
+		if window.Feature == "" {
+			accountWindows = append(accountWindows, window)
+		}
 	}
+	if len(accountWindows) > 0 {
+		if r.usageWindows == nil {
+			r.usageWindows = map[string]usageWindowsEntry{}
+		}
+		cacheKey := current.ID + "\x00" + string(current.Provider)
+		entry := r.usageWindows[cacheKey]
+		if entry.credentialKey == "" || entry.credentialKey == usageWindowsCredentialKey(current) {
+			entry.windows = mergeUsageWindows(entry.windows, accountWindows)
+			entry.at = now
+			entry.credentialKey = usageWindowsCredentialKey(current)
+			r.usageWindows[cacheKey] = entry
+		}
+	}
+	return observed, true
 }
