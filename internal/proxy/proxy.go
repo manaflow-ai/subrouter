@@ -5613,6 +5613,7 @@ func (s Server) proxyHandler() http.Handler {
 			http.Error(w, "session lease account binding is unavailable", http.StatusServiceUnavailable)
 			return
 		}
+		markTrafficAccount(r.Context(), account.ID)
 
 		auth := account.AuthorizationHeader()
 		if auth == "" {
@@ -5877,6 +5878,7 @@ func (s Server) proxyHandler() http.Handler {
 			// ReverseProxy writes this response's status next. A
 			// ModifyResponse error below never reaches here, so it still
 			// counts as subrouter's own 502.
+			markTrafficUpstreamStatus(r.Context(), response.StatusCode)
 			defer markUpstreamResponse(r.Context(), true)
 			responseAccount := account
 			if routed, ok := routedResponseAccount(response); ok {
@@ -5927,6 +5929,7 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 			markUpstreamResponse(r.Context(), false)
+			markTrafficErrorClass(r.Context(), trafficErrorClass(err))
 			if s.Logger != nil {
 				s.Logger.Error("proxy request failed", "agent", sessionAgentType, "session", sessionID, "account", account.ID, "method", r.Method, "path", proxyRequest.URL.Path, "upstream", upstream.Host, "error", err)
 			}
@@ -10596,6 +10599,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if response.Body != nil {
 				_ = response.Body.Close()
 			}
+			markTrafficRetryPath(attemptReq.Context(), "same_account_overload")
 			if sleepErr := t.sleepCtx(req.Context(), wait); sleepErr != nil {
 				return nil, sleepErr
 			}
@@ -10705,6 +10709,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if t.provider == accounts.ProviderClaude && response.StatusCode == http.StatusTooManyRequests &&
 			usageLimited && !exhausted && !credentialFailure && claudeUnifiedStatus(response.Header) == "" &&
 			claudeTransient429Retries < claudeTransient429MaxRetries && attempt < maxAttempts && a.consume() {
+			markTrafficRetryPath(attemptReq.Context(), "same_account_transient_429")
 			wait := claudeTransient429Backoff(claudeTransient429Retries)
 			claudeTransient429Retries++
 			if response.Body != nil {
@@ -10878,6 +10883,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			_ = response.Body.Close()
 		}
 		previousAccount := accountID
+		markTrafficRetryPath(attemptReq.Context(), "account_failover")
 		_, nextWasAlreadyTried := tried[nextAccount.ID]
 		if t.provider == accounts.ProviderClaude && nextWasAlreadyTried {
 			// A funded account may have been tried before the final ordinary

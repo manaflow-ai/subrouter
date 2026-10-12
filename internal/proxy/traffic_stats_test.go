@@ -272,6 +272,33 @@ func TestTrafficCountsHandlerGeneratedFailuresAsProxy(t *testing.T) {
 	}
 }
 
+func TestTrafficFailureReportIncludesRouteAccountAndRetryPath(t *testing.T) {
+	stats := NewTrafficStats(time.Now())
+	handler := stats.trafficCounted(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		markTrafficAccount(r.Context(), "claude-account@example.com")
+		markTrafficRetryPath(r.Context(), "account_failover")
+		markTrafficUpstreamStatus(r.Context(), http.StatusBadGateway)
+		markTrafficErrorClass(r.Context(), "proxy_error")
+		http.Error(w, "upstream request failed", http.StatusBadGateway)
+	}))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", nil))
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", recorder.Code)
+	}
+	snapshot := stats.Snapshot(nil, time.Now())
+	if len(snapshot.Failures) != 1 {
+		t.Fatalf("failures = %+v, want one sample", snapshot.Failures)
+	}
+	failure := snapshot.Failures[0]
+	if failure.Status != http.StatusBadGateway || failure.UpstreamStatus != http.StatusBadGateway ||
+		failure.Method != http.MethodPost || failure.Path != "/v1/messages" ||
+		failure.Account != "claude-account@example.com" || failure.RetryPath != "account_failover" ||
+		failure.ErrorClass != "proxy_error" {
+		t.Fatalf("failure = %+v, want route/account/retry classification", failure)
+	}
+}
+
 func TestTrafficCountsAPanickingHandlerAsProxy5xx(t *testing.T) {
 	stats := NewTrafficStats(time.Now())
 	handler := stats.trafficCounted(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {

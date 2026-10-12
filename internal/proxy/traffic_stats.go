@@ -7,11 +7,22 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/buildversion"
 )
+
+func trafficErrorClass(err error) string {
+	if errors.Is(err, context.Canceled) {
+		return "context_canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "context_deadline"
+	}
+	return "proxy_error"
+}
 
 // TrafficStats counts client request outcomes for this worker process.
 //
@@ -21,7 +32,8 @@ import (
 // counters are process-local and never reset, so a reader derives rates as
 // count / (now - started_at) and compares one generation with the next.
 //
-// Only counts are kept. No account, token, path, or body is recorded.
+// Aggregate counters are retained for the bake gate; a bounded failure sample
+// adds route and account context without recording tokens, headers, or bodies.
 type TrafficStats struct {
 	startedUnix atomic.Int64
 
@@ -32,6 +44,22 @@ type TrafficStats struct {
 	responseOth atomic.Uint64
 	proxy5xx    atomic.Uint64
 	upstream5xx atomic.Uint64
+	failuresMu  sync.Mutex
+	failures    []TrafficFailure
+}
+
+// TrafficFailure is a bounded diagnostic sample for a failed client request.
+// It gives the release supervisor enough context to distinguish an upstream
+// failure from a proxy-generated handoff without recording request bodies.
+type TrafficFailure struct {
+	At             string `json:"at"`
+	Status         int    `json:"status"`
+	UpstreamStatus int    `json:"upstream_status,omitempty"`
+	Method         string `json:"method"`
+	Path           string `json:"path"`
+	Account        string `json:"account,omitempty"`
+	RetryPath      string `json:"retry_path,omitempty"`
+	ErrorClass     string `json:"error_class,omitempty"`
 }
 
 // NewTrafficStats returns counters whose rate window starts at now.
@@ -51,6 +79,7 @@ type TrafficSnapshot struct {
 	Proxy5xx      uint64            `json:"proxy_5xx"`
 	Upstream5xx   uint64            `json:"upstream_5xx"`
 	Streams       StreamDropSummary `json:"stream_drops"`
+	Failures      []TrafficFailure  `json:"failures,omitempty"`
 }
 
 // TrafficByClass groups completed responses by status class.
@@ -90,6 +119,9 @@ func (t *TrafficStats) Snapshot(drops *StreamDropStats, now time.Time) TrafficSn
 	}
 	snapshot.Proxy5xx = t.proxy5xx.Load()
 	snapshot.Upstream5xx = t.upstream5xx.Load()
+	t.failuresMu.Lock()
+	snapshot.Failures = append([]TrafficFailure(nil), t.failures...)
+	t.failuresMu.Unlock()
 	return snapshot
 }
 
@@ -122,6 +154,65 @@ type trafficRecord struct {
 	// websocketUpgraded records a completed handshake written directly to the
 	// hijacked connection, bypassing ResponseWriter.WriteHeader.
 	websocketUpgraded atomic.Bool
+	mu                sync.Mutex
+	upstreamStatus    int
+	method            string
+	path              string
+	account           string
+	retryPath         string
+	errorClass        string
+}
+
+func markTrafficAccount(ctx context.Context, account string) {
+	if record, ok := ctx.Value(trafficRecordKey{}).(*trafficRecord); ok {
+		record.mu.Lock()
+		record.account = account
+		record.mu.Unlock()
+	}
+}
+
+func markTrafficRetryPath(ctx context.Context, path string) {
+	if record, ok := ctx.Value(trafficRecordKey{}).(*trafficRecord); ok {
+		record.mu.Lock()
+		record.retryPath = path
+		record.mu.Unlock()
+	}
+}
+
+func markTrafficUpstreamStatus(ctx context.Context, status int) {
+	if record, ok := ctx.Value(trafficRecordKey{}).(*trafficRecord); ok {
+		record.mu.Lock()
+		record.upstreamStatus = status
+		record.mu.Unlock()
+	}
+}
+
+func markTrafficErrorClass(ctx context.Context, class string) {
+	if record, ok := ctx.Value(trafficRecordKey{}).(*trafficRecord); ok {
+		record.mu.Lock()
+		record.errorClass = class
+		record.mu.Unlock()
+	}
+}
+
+func (t *TrafficStats) recordFailure(record *trafficRecord, status int, now time.Time) {
+	if t == nil || record == nil {
+		return
+	}
+	record.mu.Lock()
+	failure := TrafficFailure{
+		At: now.UTC().Format(time.RFC3339), Status: status, UpstreamStatus: record.upstreamStatus,
+		Method: record.method, Path: record.path, Account: record.account,
+		RetryPath: record.retryPath, ErrorClass: record.errorClass,
+	}
+	record.mu.Unlock()
+	t.failuresMu.Lock()
+	if len(t.failures) >= 32 {
+		copy(t.failures, t.failures[len(t.failures)-31:])
+		t.failures = t.failures[:31]
+	}
+	t.failures = append(t.failures, failure)
+	t.failuresMu.Unlock()
 }
 
 // markUpstreamResponse records that the response about to be written carries
@@ -155,7 +246,7 @@ func (t *TrafficStats) trafficCounted(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		record := &trafficRecord{}
+		record := &trafficRecord{method: r.Method, path: r.URL.Path, retryPath: "none"}
 		t.requests.Add(1)
 		writer := &trafficResponseWriter{ResponseWriter: w}
 		defer func() {
@@ -172,6 +263,9 @@ func (t *TrafficStats) trafficCounted(next http.Handler) http.Handler {
 				}
 			}
 			t.observe(status, writer.upstream)
+			if status >= 500 {
+				t.recordFailure(record, status, time.Now())
+			}
 			if recovered != nil {
 				panic(recovered)
 			}
