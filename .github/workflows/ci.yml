@@ -228,6 +228,49 @@ jobs:
             ~/go/pkg/mod
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
+  # Keep a runnable Linux client for the exact pull-request head. The regular
+  # cross-compile job intentionally writes to /dev/null, while the release
+  # workflow only publishes artifacts after a protected-main tag. This small
+  # candidate artifact lets the coordinator install a statusline fix only
+  # after the full PR gate passes, without building on Big Red.
+  client-artifact:
+    name: Linux client artifact (exact head)
+    needs: changes
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact pull-request head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build Linux amd64 client
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          output="${RUNNER_TEMP}/subrouter-linux-amd64"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o "${output}" ./cmd/subrouter
+          printf '%s\n' "${SOURCE_SHA}" > "${RUNNER_TEMP}/subrouter-linux-amd64.source-sha"
+          sha256sum "${output}" > "${RUNNER_TEMP}/subrouter-linux-amd64.sha256"
+
+      - name: Upload exact-head Linux client
+        uses: actions/upload-artifact@v5
+        with:
+          name: subrouter-linux-amd64-${{ github.event.pull_request.head.sha }}
+          path: |
+            ${{ runner.temp }}/subrouter-linux-amd64
+            ${{ runner.temp }}/subrouter-linux-amd64.source-sha
+            ${{ runner.temp }}/subrouter-linux-amd64.sha256
+          if-no-files-found: error
+
   docker-smoke:
     name: Docker local and team profiles
     # Not gated by "Build, vet, test", so nothing in the queue waits on it.
