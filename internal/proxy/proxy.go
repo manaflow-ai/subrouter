@@ -5924,7 +5924,7 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
-			if err := rewriteWorkspaceRoutingResponse(response, proxyRequest.URL.Path, upstream); err != nil {
+			if err := rewriteWorkspaceRoutingResponse(response, r.URL.Path, upstream); err != nil {
 				return err
 			}
 			if requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path) &&
