@@ -8621,7 +8621,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		}
 		return account, sessionID, assignment.UserEmail, nil
 	}
-	if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) {
+	if provider == accounts.ProviderCodex && workspaceDiscoveryPath(r.URL.Path) {
 		if account, ok := accountForAuthorization(availableAccounts, r.Header.Get("Authorization")); ok {
 			s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, accountMoveSticky, nil, false)
 			assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
@@ -9363,6 +9363,10 @@ func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []a
 func chatGPTBackendPath(path string) bool {
 	_, ok := stripChatGPTBackendPath(path)
 	return ok
+}
+
+func workspaceDiscoveryPath(path string) bool {
+	return path == "/backend-api/wham/accounts/check"
 }
 
 func accountForAuthorization(available []accounts.Account, authorization string) (accounts.Account, bool) {
