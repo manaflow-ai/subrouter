@@ -145,9 +145,9 @@ func TestClaudeOverloadDefaultRecoversLateOnSameAccount(t *testing.T) {
 	}
 }
 
-// Default: a Retry-After is honored per wait but capped at 15s, and cannot
-// stretch the hold past its cap.
-func TestClaudeOverloadDefaultHoldIsBounded(t *testing.T) {
+// Default: a Retry-After beyond the request's retry budget is returned to the
+// client unchanged. Retrying sooner would violate the provider's deadline.
+func TestClaudeOverloadDefaultHoldReturnsWhenRetryAfterExceedsBudget(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
 	var calls int
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
@@ -166,16 +166,35 @@ func TestClaudeOverloadDefaultHoldIsBounded(t *testing.T) {
 	if response.StatusCode != 529 {
 		t.Fatalf("status = %d, want 529", response.StatusCode)
 	}
-	if total := sumDurations(waits); total > claudeOverloadDefaultMaxWait {
-		t.Fatalf("waits = %v (total %v), exceed the %v cap", waits, total, claudeOverloadDefaultMaxWait)
+	if len(waits) != 0 {
+		t.Fatalf("waits = %v, want no retry before the 9999s provider deadline", waits)
 	}
-	for _, wait := range waits {
-		if wait != claudeOverloadMaxRetryAfter {
-			t.Fatalf("waits = %v, want every Retry-After wait capped at %v", waits, claudeOverloadMaxRetryAfter)
+}
+
+func TestClaudeOverloadHonorsLongRetryAfterBeforeSameAccountRetry(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	calls := 0
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		calls++
+		if calls == 1 {
+			header := http.Header{}
+			header.Set("Retry-After", "60")
+			return claudeOverloaded529(header)
 		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"recovered"}`))}
+	}}
+	var waits []time.Duration
+	transport := claudeOverloadTransport(&server, "session-long-retry-after", "cooked@example.com", stub, &waits)
+	response, err := transport.RoundTrip(claudeOverloadRequest("tok-cooked"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(waits) != int(claudeOverloadDefaultMaxWait/claudeOverloadMaxRetryAfter) {
-		t.Fatalf("waits = %d, want %d 15s waits inside 8m", len(waits), claudeOverloadDefaultMaxWait/claudeOverloadMaxRetryAfter)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || calls != 2 {
+		t.Fatalf("status=%d calls=%d, want one delayed retry and success", response.StatusCode, calls)
+	}
+	if len(waits) != 1 || waits[0] != 60*time.Second {
+		t.Fatalf("waits=%v, want the full 60s provider deadline", waits)
 	}
 }
 
