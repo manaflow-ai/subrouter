@@ -5119,6 +5119,19 @@ func TestKimiSubscriptionStateDistinguishesReadyRecommendedAndActive(t *testing.
 	}
 }
 
+func TestClaudeAPIKeyStateSaysFallback(t *testing.T) {
+	row := srUsageRow{provider: accounts.ProviderClaude, authMode: accounts.AuthModeAPIKey}
+	if got := usageGridState(row); got != "API key fallback" {
+		t.Fatalf("Claude API-key state = %q, want explicit fallback label", got)
+	}
+	row.active = true
+	row.sessionsKnown = true
+	row.assignedSessions = 1
+	if got := usageGridState(row); got != "active, API key fallback" {
+		t.Fatalf("active Claude API-key state = %q, want explicit active fallback label", got)
+	}
+}
+
 func TestKimiAPIKeyShowsQuotaWindowsOnlyWhenAvailable(t *testing.T) {
 	withQuota := srUsageRow{
 		provider: accounts.ProviderKimi, authMode: accounts.AuthModeAPIKey,

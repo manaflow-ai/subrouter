@@ -109,7 +109,9 @@ func claudeSubscriptionCandidatesFromScores(
 ) []accounts.Account {
 	modelKey := selectacct.ModelKey(poolModel)
 	hasDedicatedPool := modelKey != "" && base.HasModelPool(poolModel)
-	subscriptions := make([]accounts.Account, 0, len(candidates))
+	verified := make([]accounts.Account, 0, len(candidates))
+	constrained := make([]accounts.Account, 0, len(candidates))
+	uncertain := make([]accounts.Account, 0, len(candidates))
 	for _, candidate := range candidates {
 		if candidate.AuthMode != accounts.AuthModeOAuth {
 			continue
@@ -126,7 +128,14 @@ func claudeSubscriptionCandidatesFromScores(
 				continue
 			}
 		}
-		subscriptions = append(subscriptions, candidate)
+		switch {
+		case baseScore.Fresh && model.UsableForNewSession(provider, candidate.ID):
+			verified = append(verified, candidate)
+		case baseScore.Fresh:
+			constrained = append(constrained, candidate)
+		default:
+			uncertain = append(uncertain, candidate)
+		}
 	}
-	return subscriptions
+	return append(append(verified, constrained...), uncertain...)
 }

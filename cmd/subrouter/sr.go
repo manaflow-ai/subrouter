@@ -3984,6 +3984,12 @@ func usageGridState(row srUsageRow) string {
 		}
 		return "throttled"
 	}
+	if usageProvider(row) == accounts.ProviderClaude && row.authMode == accounts.AuthModeAPIKey {
+		if row.active || (row.sessionsKnown && row.assignedSessions > 0) {
+			return "active, API key fallback"
+		}
+		return "API key fallback"
+	}
 	if usageProvider(row) == accounts.ProviderAntigravity && row.authMode == accounts.AuthModeOAuth {
 		active := row.active || (row.sessionsKnown && row.assignedSessions > 0)
 		failed := row.err != nil || (row.authChecked && !row.authValid)

@@ -8682,7 +8682,13 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 				// Subscription-first migration selected a destination; the common
 				// assignment tail persists it below.
 			} else {
-				candidate, pickErr := pickRoutingAccount(scheduler, availableAccounts)
+				placementCandidates := availableAccounts
+				if provider == accounts.ProviderClaude {
+					if subscriptions := claudeSubscriptionCandidatesFromScores(base, scheduler, availableAccounts, poolModel); len(subscriptions) > 0 {
+						placementCandidates = subscriptions
+					}
+				}
+				candidate, pickErr := pickRoutingAccount(scheduler, placementCandidates)
 				if pickErr != nil || s.keepConstrainedStickyAssignment(stickyScheduler, account, candidate) {
 					if s.Logger != nil {
 						s.Logger.Info("keeping sticky session on constrained account; no materially better account",
@@ -11856,6 +11862,12 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 				// Prefer confirmed available model quota over unknown scores,
 				// without fetching another status snapshot before retry.
 				candidates = claudeRetryCandidatesFromScores(quotaScheduler, scheduler, candidates, poolModel, time.Now())
+				// Subscription quota is cheaper than every API-key route,
+				// including a promoted credit grant. Keep stale but non-exhausted
+				// OAuth candidates ahead of keys when telemetry is uncertain.
+				if subscriptions := claudeSubscriptionCandidatesFromScores(quotaScheduler, scheduler, candidates, poolModel); len(subscriptions) > 0 {
+					candidates = subscriptions
+				}
 				if len(candidates) == 0 {
 					return accounts.Account{}, fmt.Errorf("all untried Claude retry candidates have confirmed quota exhaustion or lack model support: %w", s.poolExhaustedError(provider, allCandidates, poolModel))
 				}
