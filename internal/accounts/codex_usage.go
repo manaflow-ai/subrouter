@@ -112,6 +112,21 @@ type CodexUsageDetails struct {
 	RawRateLimit       codexRateLimitDetails
 }
 
+// CodexUsageThrottleError preserves the provider's cooldown for a usage
+// endpoint response. The proxy uses RetryAt to avoid polling the same account
+// again while ChatGPT has explicitly asked us to wait.
+type CodexUsageThrottleError struct {
+	Status  string
+	RetryAt time.Time
+}
+
+func (e *CodexUsageThrottleError) Error() string {
+	if e == nil {
+		return "Codex usage fetch throttled"
+	}
+	return fmt.Sprintf("usage fetch failed: %s", e.Status)
+}
+
 type CreditsInfo struct {
 	HasCredits bool
 	Unlimited  bool
@@ -238,7 +253,17 @@ func FetchCodexUsageDetails(ctx context.Context, client *http.Client, account Ac
 	defer res.Body.Close()
 
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return CodexUsageDetails{}, fmt.Errorf("usage fetch failed: %s", res.Status)
+		status := strings.TrimSpace(res.Status)
+		if status == "" {
+			status = fmt.Sprintf("%d %s", res.StatusCode, http.StatusText(res.StatusCode))
+		}
+		if res.StatusCode == http.StatusTooManyRequests {
+			return CodexUsageDetails{}, &CodexUsageThrottleError{
+				Status:  status,
+				RetryAt: codexUsageRetryAfter(res.Header.Get("Retry-After"), time.Now()),
+			}
+		}
+		return CodexUsageDetails{}, fmt.Errorf("usage fetch failed: %s", status)
 	}
 
 	var usage codexUsageResponse
@@ -268,6 +293,24 @@ func FetchCodexUsageDetails(ctx context.Context, client *http.Client, account Ac
 		}
 	}
 	return details, nil
+}
+
+func codexUsageRetryAfter(raw string, now time.Time) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil && seconds >= 0 {
+		const maxRetryAfter = time.Duration(1<<63 - 1)
+		if seconds > int64(maxRetryAfter/time.Second) {
+			return now.Add(maxRetryAfter)
+		}
+		return now.Add(time.Duration(seconds) * time.Second)
+	}
+	if when, err := http.ParseTime(raw); err == nil {
+		return when
+	}
+	return time.Time{}
 }
 
 func parseComplimentaryResetInfo(data []byte) *ComplimentaryResetInfo {

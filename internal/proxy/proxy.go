@@ -683,6 +683,10 @@ func usageWindowsThrottleUntil(err error, now time.Time) time.Time {
 	if errors.As(err, &claudeThrottle) && claudeThrottle.RetryAt.After(now) {
 		return claudeThrottle.RetryAt
 	}
+	var codexThrottle *accounts.CodexUsageThrottleError
+	if errors.As(err, &codexThrottle) && codexThrottle.RetryAt.After(now) {
+		return codexThrottle.RetryAt
+	}
 	return now.Add(usageWindowsThrottleTTL)
 }
 
