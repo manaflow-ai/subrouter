@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,10 +28,9 @@ func TestOutboundTransportBoundsResponseHeaderWait(t *testing.T) {
 	}
 }
 
-// Ordinary-sized POSTs must not contend for the upload limiter: a slot spans
-// the whole nested retry chain (failover, backoff sleeps, the Bedrock
-// commit-window peek, header wait), so gating every POST serialized all
-// message traffic proxy-wide behind 4 slots.
+// Ordinary-sized POSTs must not contend for the upload limiter. Large POSTs
+// release their slot after the request body is uploaded, before a long
+// response finishes, so a slow turn cannot block another upload.
 func TestSmallPostsBypassUploadLimiter(t *testing.T) {
 	limiter := make(chan struct{}, 1)
 	limiter <- struct{}{} // limiter fully occupied
@@ -73,6 +73,69 @@ func TestSmallPostsBypassUploadLimiter(t *testing.T) {
 	if err == nil {
 		_ = bigResponse.Body.Close()
 		t.Fatal("large POST should wait on the full limiter and fail on context timeout")
+	}
+}
+
+func TestLargePostReleasesUploadLimiterBeforeResponse(t *testing.T) {
+	limiter := make(chan struct{}, 1)
+	uploaded := make(chan struct{})
+	allowResponse := make(chan struct{})
+	var calls atomic.Int32
+	transport := replayablePostRetryTransport{
+		base: bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			call := calls.Add(1)
+			if _, err := io.Copy(io.Discard, req.Body); err != nil {
+				return nil, err
+			}
+			if call == 1 {
+				close(uploaded)
+				<-allowResponse
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
+		}),
+		maxAttempts: 1,
+		limiter:     limiter,
+	}
+	body := strings.Repeat("x", replayablePostLimiterMinBytes)
+	first, err := http.NewRequest(http.MethodPost, "https://example.invalid/v1/messages", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(body)), nil }
+	firstDone := make(chan error, 1)
+	go func() {
+		response, roundTripErr := transport.RoundTrip(first)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		firstDone <- roundTripErr
+	}()
+	<-uploaded
+
+	second, err := http.NewRequest(http.MethodPost, "https://example.invalid/v1/messages", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(body)), nil }
+	secondDone := make(chan error, 1)
+	go func() {
+		response, roundTripErr := transport.RoundTrip(second)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		secondDone <- roundTripErr
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second upload failed after first body completed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second upload stayed queued behind first response")
+	}
+	close(allowResponse)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first request failed: %v", err)
 	}
 }
 
