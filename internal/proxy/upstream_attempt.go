@@ -121,21 +121,50 @@ func (t inflightAttemptTransport) RoundTrip(req *http.Request) (*http.Response, 
 	}
 	// Broker mode is skipped on every path (WebSocket, non-replayable and
 	// replayable alike) so load accounting agrees across them.
-	if t.attempt == nil || t.attempt.server == nil || t.attempt.server.SchedulerRef == nil || t.attempt.server.CredentialBroker != nil {
+	if t.attempt == nil || t.attempt.server == nil || t.attempt.server.CredentialBroker != nil ||
+		(t.attempt.server.SchedulerRef == nil && t.attempt.server.admission == nil) {
 		return base.RoundTrip(req)
 	}
 	account := t.attempt.current()
-	release := t.attempt.server.SchedulerRef.BeginInflight(schedulerAccountProvider(account.Provider), account.ID)
+	var admission *admissionLease
+	if t.attempt.server.admission != nil {
+		key := admissionKeyFor(schedulerAccountProvider(account.Provider), account.ID, t.attempt.poolModel)
+		var err error
+		admission, err = t.attempt.server.admission.acquire(req.Context(), key)
+		if err != nil {
+			return nil, err
+		}
+	}
+	release := func() {}
+	if t.attempt.server.SchedulerRef != nil {
+		release = t.attempt.server.SchedulerRef.BeginInflight(schedulerAccountProvider(account.Provider), account.ID)
+	}
 	response, err := base.RoundTrip(req)
 	if err != nil || response == nil {
 		release()
+		if admission != nil {
+			admission.release()
+		}
 		return response, err
+	}
+	if admission != nil {
+		t.attempt.server.admission.observe(
+			admission.key, response.StatusCode, response.Header, time.Now(),
+		)
 	}
 	if response.Body == nil || response.Body == http.NoBody {
 		release()
+		if admission != nil {
+			admission.release()
+		}
 		return response, err
 	}
-	response.Body = &inflightResponseBody{ReadCloser: response.Body, release: release}
+	response.Body = &inflightResponseBody{ReadCloser: response.Body, release: func() {
+		release()
+		if admission != nil {
+			admission.release()
+		}
+	}}
 	return response, err
 }
 

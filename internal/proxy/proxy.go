@@ -120,7 +120,10 @@ type Server struct {
 	Sessions               *session.Store
 	Scheduler              selectacct.Scheduler
 	SchedulerRef           *selectacct.SchedulerRef
-	UsageScoreTTL          time.Duration
+	// admission is the controller-wide physical-attempt gate. It is a pointer
+	// so value copies of Server made by Handler and middleware share one queue.
+	admission     *admissionControl
+	UsageScoreTTL time.Duration
 	// ReadyCheck gates supervisor readiness on asynchronous startup state that
 	// must be coherent before this worker may receive traffic.
 	ReadyCheck    func() error
@@ -2831,6 +2834,9 @@ func (s Server) Handler() http.Handler {
 	}
 	if s.softMoveState == nil {
 		s.softMoveState = newSoftMoveState()
+	}
+	if s.admission == nil {
+		s.admission = newAdmissionControl()
 	}
 	if s.Lifecycle == nil {
 		s.Lifecycle = NewLifecycle()
@@ -5904,14 +5910,15 @@ func (s Server) proxyHandler() http.Handler {
 					budget: requestRetryBudget, retriesPerPass: requestMaxAttempts - 1,
 				}
 			}
-		} else if s.SchedulerRef != nil && s.CredentialBroker == nil {
+		} else if (s.SchedulerRef != nil || s.admission != nil) && s.CredentialBroker == nil {
 			// Non-replayable requests bypass the retry stack, so give their
 			// single physical attempt the same response-lifetime accounting.
 			transport = inflightAttemptTransport{
 				base: transport,
 				attempt: &upstreamAttempt{
-					server:  &s,
-					account: accounts.Account{ID: account.ID, Provider: requestProvider},
+					server:    &s,
+					poolModel: requestPoolModel,
+					account:   accounts.Account{ID: account.ID, Provider: requestProvider},
 				},
 			}
 		}
@@ -5984,6 +5991,10 @@ func (s Server) proxyHandler() http.Handler {
 		rp.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 			markUpstreamResponse(r.Context(), false)
 			markTrafficErrorClass(r.Context(), trafficErrorClass(err))
+			if errors.Is(err, errAdmissionQueueFull) {
+				http.Error(w, "upstream admission queue is full", http.StatusServiceUnavailable)
+				return
+			}
 			if s.Logger != nil {
 				s.Logger.Error("proxy request failed", "agent", sessionAgentType, "session", sessionID, "account", account.ID, "method", r.Method, "path", proxyRequest.URL.Path, "upstream", upstream.Host, "error", err)
 			}
@@ -6300,10 +6311,28 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	// connection ends. Broker leases are centrally selected and do not use the
 	// local SchedulerRef, so they stay outside this accounting.
 	releaseInflight := func() {}
+	var admissionLease *admissionLease
+	if s.CredentialBroker == nil && s.admission != nil {
+		key := admissionKeyFor(schedulerAccountProvider(account.Provider), account.ID, poolModel)
+		var err error
+		admissionLease, err = s.admission.acquire(r.Context(), key)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			http.Error(w, "upstream admission queue is full", http.StatusServiceUnavailable)
+			return
+		}
+	}
 	if s.SchedulerRef != nil && s.CredentialBroker == nil {
 		releaseInflight = s.SchedulerRef.BeginInflight(schedulerAccountProvider(account.Provider), account.ID)
 	}
-	defer releaseInflight()
+	defer func() {
+		releaseInflight()
+		if admissionLease != nil {
+			admissionLease.release()
+		}
+	}()
 
 	upstreamURL := cloneURL(r.URL)
 	upstreamURL.Scheme = websocketScheme(upstream.Scheme)

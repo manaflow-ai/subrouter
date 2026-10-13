@@ -83,6 +83,7 @@ type TrafficSnapshot struct {
 	Upstream5xx   uint64            `json:"upstream_5xx"`
 	Streams       StreamDropSummary `json:"stream_drops"`
 	Failures      []TrafficFailure  `json:"failures,omitempty"`
+	Admission     admissionSnapshot `json:"admission,omitempty"`
 }
 
 // TrafficByClass groups completed responses by status class.
@@ -341,5 +342,9 @@ func (w *trafficResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 // handleTraffic reports request outcome counts for this worker process. Like
 // /_subrouter/stream-stats it is unauthenticated and carries counts only.
 func (s Server) handleTraffic(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, s.Traffic.Snapshot(s.StreamDrops, time.Now()))
+	snapshot := s.Traffic.Snapshot(s.StreamDrops, time.Now())
+	if s.admission != nil {
+		snapshot.Admission = s.admission.snapshot()
+	}
+	writeJSON(w, snapshot)
 }
