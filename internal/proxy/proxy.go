@@ -9370,9 +9370,16 @@ func accountForAuthorization(available []accounts.Account, authorization string)
 	if authorization == "" {
 		return accounts.Account{}, false
 	}
+	accountID := ""
+	if scheme, token, ok := strings.Cut(authorization, " "); ok && strings.EqualFold(scheme, "Bearer") {
+		accountID = accounts.ExtractChatGPTAccountIDFromJWT(strings.TrimSpace(token))
+	}
 	for _, account := range available {
 		if account.AuthMode != accounts.AuthModeOAuth {
 			continue
+		}
+		if accountID != "" && account.AccountID == accountID {
+			return account, true
 		}
 		candidate := account.AuthorizationHeader()
 		if candidate != "" && len(candidate) == len(authorization) && subtle.ConstantTimeCompare([]byte(candidate), []byte(authorization)) == 1 {

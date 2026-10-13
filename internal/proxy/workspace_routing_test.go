@@ -24,6 +24,12 @@ func TestAccountForAuthorizationPreservesWorkspaceIdentity(t *testing.T) {
 	if _, ok := accountForAuthorization(managed, "Bearer unknown-token"); ok {
 		t.Fatal("unknown authorization matched a managed account")
 	}
+	jwt := "eyJhbGciOiJub25lIn0.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJzZWxlY3RlZC1hY2N0In0."
+	managed[1].AccountID = "selected-acct"
+	got, ok = accountForAuthorization(managed, "Bearer "+jwt)
+	if !ok || got.ID != "selected" {
+		t.Fatalf("JWT workspace selection = (%+v, %v), want selected account", got, ok)
+	}
 }
 
 func TestRewriteWorkspaceRoutingResponseMakesSentinelOriginExplicit(t *testing.T) {
