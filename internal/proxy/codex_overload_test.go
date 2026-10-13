@@ -595,6 +595,74 @@ func TestCodexOverloadFailoverBacksOffBetweenAccounts(t *testing.T) {
 	}
 }
 
+func TestCodexCapacityRetryAfterIsMinimumAndHonorsBudget(t *testing.T) {
+	tests := []struct {
+		name       string
+		maxWait    time.Duration
+		wantCalls  int
+		wantStatus int
+		wantWait   time.Duration
+	}{
+		{name: "retry after fits budget", maxWait: 2 * time.Minute, wantCalls: 2, wantStatus: http.StatusOK, wantWait: time.Minute},
+		{name: "retry after exceeds budget", maxWait: 30 * time.Second, wantCalls: 1, wantStatus: http.StatusServiceUnavailable},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Unix(1_800_000_000, 0)
+			var waits []time.Duration
+			calls := 0
+			stub := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if calls == 1 {
+					return &http.Response{
+						StatusCode: http.StatusServiceUnavailable,
+						Header:     http.Header{"Content-Type": []string{"application/json"}, "Retry-After": []string{"60"}},
+						Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"server_is_overloaded"}}`)),
+						Request:    req,
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+					Request:    req,
+				}, nil
+			})
+			server := &Server{CodexOverloadFailover: &CodexOverloadFailoverConfig{StayMaxWait: test.maxWait}}
+			transport := codexOverloadFailoverTransport{
+				base: stub, server: server, account: "codex-account", poolModel: "gpt-6-astra",
+				now: func() time.Time { return now },
+				sleep: func(_ context.Context, wait time.Duration) bool {
+					waits = append(waits, wait)
+					now = now.Add(wait)
+					return true
+				},
+			}
+			req, err := http.NewRequest(http.MethodPost, "https://example.test/responses", strings.NewReader(`{"model":"gpt-6-astra"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(strings.NewReader(`{"model":"gpt-6-astra"}`)), nil
+			}
+			response, err := transport.RoundTrip(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			if calls != test.wantCalls || response.StatusCode != test.wantStatus {
+				t.Fatalf("calls=%d status=%d, want calls=%d status=%d", calls, response.StatusCode, test.wantCalls, test.wantStatus)
+			}
+			if test.wantWait > 0 && (len(waits) != 1 || waits[0] != test.wantWait) {
+				t.Fatalf("waits=%v, want the full provider deadline %v", waits, test.wantWait)
+			}
+			if test.wantWait == 0 && len(waits) != 0 {
+				t.Fatalf("waits=%v, want no retry before the provider deadline", waits)
+			}
+		})
+	}
+}
+
 // The regional egress treats a 2xx JSON capacity body like an in-stream one.
 func TestCodexEgressReplaysJSONCapacityBody(t *testing.T) {
 	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
