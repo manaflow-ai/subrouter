@@ -179,7 +179,7 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 		team.DisplayName,
 	)
 	if err != nil {
-		return err
+		return hostedExchangeLoginError(err)
 	}
 	config.AccessToken = tokens.AccessToken
 	config.RefreshToken = tokens.RefreshToken
@@ -202,6 +202,13 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	fmt.Fprintf(r.out, "Logged in to cmux.com team %s (%s).\n", team.DisplayName, team.ID)
 	fmt.Fprintln(r.out, "Remote: cmux (hosted)")
 	return nil
+}
+
+func hostedExchangeLoginError(err error) error {
+	return fmt.Errorf(
+		"hosted cmux.com tenant exchange failed: %w\nIf you want the team server instead, run:\n  sr storage legacy\n  sr server add lawrence --url http://127.0.0.1:31415 --default",
+		err,
+	)
 }
 
 func cliVerificationURL(baseURL, loginCode string) (string, error) {

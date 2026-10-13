@@ -134,6 +134,80 @@ func TestSRLoginNativeStackConfiguresBuiltInCMUXRemote(t *testing.T) {
 	}
 }
 
+func TestSRLoginHostedExchangeFailureSuggestsLegacyServer(t *testing.T) {
+	accessToken := testUnverifiedStackToken(t, map[string]any{
+		"sub": "user", "project_id": "project", "selected_team_id": "team-1",
+	})
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/cli/config":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"version": 1,
+				"auth": map[string]string{
+					"apiUrl": server.URL, "projectId": "project",
+					"publishableClientKey": "pck_test",
+					"confirmUrl":           server.URL + "/handler/cli-auth-confirm",
+				},
+				"subrouter": map[string]string{
+					"url":         server.URL,
+					"exchangeUrl": server.URL + "/api/subrouter/exchange",
+				},
+			})
+		case "/auth/cli":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"polling_code": "poll", "login_code": "login",
+				"expires_at": time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano),
+			})
+		case "/auth/cli/poll":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status": "success", "refresh_token": "refresh",
+			})
+		case "/auth/oauth/token":
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"access_token": accessToken, "refresh_token": "rotated",
+			})
+		case "/teams":
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]string{{
+				"id": "team-1", "display_name": "Acme",
+			}}})
+		case "/api/subrouter/exchange":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"upstream_request_failed"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(root, "cloud.json"))
+	t.Setenv("CODEX_HOME", filepath.Join(root, "codex-home"))
+	var output bytes.Buffer
+	runner := srRunner{
+		program: "sr", store: accounts.CodexStore{Dir: filepath.Join(root, "accounts")},
+		in: strings.NewReader(""), out: &output, errOut: &output, client: server.Client(),
+		cloudLoginPollInterval: time.Millisecond,
+	}
+	err := runner.cloudLogin(context.Background(), []string{
+		"--base-url", server.URL, "--hosted-url", server.URL, "--no-browser",
+	})
+	if err == nil {
+		t.Fatal("cloudLogin unexpectedly succeeded")
+	}
+	message := err.Error()
+	for _, want := range []string{
+		"hosted cmux.com tenant exchange failed",
+		"sr storage legacy",
+		"sr server add lawrence --url http://127.0.0.1:31415 --default",
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("error = %q, missing %q", message, want)
+		}
+	}
+}
+
 func TestHostedCodexAddUsesTemporaryHomeAndUploadsCredential(t *testing.T) {
 	tenantKey := "srt_0123456789abcdef0123456789abcdef"
 	var uploaded broker.AccountUpload
