@@ -137,5 +137,10 @@ func claudeSubscriptionCandidatesFromScores(
 			uncertain = append(uncertain, candidate)
 		}
 	}
-	return append(append(verified, constrained...), uncertain...)
+	if len(verified) > 0 {
+		// Preserve the measured-healthy admission preference: optimistic or
+		// stale subscriptions must not dilute a confirmed quota choice.
+		return verified
+	}
+	return append(constrained, uncertain...)
 }
