@@ -160,8 +160,8 @@ func TestLargePostKeepsUploadLimiterUntilBodyClose(t *testing.T) {
 		limiter:     limiter,
 	}
 	body := strings.Repeat("x", replayablePostLimiterMinBytes)
-	newRequest := func() *http.Request {
-		req, err := http.NewRequest(http.MethodPost, "https://example.invalid/v1/messages", strings.NewReader(body))
+	newRequest := func(ctx context.Context) *http.Request {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://example.invalid/v1/messages", strings.NewReader(body))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -170,7 +170,7 @@ func TestLargePostKeepsUploadLimiterUntilBodyClose(t *testing.T) {
 	}
 	firstDone := make(chan error, 1)
 	go func() {
-		response, err := transport.RoundTrip(newRequest())
+		response, err := transport.RoundTrip(newRequest(context.Background()))
 		if response != nil {
 			_ = response.Body.Close()
 		}
@@ -178,9 +178,11 @@ func TestLargePostKeepsUploadLimiterUntilBodyClose(t *testing.T) {
 	}()
 	<-firstReturned
 
+	secondCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
 	secondDone := make(chan error, 1)
 	go func() {
-		response, err := transport.RoundTrip(newRequest())
+		response, err := transport.RoundTrip(newRequest(secondCtx))
 		if response != nil {
 			_ = response.Body.Close()
 		}
@@ -197,8 +199,13 @@ func TestLargePostKeepsUploadLimiterUntilBodyClose(t *testing.T) {
 	if err := <-firstDone; err != nil {
 		t.Fatalf("first request failed: %v", err)
 	}
-	if err := <-secondDone; err != nil {
-		t.Fatalf("second request failed after first body closed: %v", err)
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second request failed after first body closed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second request did not finish after first body closed")
 	}
 }
 
