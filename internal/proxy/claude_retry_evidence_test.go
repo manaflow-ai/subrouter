@@ -216,7 +216,7 @@ func TestClaudeNewSessionKeepsUnknownFallbackWhenNoVerifiedAdmission(t *testing.
 	})
 	candidates := []accounts.Account{unknown, low, stale}
 	got := claudeNewSessionCandidatesFromScores(base, base, candidates, "")
-	if len(got) != 2 || got[0].ID != low.ID || got[1].ID != stale.ID {
+	if len(got) != 3 || got[0].ID != low.ID || got[1].ID != unknown.ID || got[2].ID != stale.ID {
 		t.Fatalf("fresh constrained subscription should precede unknown/stale fallback: %+v", got)
 	}
 }
