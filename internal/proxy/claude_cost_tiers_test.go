@@ -26,6 +26,8 @@ func TestResponseClaudeCreditExhausted(t *testing.T) {
 		{name: "billing 400", status: http.StatusBadRequest, body: anthropicCreditBalanceBody, want: true},
 		{name: "billing wording without is", status: http.StatusBadRequest, body: `{"type":"error","error":{"message":"Credit balance too low"}}`, want: true},
 		{name: "billing insufficient wording", status: http.StatusPaymentRequired, body: `{"error":{"message":"Your credit balance is insufficient to access the Anthropic API."}}`, want: true},
+		{name: "billing standalone credits", status: http.StatusBadRequest, body: `{"error":{"message":"Insufficient credits"}}`, want: true},
+		{name: "explicit billing error type", status: http.StatusForbidden, body: `{"type":"billing_error","message":"request denied"}`, want: true},
 		{name: "other 400", status: http.StatusBadRequest, body: `{"type":"error","error":{"type":"invalid_request_error","message":"messages: field required"}}`},
 		{name: "rate limit 429", status: http.StatusTooManyRequests, body: anthropicCreditBalanceBody},
 		{name: "success is never read", status: http.StatusOK, body: anthropicCreditBalanceBody},
