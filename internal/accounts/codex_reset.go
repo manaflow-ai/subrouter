@@ -10,16 +10,9 @@ import (
 	"time"
 )
 
-const (
-	// codexRateLimitResetCreditsURL is the wham endpoint Codex.app uses to list
-	// and consume ChatGPT Pro rate-limit reset credits. It is a var (not a
-	// const) so tests can point it at an httptest server.
-	codexCLIUserAgent = "codex_cli_rs/0.0.0"
-)
-
-var (
-	codexRateLimitResetCreditsURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
-)
+// codexRateLimitResetCreditsURL is the wham endpoint for reset credits.
+// Tests replace it with a local HTTP server.
+var codexRateLimitResetCreditsURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 
 // rateLimitResetConsumeURL derives the consume endpoint from the current
 // credits URL so tests only need to override codexRateLimitResetCreditsURL.
@@ -208,16 +201,15 @@ func RedeemRateLimitResetIf(ctx context.Context, client *http.Client, account Ac
 	return ConsumeRateLimitResetCredit(ctx, client, account, credit.ID, newUUIDv4())
 }
 
-// applyCodexWhamHeaders sets the headers Codex.app sends to the wham API
-// surface. The usage GET works with only Authorization, but the consume POST
-// is gated by the upstream's codex-client allowlist, so every reset request
-// carries the full identifying header set.
+// applyCodexWhamHeaders identifies the actual caller of maintenance requests.
+// If an upstream only permits its own client, surface that rejection rather
+// than claiming a vendor CLI identity or inventing a vendor version.
 func applyCodexWhamHeaders(req *http.Request, account Account) {
 	req.Header.Set("Authorization", account.AuthorizationHeader())
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("OAI-Client-Id", "codex")
+	req.Header.Set("OAI-Client-Id", "subrouter")
 	req.Header.Set("OAI-Language", "en-US")
-	req.Header.Set("User-Agent", codexCLIUserAgent)
+	req.Header.Set("User-Agent", "subrouter")
 	if account.AccountID != "" {
 		req.Header.Set("ChatGPT-Account-ID", account.AccountID)
 	}

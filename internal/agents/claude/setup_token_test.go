@@ -188,8 +188,8 @@ func TestVerifyAccessTokenClassifiesAnthropicAnswer(t *testing.T) {
 		fails    bool
 	}{
 		{http.StatusOK, false, false},
-		{http.StatusTooManyRequests, false, false},
-		{http.StatusBadRequest, false, false},
+		{http.StatusTooManyRequests, false, true},
+		{http.StatusBadRequest, false, true},
 		{http.StatusUnauthorized, true, true},
 		{http.StatusForbidden, true, true},
 		{http.StatusBadGateway, false, true},
@@ -206,8 +206,8 @@ func TestVerifyAccessTokenClassifiesAnthropicAnswer(t *testing.T) {
 	if sawAuth != "Bearer "+testSetupToken {
 		t.Errorf("Authorization = %q", sawAuth)
 	}
-	if !strings.Contains(sawBeta, oauthBetaHeader) || !strings.Contains(sawBeta, "claude-code-20250219") {
-		t.Errorf("anthropic-beta = %q, want Claude Code probe shape", sawBeta)
+	if sawBeta != oauthBetaHeader {
+		t.Errorf("anthropic-beta = %q, want only OAuth protocol beta", sawBeta)
 	}
 }
 
