@@ -5924,6 +5924,9 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
+			if err := rewriteWorkspaceRoutingResponse(response, proxyRequest.URL.Path, upstream); err != nil {
+				return err
+			}
 			if requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path) &&
 				r.Header.Get(CodexCapacityRetryableHeader) == "1" {
 				response, _ = codexRetryableCapacityResponse(response)
@@ -6105,6 +6108,51 @@ func (s Server) proxyHandler() http.Handler {
 
 		rp.ServeHTTP(w, proxyRequest)
 	})
+}
+
+// Codex's workspace-routing resolver requires workspace_backend_origin to be
+// an HTTPS origin. Older ChatGPT responses used NO_CONSTRAINT as a sentinel
+// for that field, which is valid for the account API but causes newer Codex
+// clients to reject an HTTP chatgpt_base_url before they can use the proxy.
+// Keep the upstream's routing policy while making the selected backend origin
+// explicit for the discovery response.
+func rewriteWorkspaceRoutingResponse(response *http.Response, path string, upstream *url.URL) error {
+	if response == nil || response.StatusCode < 200 || response.StatusCode >= 300 || path != "/backend-api/wham/accounts/check" || upstream == nil {
+		return nil
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return err
+	}
+	_ = response.Body.Close()
+	var payload struct {
+		Accounts []map[string]any `json:"accounts"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		response.Body = io.NopCloser(bytes.NewReader(body))
+		return nil
+	}
+	origin := "https://" + upstream.Host
+	changed := false
+	for _, account := range payload.Accounts {
+		if account["workspace_backend_origin"] == "NO_CONSTRAINT" {
+			account["workspace_backend_origin"] = origin
+			changed = true
+		}
+	}
+	if !changed {
+		response.Body = io.NopCloser(bytes.NewReader(body))
+		return nil
+	}
+	body, err = json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	response.ContentLength = int64(len(body))
+	response.Header.Del("Content-Length")
+	response.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	return nil
 }
 
 func privacySafeCutoverRequestLogAttrs(agent, sessionID, userHash, method, path, upstream, remoteAddr, userAgent, markerHash string) []any {

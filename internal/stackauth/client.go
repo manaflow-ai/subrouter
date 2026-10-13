@@ -33,24 +33,43 @@ type PublicConfig struct {
 }
 
 func (c PublicConfig) Validate() error {
-	for name, value := range map[string]string{
-		"Stack API URL":          c.Auth.APIURL,
-		"Stack project ID":       c.Auth.ProjectID,
-		"Stack publishable key":  c.Auth.PublishableClientKey,
-		"CLI confirmation URL":   c.Auth.ConfirmURL,
-		"Subrouter URL":          c.Subrouter.URL,
-		"Subrouter exchange URL": c.Subrouter.ExchangeURL,
-	} {
+	return c.validate(false)
+}
+
+// ValidateForLogin accepts a public config without a hosted Subrouter block.
+// This lets clients select their legacy/team-server path without contacting a
+// retired hosted origin.
+func (c PublicConfig) ValidateForLogin() error {
+	return c.validate(true)
+}
+
+func (c PublicConfig) validate(allowUnconfiguredSubrouter bool) error {
+	fields := map[string]string{
+		"Stack API URL":         c.Auth.APIURL,
+		"Stack project ID":      c.Auth.ProjectID,
+		"Stack publishable key": c.Auth.PublishableClientKey,
+		"CLI confirmation URL":  c.Auth.ConfirmURL,
+	}
+	hostedConfigured := strings.TrimSpace(c.Subrouter.URL) != "" ||
+		strings.TrimSpace(c.Subrouter.ExchangeURL) != ""
+	if !allowUnconfiguredSubrouter || hostedConfigured {
+		fields["Subrouter URL"] = c.Subrouter.URL
+		fields["Subrouter exchange URL"] = c.Subrouter.ExchangeURL
+	}
+	for name, value := range fields {
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("%s is missing", name)
 		}
 	}
-	for name, raw := range map[string]string{
-		"Stack API URL":          c.Auth.APIURL,
-		"CLI confirmation URL":   c.Auth.ConfirmURL,
-		"Subrouter URL":          c.Subrouter.URL,
-		"Subrouter exchange URL": c.Subrouter.ExchangeURL,
-	} {
+	urls := map[string]string{
+		"Stack API URL":        c.Auth.APIURL,
+		"CLI confirmation URL": c.Auth.ConfirmURL,
+	}
+	if hostedConfigured {
+		urls["Subrouter URL"] = c.Subrouter.URL
+		urls["Subrouter exchange URL"] = c.Subrouter.ExchangeURL
+	}
+	for name, raw := range urls {
 		if err := validateHTTPSOriginOrURL(raw); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
@@ -83,7 +102,7 @@ func FetchPublicConfig(ctx context.Context, httpClient *http.Client, cmuxBaseURL
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&config); err != nil {
 		return PublicConfig{}, fmt.Errorf("decode CLI configuration: %w", err)
 	}
-	if err := config.Validate(); err != nil {
+	if err := config.ValidateForLogin(); err != nil {
 		return PublicConfig{}, fmt.Errorf("invalid CLI configuration: %w", err)
 	}
 	return config, nil
