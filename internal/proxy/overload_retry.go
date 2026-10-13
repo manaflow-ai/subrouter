@@ -23,9 +23,6 @@ const (
 	// a request 10 minutes, so 8m leaves it room to receive the 529.
 	claudeOverloadDefaultInterval = 15 * time.Second
 	claudeOverloadDefaultMaxWait  = 8 * time.Minute
-	// claudeOverloadMaxRetryAfter caps one Retry-After-driven wait.
-	claudeOverloadMaxRetryAfter = 15 * time.Second
-
 	// Codex: 0.5s doubling to 8s, then every ~9s (8-10s with jitter) for up
 	// to 4m, inside Codex CLI's 5-minute stream idle timeout.
 	codexCapacityDefaultStayInterval = 9 * time.Second

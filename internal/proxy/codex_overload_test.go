@@ -523,10 +523,10 @@ func TestCodexOverloadMarkTTLHonorsRetryHints(t *testing.T) {
 			}
 			proxy := httptest.NewServer(server.Handler())
 			defer proxy.Close()
-			started := time.Now()
 			if status, body := codexEgressPost(t, proxy.URL, sessionID); status != http.StatusOK {
 				t.Fatalf("status=%d body=%s", status, body)
 			}
+			started := time.Now()
 			until, _, ok := server.SchedulerRef.CapacityMarkFor(accounts.ProviderCodex, "codex-account-0", "gpt-6-astra", "")
 			if !ok {
 				t.Fatal("overloaded account was not marked")
@@ -553,6 +553,20 @@ func TestCodexRetryHintJSONShapes(t *testing.T) {
 		if got := codexRetryHintJSON([]byte(body)); got != want {
 			t.Errorf("codexRetryHintJSON(%s) = %v, want %v", body, got, want)
 		}
+	}
+}
+
+func TestCodexRetryAfterMillisecondsRejectsOverflow(t *testing.T) {
+	for _, raw := range []string{"NaN", "+Inf", "-Inf", "0", "-1", "not-a-number"} {
+		if wait, ok := codexRetryAfterMilliseconds(raw); ok {
+			t.Fatalf("retry-after-ms %q parsed as %v, want invalid", raw, wait)
+		}
+	}
+	if wait, ok := codexRetryAfterMilliseconds("1e100"); !ok || wait != 8*24*time.Hour {
+		t.Fatalf("retry-after-ms 1e100 = %v, %t, want the 8d saturation", wait, ok)
+	}
+	if wait, ok := codexRetryAfterMilliseconds("60000"); !ok || wait != time.Minute {
+		t.Fatalf("retry-after-ms 60000 = %v, %t, want 1m, true", wait, ok)
 	}
 }
 
@@ -592,6 +606,74 @@ func TestCodexOverloadFailoverBacksOffBetweenAccounts(t *testing.T) {
 	}
 	if gap := arrivals[2].Sub(arrivals[1]); gap < 100*time.Millisecond || gap > 1500*time.Millisecond {
 		t.Fatalf("gap before the switch = %v, want a 100-400ms backoff", gap)
+	}
+}
+
+func TestCodexCapacityRetryAfterIsMinimumAndHonorsBudget(t *testing.T) {
+	tests := []struct {
+		name       string
+		maxWait    time.Duration
+		wantCalls  int
+		wantStatus int
+		wantWait   time.Duration
+	}{
+		{name: "retry after fits budget", maxWait: 2 * time.Minute, wantCalls: 2, wantStatus: http.StatusOK, wantWait: time.Minute},
+		{name: "retry after exceeds budget", maxWait: 30 * time.Second, wantCalls: 1, wantStatus: http.StatusServiceUnavailable},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Unix(1_800_000_000, 0)
+			var waits []time.Duration
+			calls := 0
+			stub := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if calls == 1 {
+					return &http.Response{
+						StatusCode: http.StatusServiceUnavailable,
+						Header:     http.Header{"Content-Type": []string{"application/json"}, "Retry-After": []string{"60"}},
+						Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"server_is_overloaded"}}`)),
+						Request:    req,
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+					Request:    req,
+				}, nil
+			})
+			server := &Server{CodexOverloadFailover: &CodexOverloadFailoverConfig{StayMaxWait: test.maxWait}}
+			transport := codexOverloadFailoverTransport{
+				base: stub, server: server, account: "codex-account", poolModel: "gpt-6-astra",
+				now: func() time.Time { return now },
+				sleep: func(_ context.Context, wait time.Duration) bool {
+					waits = append(waits, wait)
+					now = now.Add(wait)
+					return true
+				},
+			}
+			req, err := http.NewRequest(http.MethodPost, "https://example.test/responses", strings.NewReader(`{"model":"gpt-6-astra"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(strings.NewReader(`{"model":"gpt-6-astra"}`)), nil
+			}
+			response, err := transport.RoundTrip(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			if calls != test.wantCalls || response.StatusCode != test.wantStatus {
+				t.Fatalf("calls=%d status=%d, want calls=%d status=%d", calls, response.StatusCode, test.wantCalls, test.wantStatus)
+			}
+			if test.wantWait > 0 && (len(waits) != 1 || waits[0] != test.wantWait) {
+				t.Fatalf("waits=%v, want the full provider deadline %v", waits, test.wantWait)
+			}
+			if test.wantWait == 0 && len(waits) != 0 {
+				t.Fatalf("waits=%v, want no retry before the provider deadline", waits)
+			}
+		})
 	}
 }
 

@@ -57,11 +57,14 @@ func TestCodexPostFallbackRetryBudgetPreservesOverrides(t *testing.T) {
 
 func TestCodexRetryableCapacityResponse(t *testing.T) {
 	tests := []struct {
-		name        string
-		status      int
-		contentType string
-		body        string
-		convert     bool
+		name         string
+		status       int
+		contentType  string
+		body         string
+		retryAfter   string
+		retryAfterMs string
+		wantRetry    string
+		convert      bool
 	}{
 		{
 			name:        "sse capacity",
@@ -78,6 +81,25 @@ func TestCodexRetryableCapacityResponse(t *testing.T) {
 			convert:     true,
 		},
 		{
+			name:        "json capacity preserves retry deadline",
+			status:      http.StatusBadGateway,
+			contentType: "application/json",
+			body:        `{"error":{"code":"server_is_overloaded"}}`,
+			retryAfter:  "60",
+			wantRetry:   "60",
+			convert:     true,
+		},
+		{
+			name:         "json capacity preserves millisecond deadline",
+			status:       http.StatusBadGateway,
+			contentType:  "application/json",
+			body:         `{"error":{"code":"server_is_overloaded"}}`,
+			retryAfter:   "1",
+			retryAfterMs: "60000",
+			wantRetry:    "60",
+			convert:      true,
+		},
+		{
 			name:        "generic server error",
 			status:      http.StatusBadGateway,
 			contentType: "application/json",
@@ -92,9 +114,16 @@ func TestCodexRetryableCapacityResponse(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			header := http.Header{"Content-Type": []string{test.contentType}}
+			if test.retryAfter != "" {
+				header.Set("Retry-After", test.retryAfter)
+			}
+			if test.retryAfterMs != "" {
+				header.Set("Retry-After-Ms", test.retryAfterMs)
+			}
 			response := &http.Response{
 				StatusCode: test.status,
-				Header:     http.Header{"Content-Type": []string{test.contentType}},
+				Header:     header,
 				Body:       io.NopCloser(strings.NewReader(test.body)),
 			}
 			response, converted := codexRetryableCapacityResponse(response)
@@ -107,8 +136,12 @@ func TestCodexRetryableCapacityResponse(t *testing.T) {
 				}
 				return
 			}
-			if response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Retry-After") != "1" {
-				t.Fatalf("response = %#v, want retryable 503", response)
+			wantRetry := test.wantRetry
+			if wantRetry == "" {
+				wantRetry = "1"
+			}
+			if response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Retry-After") != wantRetry {
+				t.Fatalf("response = %#v, want retryable 503 with Retry-After %q", response, wantRetry)
 			}
 			body, err := io.ReadAll(response.Body)
 			if err != nil {
@@ -124,10 +157,10 @@ func TestCodexRetryableCapacityResponse(t *testing.T) {
 func TestCodexPersistRetryHonorsUnboundedPostFallbackWait(t *testing.T) {
 	config := &CodexOverloadFailoverConfig{persistGap: func() time.Duration { return 0 }}
 	transport := codexOverloadFailoverTransport{server: &Server{CodexOverloadFailover: config}}
-	if _, planned := transport.planPersistRetry(context.Background(), "account-a", nil, time.Now().Add(-time.Second), true); !planned {
+	if _, planned := transport.planPersistRetry(context.Background(), "account-a", nil, time.Now().Add(-time.Second), true, 0); !planned {
 		t.Fatal("unbounded persistent retry should ignore the elapsed deadline")
 	}
-	if _, planned := transport.planPersistRetry(context.Background(), "account-a", nil, time.Now().Add(-time.Second), false); planned {
+	if _, planned := transport.planPersistRetry(context.Background(), "account-a", nil, time.Now().Add(-time.Second), false, 0); planned {
 		t.Fatal("bounded persistent retry should honor the elapsed deadline")
 	}
 }
