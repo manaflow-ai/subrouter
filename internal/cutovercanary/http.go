@@ -358,7 +358,7 @@ func claudeRequest(model, marker string) ([]byte, error) {
 	return json.Marshal(map[string]any{
 		"model": model, "max_tokens": 256,
 		"system": []map[string]any{{
-			"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+			"type": "text", "text": "This is a subrouter connectivity check.",
 		}},
 		"messages": []map[string]any{{"role": "user", "content": "Reply with exactly " + marker}},
 	})
@@ -401,10 +401,10 @@ func (c *apiClient) claudeTurn(ctx context.Context, sessionID, model, marker str
 	headers := map[string]string{
 		"Authorization":            "Bearer subrouter",
 		"Content-Type":             "application/json",
-		"anthropic-beta":           "claude-code-20250219,oauth-2025-04-20",
+		"anthropic-beta":           "oauth-2025-04-20",
 		"anthropic-version":        "2023-06-01",
-		"User-Agent":               "claude-cli/2.1.199 (external, cli)",
-		"x-app":                    "cli",
+		"User-Agent":               "subrouter",
+		"x-app":                    "subrouter",
 		"X-Subrouter-Agent":        "claude",
 		"X-Claude-Code-Session-Id": sessionID,
 		"X-Subrouter-No-Retry":     "true",

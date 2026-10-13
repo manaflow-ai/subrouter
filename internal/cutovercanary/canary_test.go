@@ -130,13 +130,13 @@ func TestAuthenticatedClaudeCanaryRoutesAndCleansExactSession(t *testing.T) {
 		switch r.URL.Path {
 		case "/v1/messages":
 			if r.Header.Get("Authorization") != "Bearer subrouter" ||
-				r.Header.Get("anthropic-beta") != "claude-code-20250219,oauth-2025-04-20" ||
+				r.Header.Get("anthropic-beta") != "oauth-2025-04-20" ||
 				r.Header.Get("anthropic-version") != "2023-06-01" ||
-				r.Header.Get("User-Agent") != "claude-cli/2.1.199 (external, cli)" ||
-				r.Header.Get("x-app") != "cli" ||
+				r.Header.Get("User-Agent") != "subrouter" ||
+				r.Header.Get("x-app") != "subrouter" ||
 				r.Header.Get("X-Subrouter-Agent") != "claude" ||
 				r.Header.Get("X-Subrouter-No-Retry") != "true" {
-				t.Error("Claude canary request headers do not match the routed CLI shape")
+				t.Error("Claude canary request headers must identify subrouter")
 			}
 			observedSession = r.Header.Get("X-Claude-Code-Session-Id")
 			var body struct {
@@ -156,8 +156,8 @@ func TestAuthenticatedClaudeCanaryRoutesAndCleansExactSession(t *testing.T) {
 				t.Error("Claude canary request body is invalid")
 			}
 			if len(body.System) != 1 || body.System[0].Type != "text" ||
-				body.System[0].Text != "You are Claude Code, Anthropic's official CLI for Claude." {
-				t.Error("Claude canary request does not carry the Claude Code system identity")
+				body.System[0].Text != "This is a subrouter connectivity check." {
+				t.Error("Claude canary request must identify its own purpose")
 			}
 			marker := strings.TrimPrefix(body.Messages[0].Content, "Reply with exactly ")
 			mu.Lock()

@@ -180,11 +180,9 @@ type TokenIdentity struct {
 	WeeklyResetAt time.Time
 }
 
-// VerifyAccessToken sends the one-token Messages probe Claude Code itself
-// would send and reports ErrSetupTokenRejected on an authentication failure.
-// Any 2xx or quota response proves the token is accepted; the probe has the
-// Claude Code request shape because Anthropic answers a bare subscription
-// OAuth call with a headerless 429 regardless of the token.
+// VerifyAccessToken sends a one-token subrouter Messages probe and reports
+// ErrSetupTokenRejected on an authentication failure. A 2xx or a 429 with
+// account-specific identity proves acceptance; a bare rejection does not.
 func VerifyAccessToken(ctx context.Context, client *http.Client, accessToken string) error {
 	_, err := VerifyAccessTokenIdentity(ctx, client, accessToken)
 	return err
@@ -210,9 +208,7 @@ func VerifyAccessTokenIdentity(ctx context.Context, client *http.Client, accessT
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return TokenIdentity{}, fmt.Errorf("%w: %s", ErrSetupTokenRejected, res.Status)
 	}
-	if res.StatusCode >= 500 {
-		return TokenIdentity{}, fmt.Errorf("Claude setup token verification failed: %s", res.Status)
-	}
+
 	identity := TokenIdentity{
 		OrganizationID: strings.TrimSpace(res.Header.Get("anthropic-organization-id")),
 	}
@@ -220,20 +216,25 @@ func VerifyAccessTokenIdentity(ctx context.Context, client *http.Client, accessT
 	if epoch, err := strconv.ParseInt(rawReset, 10, 64); err == nil && epoch > 0 {
 		identity.WeeklyResetAt = time.Unix(epoch, 0)
 	}
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		if res.StatusCode != http.StatusTooManyRequests || (identity.OrganizationID == "" && identity.WeeklyResetAt.IsZero()) {
+			return TokenIdentity{}, fmt.Errorf("Claude setup token verification inconclusive: %s", res.Status)
+		}
+	}
 	return identity, nil
 }
 
 func newFableProbeRequest(ctx context.Context, accessToken string) (*http.Request, error) {
-	body := bytes.NewBufferString(`{"model":"` + FableModel + `","max_tokens":1,"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[{"role":"user","content":"."}]}`)
+	body := bytes.NewBufferString(`{"model":"` + FableModel + `","max_tokens":1,"system":[{"type":"text","text":"This is a subrouter quota probe."}],"messages":[{"role":"user","content":"."}]}`)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, messagesURL, body)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("anthropic-beta", "claude-code-20250219,"+oauthBetaHeader)
+	req.Header.Set("anthropic-beta", oauthBetaHeader)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "claude-cli/2.1.199 (external, cli)")
-	req.Header.Set("x-app", "cli")
+	req.Header.Set("User-Agent", "subrouter")
+	req.Header.Set("x-app", "subrouter")
 	return req, nil
 }

@@ -33,10 +33,11 @@ func oauthAccountForTest() Account {
 }
 
 func TestListRateLimitResetCredits(t *testing.T) {
-	var gotAuth, gotUA string
+	var gotAuth, gotUA, gotClient string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		gotUA = r.Header.Get("User-Agent")
+		gotClient = r.Header.Get("OAI-Client-Id")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"credits":[
 			{"id":"RateLimitResetCredit_abc","reset_type":"codex_rate_limits","status":"available"},
@@ -53,8 +54,8 @@ func TestListRateLimitResetCredits(t *testing.T) {
 	if gotAuth != "Bearer tok-123" {
 		t.Errorf("Authorization = %q, want Bearer tok-123", gotAuth)
 	}
-	if gotUA != codexCLIUserAgent {
-		t.Errorf("User-Agent = %q, want %q", gotUA, codexCLIUserAgent)
+	if gotUA != "subrouter" || gotClient != "subrouter" {
+		t.Errorf("maintenance identity = %q/%q, want subrouter/subrouter", gotUA, gotClient)
 	}
 	if len(credits) != 2 {
 		t.Fatalf("expected 2 credits, got %d", len(credits))
