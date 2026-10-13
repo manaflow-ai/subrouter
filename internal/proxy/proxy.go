@@ -10704,9 +10704,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// client yet, so it is retried exactly like a 529.
 		claudeStreamOverload := false
 		claudeStreamDenial := false
+		claudeStreamCredit := false
 		if t.provider == accounts.ProviderClaude {
 			claudeStreamOverload = claudeStreamOverloaded(response)
 			claudeStreamDenial = claudeStreamPersistentAuthorizationDenied(response)
+			claudeStreamCredit = claudeStreamCreditExhausted(response)
 		}
 		claudeOverload := t.provider == accounts.ProviderClaude && !claudeResponseRejectedForPool(response.Header, t.poolModel) &&
 			(claudeOverloadStatus(response.StatusCode) || claudeStreamOverload)
@@ -10867,8 +10869,8 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		usageLimited, exhausted, credentialFailure := false, false, false
 		persistentAuthorizationDenial := claudeStreamDenial
-		claudeCreditExhausted := false
-		if !modelUnsupported && t.provider == accounts.ProviderClaude {
+		claudeCreditExhausted := claudeStreamCredit
+		if !claudeCreditExhausted && !modelUnsupported && t.provider == accounts.ProviderClaude {
 			claudeCreditExhausted, inspectErr = responseClaudeCreditExhausted(response)
 			if inspectErr != nil {
 				if t.logger != nil {

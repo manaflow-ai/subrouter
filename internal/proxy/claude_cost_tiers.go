@@ -54,7 +54,15 @@ const claudeCreditExhaustionHold = time.Hour
 // "Your credit balance is too low to access the Anthropic API. Please go to
 // Plans & Billing to upgrade or purchase credits."
 func claudeCreditExhaustedMessage(body []byte) bool {
-	return strings.Contains(normalizedProviderErrorMessage(body), "credit balance is too low")
+	message := normalizedProviderErrorMessage(body)
+	if !strings.Contains(message, "credit balance") {
+		return false
+	}
+	// Anthropic has returned both "credit balance is too low" and the shorter
+	// "credit balance too low" wording, as well as "credit balance is
+	// insufficient". All are account-wide billing failures, regardless of the
+	// surrounding error envelope.
+	return strings.Contains(message, "too low") || strings.Contains(message, "insufficient") || strings.Contains(message, "not enough")
 }
 
 func claudeCreditExhaustedStatus(code int) bool {
