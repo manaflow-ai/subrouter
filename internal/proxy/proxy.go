@@ -1099,9 +1099,6 @@ func (r *AccountRef) replace(account accounts.Account) {
 
 func (s Server) Handler() http.Handler {
 	s.CredentialBroker = normalizedCredentialBroker(s.CredentialBroker)
-	if s.SchedulerRef == nil {
-		s.SchedulerRef = selectacct.NewSchedulerRef(s.Scheduler)
-	}
 	if s.ActiveSessions == nil {
 		s.ActiveSessions = NewActiveSessions()
 	}
