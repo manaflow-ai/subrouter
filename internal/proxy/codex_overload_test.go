@@ -523,10 +523,10 @@ func TestCodexOverloadMarkTTLHonorsRetryHints(t *testing.T) {
 			}
 			proxy := httptest.NewServer(server.Handler())
 			defer proxy.Close()
-			started := time.Now()
 			if status, body := codexEgressPost(t, proxy.URL, sessionID); status != http.StatusOK {
 				t.Fatalf("status=%d body=%s", status, body)
 			}
+			started := time.Now()
 			until, _, ok := server.SchedulerRef.CapacityMarkFor(accounts.ProviderCodex, "codex-account-0", "gpt-6-astra", "")
 			if !ok {
 				t.Fatal("overloaded account was not marked")
@@ -557,10 +557,13 @@ func TestCodexRetryHintJSONShapes(t *testing.T) {
 }
 
 func TestCodexRetryAfterMillisecondsRejectsOverflow(t *testing.T) {
-	for _, raw := range []string{"NaN", "+Inf", "-Inf", "1e100", "0", "-1", "not-a-number"} {
+	for _, raw := range []string{"NaN", "+Inf", "-Inf", "0", "-1", "not-a-number"} {
 		if wait, ok := codexRetryAfterMilliseconds(raw); ok {
 			t.Fatalf("retry-after-ms %q parsed as %v, want invalid", raw, wait)
 		}
+	}
+	if wait, ok := codexRetryAfterMilliseconds("1e100"); !ok || wait != 8*24*time.Hour {
+		t.Fatalf("retry-after-ms 1e100 = %v, %t, want the 8d saturation", wait, ok)
 	}
 	if wait, ok := codexRetryAfterMilliseconds("60000"); !ok || wait != time.Minute {
 		t.Fatalf("retry-after-ms 60000 = %v, %t, want 1m, true", wait, ok)

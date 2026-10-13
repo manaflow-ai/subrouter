@@ -759,21 +759,25 @@ func (t codexOverloadFailoverTransport) planStayRetry(accountID, reason string, 
 
 // planDefaultRetry is the failover ladder: one quick retry on the same
 // account, then the overload failover to other accounts, all inside the
-// time budget and the request's shared attempt budget.
+// time budget and the request's shared attempt budget. If a provider
+// Retry-After cannot fit the same-account budget, that retry is skipped and
+// failover may proceed without sending the original account early.
 func (t codexOverloadFailoverTransport) planDefaultRetry(ctx context.Context, accountID, reason string, tried map[string]struct{}, sameAccountLeft, switched *int, maxAccounts int, deadline time.Time, retryAfter time.Duration) (codexCapacityAttemptPlan, bool) {
 	config := t.server.CodexOverloadFailover
 	if *sameAccountLeft > 0 {
-		*sameAccountLeft--
 		gap := max(config.sameAccountDelay(), retryAfter)
-		if t.clock().Add(gap).After(deadline) {
-			t.logOverload("codex capacity retry exhausted", accountID, reason, *switched, "time_budget")
-			return codexCapacityAttemptPlan{}, false
+		if !t.clock().Add(gap).After(deadline) {
+			*sameAccountLeft--
+			if !t.attempt.consume() {
+				t.logOverload("codex capacity retry exhausted", accountID, reason, *switched, "retry_budget")
+				return codexCapacityAttemptPlan{}, false
+			}
+			return codexCapacityAttemptPlan{gap: gap, phase: "same_account"}, true
 		}
-		if !t.attempt.consume() {
-			t.logOverload("codex capacity retry exhausted", accountID, reason, *switched, "retry_budget")
-			return codexCapacityAttemptPlan{}, false
-		}
-		return codexCapacityAttemptPlan{gap: gap, phase: "same_account"}, true
+		// A provider deadline longer than this request's failover budget rules
+		// out the same-account retry. Skip it and continue to the alternate
+		// account path; the original account is never retried early.
+		*sameAccountLeft = 0
 	}
 	// The same account shed the request again (its capacity mark now
 	// ranks it last for this pool): move on.
