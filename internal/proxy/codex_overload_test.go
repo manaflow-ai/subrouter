@@ -556,6 +556,17 @@ func TestCodexRetryHintJSONShapes(t *testing.T) {
 	}
 }
 
+func TestCodexRetryAfterMillisecondsRejectsOverflow(t *testing.T) {
+	for _, raw := range []string{"NaN", "+Inf", "-Inf", "1e100", "0", "-1", "not-a-number"} {
+		if wait, ok := codexRetryAfterMilliseconds(raw); ok {
+			t.Fatalf("retry-after-ms %q parsed as %v, want invalid", raw, wait)
+		}
+	}
+	if wait, ok := codexRetryAfterMilliseconds("60000"); !ok || wait != time.Minute {
+		t.Fatalf("retry-after-ms 60000 = %v, %t, want 1m, true", wait, ok)
+	}
+}
+
 // Switching accounts right away piles onto a pool that is shedding load; the
 // failover waits a short jittered beat between accounts.
 func TestCodexOverloadFailoverBacksOffBetweenAccounts(t *testing.T) {

@@ -57,13 +57,14 @@ func TestCodexPostFallbackRetryBudgetPreservesOverrides(t *testing.T) {
 
 func TestCodexRetryableCapacityResponse(t *testing.T) {
 	tests := []struct {
-		name        string
-		status      int
-		contentType string
-		body        string
-		retryAfter  string
-		wantRetry   string
-		convert     bool
+		name         string
+		status       int
+		contentType  string
+		body         string
+		retryAfter   string
+		retryAfterMs string
+		wantRetry    string
+		convert      bool
 	}{
 		{
 			name:        "sse capacity",
@@ -89,6 +90,16 @@ func TestCodexRetryableCapacityResponse(t *testing.T) {
 			convert:     true,
 		},
 		{
+			name:         "json capacity preserves millisecond deadline",
+			status:       http.StatusBadGateway,
+			contentType:  "application/json",
+			body:         `{"error":{"code":"server_is_overloaded"}}`,
+			retryAfter:   "1",
+			retryAfterMs: "60000",
+			wantRetry:    "60",
+			convert:      true,
+		},
+		{
 			name:        "generic server error",
 			status:      http.StatusBadGateway,
 			contentType: "application/json",
@@ -106,6 +117,9 @@ func TestCodexRetryableCapacityResponse(t *testing.T) {
 			header := http.Header{"Content-Type": []string{test.contentType}}
 			if test.retryAfter != "" {
 				header.Set("Retry-After", test.retryAfter)
+			}
+			if test.retryAfterMs != "" {
+				header.Set("Retry-After-Ms", test.retryAfterMs)
 			}
 			response := &http.Response{
 				StatusCode: test.status,

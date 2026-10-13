@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
@@ -305,15 +306,14 @@ func codexRetryableCapacityResponse(response *http.Response) (*http.Response, bo
 	retryAfterMs := strings.TrimSpace(response.Header.Get("Retry-After-Ms"))
 	now := time.Now()
 	validRetryAfter := retryAfter == "0"
+	retryAfterWait := time.Duration(0)
 	if retryAfter != "" && !validRetryAfter {
-		validRetryAfter = parseRetryAfter(retryAfter, now).After(now)
-	}
-	validRetryAfterMs := false
-	if retryAfterMs != "" {
-		if milliseconds, err := strconv.ParseFloat(retryAfterMs, 64); err == nil {
-			validRetryAfterMs = milliseconds > 0
+		if retryAt := parseRetryAfter(retryAfter, now); retryAt.After(now) {
+			validRetryAfter = true
+			retryAfterWait = retryAt.Sub(now)
 		}
 	}
+	retryAfterMsWait, validRetryAfterMs := codexRetryAfterMilliseconds(retryAfterMs)
 	_ = response.Body.Close()
 	body := []byte(codexRetryableCapacityBody)
 	if response.Header == nil {
@@ -324,12 +324,12 @@ func codexRetryableCapacityResponse(response *http.Response) (*http.Response, bo
 	response.Header.Del("Content-Encoding")
 	response.Header.Del("Content-Range")
 	response.Header.Set("Content-Type", "application/json")
-	if validRetryAfter {
+	if validRetryAfter && (!validRetryAfterMs || retryAfterWait >= retryAfterMsWait) {
 		response.Header.Set("Retry-After", retryAfter)
 	} else if validRetryAfterMs {
 		response.Header.Set("Retry-After-Ms", retryAfterMs)
-		milliseconds, _ := strconv.ParseFloat(retryAfterMs, 64)
-		response.Header.Set("Retry-After", strconv.FormatInt(ceilSeconds(time.Duration(milliseconds*float64(time.Millisecond))), 10))
+		wait, _ := codexRetryAfterMilliseconds(retryAfterMs)
+		response.Header.Set("Retry-After", strconv.FormatInt(ceilSeconds(wait), 10))
 	} else {
 		response.Header.Set("Retry-After", "1")
 	}
@@ -361,8 +361,8 @@ func codexCapacityRetryHint(response *http.Response) time.Duration {
 		return 0
 	}
 	if raw := strings.TrimSpace(response.Header.Get("Retry-After-Ms")); raw != "" {
-		if ms, err := strconv.ParseFloat(raw, 64); err == nil && ms > 0 {
-			return time.Duration(ms * float64(time.Millisecond))
+		if wait, ok := codexRetryAfterMilliseconds(raw); ok {
+			return wait
 		}
 	}
 	now := time.Now()
@@ -373,6 +373,25 @@ func codexCapacityRetryHint(response *http.Response) time.Duration {
 		return codexRetryHintJSON(peeked.payload)
 	}
 	return 0
+}
+
+// codexRetryAfterMilliseconds parses the provider's non-standard millisecond
+// hint without allowing NaN, infinity, or a huge value to overflow duration.
+// Eight days matches the standard Retry-After bound used by the controller.
+func codexRetryAfterMilliseconds(raw string) (time.Duration, bool) {
+	milliseconds, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || math.IsNaN(milliseconds) || math.IsInf(milliseconds, 0) || milliseconds <= 0 {
+		return 0, false
+	}
+	const maxWait = 8 * 24 * time.Hour
+	if milliseconds >= float64(maxWait/time.Millisecond) {
+		return maxWait, true
+	}
+	wait := time.Duration(milliseconds * float64(time.Millisecond))
+	if wait <= 0 {
+		return 0, false
+	}
+	return wait, true
 }
 
 // codexRetryHintJSON digs a retry hint out of a failure payload: top level,

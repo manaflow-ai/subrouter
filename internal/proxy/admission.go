@@ -5,7 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"math"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -220,9 +223,11 @@ func (a *admissionControl) observe(key admissionKey, status int, header http.Hea
 	if a == nil || (status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable && status != 529) {
 		return
 	}
-	until := retryAfterExpiry(header, now)
+	until := admissionRetryAfterExpiry(header, now)
 	if key.provider == accounts.ProviderClaude && status == http.StatusTooManyRequests {
-		until = claudeExhaustionExpiryForPool(header, now, key.model)
+		if quotaUntil := claudeExhaustionExpiryForPool(header, now, key.model); quotaUntil.After(until) {
+			until = quotaUntil
+		}
 	}
 	if until.IsZero() {
 		if status != http.StatusTooManyRequests {
@@ -231,6 +236,35 @@ func (a *admissionControl) observe(key admissionKey, status int, header http.Hea
 		until = now.Add(time.Second)
 	}
 	a.pause(key, until)
+}
+
+// admissionRetryAfterExpiry accepts the standard Retry-After header and
+// Codex's millisecond variant, choosing the later valid deadline. Values are
+// bounded before converting to time.Duration so a malformed or enormous
+// floating-point value cannot wrap into an immediate retry.
+func admissionRetryAfterExpiry(header http.Header, now time.Time) time.Time {
+	until := retryAfterExpiry(header, now)
+	raw := strings.TrimSpace(header.Get("Retry-After-Ms"))
+	if raw == "" {
+		return until
+	}
+	milliseconds, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(milliseconds) || math.IsInf(milliseconds, 0) || milliseconds <= 0 {
+		return until
+	}
+	const maxWait = 8 * 24 * time.Hour
+	if milliseconds >= float64(maxWait/time.Millisecond) {
+		maxUntil := now.Add(maxWait)
+		if maxUntil.After(until) {
+			return maxUntil
+		}
+		return until
+	}
+	msUntil := now.Add(time.Duration(milliseconds * float64(time.Millisecond)))
+	if msUntil.After(until) {
+		return msUntil
+	}
+	return until
 }
 
 func (l *admissionLease) release() {
