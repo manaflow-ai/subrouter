@@ -124,10 +124,10 @@ func TestCodexRetryableCapacityResponse(t *testing.T) {
 func TestCodexPersistRetryHonorsUnboundedPostFallbackWait(t *testing.T) {
 	config := &CodexOverloadFailoverConfig{persistGap: func() time.Duration { return 0 }}
 	transport := codexOverloadFailoverTransport{server: &Server{CodexOverloadFailover: config}}
-	if _, planned := transport.planPersistRetry(context.Background(), "account-a", nil, time.Now().Add(-time.Second), true); !planned {
+	if _, planned := transport.planPersistRetry(context.Background(), "account-a", nil, time.Now().Add(-time.Second), true, 0); !planned {
 		t.Fatal("unbounded persistent retry should ignore the elapsed deadline")
 	}
-	if _, planned := transport.planPersistRetry(context.Background(), "account-a", nil, time.Now().Add(-time.Second), false); planned {
+	if _, planned := transport.planPersistRetry(context.Background(), "account-a", nil, time.Now().Add(-time.Second), false, 0); planned {
 		t.Fatal("bounded persistent retry should honor the elapsed deadline")
 	}
 }

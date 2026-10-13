@@ -9954,7 +9954,9 @@ func claudeTransient429Backoff(retry int) time.Duration {
 // Code, which gives a request 10 minutes, gets a clean 529 rather than a
 // timeout. The cap counts upstream time: a step whose wait would end past it
 // is shortened to end at the cap, and no retry starts once the cap has
-// passed. Retry-After can lengthen a step (up to 15s) but never shortens it.
+// passed. Retry-After can lengthen a step, but never shortens it. If the
+// provider deadline is beyond the local retry budget, the overload response
+// passes through unchanged instead of retrying early.
 //
 // The ladder is request-wide (claudeOverloadHold lives on the request's
 // attemptBudget), so an outer replay after a transport error continues it
@@ -10003,20 +10005,26 @@ func (h *claudeOverloadHold) claim(header http.Header, now time.Time, policy ove
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	wait := claudeOverloadGap(h.retries, policy.intervalOr(claudeOverloadDefaultInterval))
-	if retryAt := parseRetryAfter(strings.TrimSpace(claudeHeaderGet(header, "Retry-After")), now); !retryAt.IsZero() {
-		// Retry-After can lengthen a step but never shorten it: a 0 or
-		// past value would otherwise fire the whole ladder back to back.
-		wait = max(wait, min(retryAt.Sub(now), claudeOverloadMaxRetryAfter))
+	providerWait := time.Duration(0)
+	if retryAt := parseRetryAfter(strings.TrimSpace(claudeHeaderGet(header, "Retry-After")), now); retryAt.After(now) {
+		// Retry-After is an upstream deadline, not a hint. A zero or past value
+		// is ignored, while a future value must never be shortened.
+		providerWait = retryAt.Sub(now)
+		wait = max(wait, providerWait)
 	}
 	elapsed := h.held
 	if !h.started.IsZero() {
 		elapsed = max(elapsed, now.Sub(h.started))
 	}
 	if !policy.unbounded {
-		// Upstream time counts against the hold, so the last step is
-		// shortened to end at the cap instead of being refused outright.
 		left := policy.maxWaitOr(claudeOverloadDefaultMaxWait) - elapsed
 		if left <= 0 {
+			return claudeOverloadClaim{retry: h.retries, elapsed: elapsed}, false
+		}
+		// Retrying before the provider's deadline is worse than returning the
+		// original overload. Do not shorten a provider-directed wait to fit the
+		// local retry budget.
+		if providerWait > left {
 			return claudeOverloadClaim{retry: h.retries, elapsed: elapsed}, false
 		}
 		wait = min(wait, left)

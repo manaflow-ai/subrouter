@@ -358,7 +358,7 @@ func TestClaudeOverloadRetryAfterNeverShortensStep(t *testing.T) {
 	}
 	header.Set("Retry-After", "60")
 	step, ok = hold.claim(header, now.Add(8*time.Second), overloadRetryPolicy{})
-	if !ok || step.wait != claudeOverloadMaxRetryAfter {
-		t.Fatalf("Retry-After: 60 wait = %v ok = %t, want the %v cap", step.wait, ok, claudeOverloadMaxRetryAfter)
+	if !ok || step.wait != 60*time.Second {
+		t.Fatalf("Retry-After: 60 wait = %v ok = %t, want the full provider deadline", step.wait, ok)
 	}
 }
