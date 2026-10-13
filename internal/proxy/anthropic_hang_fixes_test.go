@@ -139,6 +139,69 @@ func TestLargePostReleasesUploadLimiterBeforeResponse(t *testing.T) {
 	}
 }
 
+func TestLargePostKeepsUploadLimiterUntilBodyClose(t *testing.T) {
+	limiter := make(chan struct{}, 1)
+	firstReturned := make(chan struct{})
+	firstBody := make(chan io.ReadCloser, 1)
+	var calls atomic.Int32
+	transport := replayablePostRetryTransport{
+		base: bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if calls.Add(1) == 1 {
+				firstBody <- req.Body
+				close(firstReturned)
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
+			}
+			if _, err := io.Copy(io.Discard, req.Body); err != nil {
+				return nil, err
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
+		}),
+		maxAttempts: 1,
+		limiter:     limiter,
+	}
+	body := strings.Repeat("x", replayablePostLimiterMinBytes)
+	newRequest := func() *http.Request {
+		req, err := http.NewRequest(http.MethodPost, "https://example.invalid/v1/messages", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(body)), nil }
+		return req
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		response, err := transport.RoundTrip(newRequest())
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		firstDone <- err
+	}()
+	<-firstReturned
+
+	secondDone := make(chan error, 1)
+	go func() {
+		response, err := transport.RoundTrip(newRequest())
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second upload ran while first body was still open, err=%v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := (<-firstBody).Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second request failed after first body closed: %v", err)
+	}
+}
+
 // A stream that stays alive but never produces a decisive frame (pings,
 // unparseable frames) must not buffer forever while the client has received
 // no response headers at all.

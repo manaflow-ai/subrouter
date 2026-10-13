@@ -12076,17 +12076,24 @@ func (t replayablePostRetryTransport) roundTrip(a *upstreamAttempt, req *http.Re
 		req = copy
 	}
 	response, err := a.send(t.base, req, addressed)
-	// A transport may return before consuming the body on an early dial or
-	// context error. Avoid leaking the slot in that case.
-	release()
+	// On an early transport error, close the wrapped body so it releases the
+	// slot. A successful response may be returned before the transport has
+	// finished reading the request body, so leave that slot to the wrapper's
+	// EOF or Close callback.
+	if err != nil && req.Body != nil && req.Body != http.NoBody {
+		_ = req.Body.Close()
+	}
 	return response, err
 }
 
+// uploadLimiterBody releases the upload slot when the transport finishes with
+// the request body rather than when response headers arrive.
 type uploadLimiterBody struct {
 	io.ReadCloser
 	release func()
 }
 
+// Read forwards body data and releases the slot at EOF or on a read error.
 func (b *uploadLimiterBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if err != nil {
@@ -12095,6 +12102,7 @@ func (b *uploadLimiterBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// Close releases the slot when the transport abandons the request body.
 func (b *uploadLimiterBody) Close() error {
 	err := b.ReadCloser.Close()
 	b.release()
