@@ -42,20 +42,20 @@ jobs:
           SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          mkdir -p canary-artifact
+          mkdir -p "$RUNNER_TEMP/sr-canary"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -buildvcs=true \
             -ldflags="-s -w" \
-            -o canary-artifact/subrouter-darwin-arm64 ./cmd/subrouter
-          printf '%s\n' "$SOURCE_SHA" > canary-artifact/source-sha.txt
-          (cd canary-artifact && sha256sum subrouter-darwin-arm64 > SHA256SUMS)
+            -o "$RUNNER_TEMP/sr-canary/subrouter-darwin-arm64" ./cmd/subrouter
+          printf '%s\n' "$SOURCE_SHA" > "$RUNNER_TEMP/sr-canary/source-sha.txt"
+          (cd "$RUNNER_TEMP/sr-canary" && sha256sum subrouter-darwin-arm64 > SHA256SUMS)
 
       - name: Upload canary candidate
         if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: canary-${{ github.event.pull_request.head.sha }}
-          path: canary-artifact/
+          path: ${{ runner.temp }}/sr-canary/
           retention-days: 7
 
       # CI only builds for linux/amd64, but releases cross-compile for every
