@@ -63,14 +63,14 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("load hosted login configuration: %w", err)
 	}
+	if strings.TrimSpace(publicConfig.Subrouter.ExchangeURL) == "" {
+		return hostedExchangeLoginError(errors.New("cmux.com does not advertise hosted Subrouter"))
+	}
 	if override := strings.TrimRight(strings.TrimSpace(*hostedURL), "/"); override != "" {
 		publicConfig.Subrouter.URL = override
 		if err := publicConfig.Validate(); err != nil {
 			return fmt.Errorf("invalid hosted Subrouter override: %w", err)
 		}
-	}
-	if strings.TrimSpace(publicConfig.Subrouter.ExchangeURL) == "" {
-		return hostedExchangeLoginError(errors.New("cmux.com does not advertise hosted Subrouter"))
 	}
 	stackClient := stackauth.Client{
 		APIURL: publicConfig.Auth.APIURL, ProjectID: publicConfig.Auth.ProjectID,
