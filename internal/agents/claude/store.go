@@ -4313,6 +4313,21 @@ func (e *UsageScopeError) Error() string {
 	return "usage fetch failed: " + e.Status
 }
 
+// FableUsageThrottleError preserves a Messages probe's provider cooldown
+// without treating it as an account-wide OAuth usage-endpoint throttle.
+type FableUsageThrottleError struct {
+	Status  string
+	RetryAt time.Time
+	Windows []accounts.UsageWindow
+}
+
+func (e *FableUsageThrottleError) Error() string {
+	if e == nil {
+		return "Fable usage probe throttled"
+	}
+	return "Fable usage probe failed: " + e.Status
+}
+
 func FetchUsage(ctx context.Context, client *http.Client, accessToken string) (*UsageResponse, error) {
 	if accessToken == "" {
 		return nil, nil
@@ -4382,7 +4397,24 @@ func FetchFableUsageWindows(ctx context.Context, client *http.Client, accessToke
 	}
 	defer res.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 64<<10))
-	windows := usageWindowsFromFableHeaders(res.Header, time.Now())
+	now := time.Now()
+	windows := usageWindowsFromFableHeaders(res.Header, now)
+	if res.StatusCode == http.StatusTooManyRequests {
+		// Headerless bot-shape 429s retain the old unknown result. A provider
+		// deadline is useful only when it is actually supplied, and must stay
+		// scoped to this Messages probe rather than the ordinary usage endpoint.
+		if retryAfter := strings.TrimSpace(res.Header.Get("Retry-After")); retryAfter != "" {
+			status := strings.TrimSpace(res.Status)
+			if status == "" {
+				status = fmt.Sprintf("%d %s", res.StatusCode, http.StatusText(res.StatusCode))
+			}
+			return nil, &FableUsageThrottleError{
+				Status:  status,
+				RetryAt: usageThrottleRetryAt(retryAfter, now),
+				Windows: windows,
+			}
+		}
+	}
 	if len(windows) > 0 {
 		return windows, nil
 	}

@@ -480,6 +480,10 @@ type AccountRef struct {
 	// reverify a weekly-cooked account while its usage endpoint is throttled.
 	// Guarded by usageWindowsMu and scoped to the credential identity.
 	claudeQuotaProbeAt map[string]time.Time
+	// Fable Messages probe cooldowns are separate from ordinary usage endpoint
+	// throttles because the two provider endpoints have independent budgets.
+	claudeFableProbeFailures   map[string]claudeFableProbeFailure
+	claudeFableProbeGeneration map[string]uint64
 	// claudeUsageScopeDenied holds credentials the Claude usage endpoint has
 	// refused for lacking its scope (setup tokens). Guarded by usageWindowsMu.
 	claudeUsageScopeDenied map[string]struct{}
@@ -4958,7 +4962,15 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			var windows []accounts.UsageWindow
 			var fresh bool
 			if reverifyClaudeQuota {
-				windows, err = agentclaude.FetchFableUsageWindows(sweepCtx, client, refreshed.Token)
+				windows, err = s.AccountRef.fetchClaudeFableUsageWindows(sweepCtx, client, refreshed)
+				var fableThrottle *agentclaude.FableUsageThrottleError
+				if errors.As(err, &fableThrottle) && len(fableThrottle.Windows) > 0 {
+					// A throttled probe can still carry authoritative reset
+					// headers. Keep those windows for this score without
+					// treating a headerless probe rejection as fresh.
+					windows = append([]accounts.UsageWindow(nil), fableThrottle.Windows...)
+					err = nil
+				}
 				fresh = err == nil && fableProbeHasPrimaryWindows(windows)
 				if err == nil && !fresh {
 					return
@@ -5021,7 +5033,13 @@ func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, acco
 		}
 		windows := claudeUsageWindows(usage)
 		if !usageWindowNamed(windows, agentclaude.FableWindowName) {
-			if fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, account.Token); probeErr == nil && len(fableWindows) > 0 {
+			fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, account.Token)
+			var fableThrottle *agentclaude.FableUsageThrottleError
+			if errors.As(probeErr, &fableThrottle) && len(fableThrottle.Windows) > 0 {
+				if err == nil || fableProbeHasPrimaryWindows(fableThrottle.Windows) {
+					windows = mergeUsageWindows(windows, fableThrottle.Windows)
+				}
+			} else if probeErr == nil && len(fableWindows) > 0 {
 				if err == nil || fableProbeHasPrimaryWindows(fableWindows) {
 					windows = mergeUsageWindows(windows, fableWindows)
 				}
