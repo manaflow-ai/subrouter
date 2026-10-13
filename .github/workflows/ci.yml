@@ -19,6 +19,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -33,6 +35,28 @@ jobs:
 
       - name: Test
         run: CGO_ENABLED=0 go test ./...
+
+      - name: Package exact-head canary candidate
+        if: github.event_name == 'pull_request'
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p canary-artifact
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -buildvcs=true \
+            -ldflags="-s -w" \
+            -o canary-artifact/subrouter-darwin-arm64 ./cmd/subrouter
+          printf '%s\n' "$SOURCE_SHA" > canary-artifact/source-sha.txt
+          (cd canary-artifact && sha256sum subrouter-darwin-arm64 > SHA256SUMS)
+
+      - name: Upload canary candidate
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-${{ github.event.pull_request.head.sha }}
+          path: canary-artifact/
+          retention-days: 7
 
       # CI only builds for linux/amd64, but releases cross-compile for every
       # platform below. A platform-specific symbol (syscall.SIGUSR1 does not

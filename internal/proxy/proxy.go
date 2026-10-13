@@ -1099,6 +1099,9 @@ func (r *AccountRef) replace(account accounts.Account) {
 
 func (s Server) Handler() http.Handler {
 	s.CredentialBroker = normalizedCredentialBroker(s.CredentialBroker)
+	if s.SchedulerRef == nil {
+		s.SchedulerRef = selectacct.NewSchedulerRef(s.Scheduler)
+	}
 	if s.ActiveSessions == nil {
 		s.ActiveSessions = NewActiveSessions()
 	}
@@ -2769,7 +2772,7 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		if boundLease == nil && retryPost && postReplayable &&
 			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude) &&
-			account.AuthMode == accounts.AuthModeOAuth &&
+			(account.AuthMode == accounts.AuthModeOAuth || (requestProvider == accounts.ProviderClaude && session.ExtractAccountID(r) == "")) &&
 			s.CredentialBroker == nil {
 			var fableFallback func() (*http.Response, bool)
 			if fableFallbackConfigured {
@@ -4732,6 +4735,9 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		s.Logger.Info("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
 	}
 	scheduler := base.ForModel(poolModel).WithSessionCounts(s.Sessions.CountByAccount())
+	if provider == accounts.ProviderClaude {
+		availableAccounts = claudeSubscriptionFirst(availableAccounts, scheduler)
+	}
 	// picked carries a placement decided inside the sticky branch (the
 	// constrained account's replacement) into the shared assignment tail, so
 	// the account that was judged materially better is the one assigned.
@@ -5778,7 +5784,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				return response, nil
 			}
 		}
+		billingRejected := t.provider == accounts.ProviderClaude && claudeBillingRejected(response)
 		usageLimited, inspectErr := t.responseUsageLimited(response)
+		usageLimited = usageLimited || billingRejected
 		if inspectErr != nil {
 			if t.logger != nil {
 				t.logger.Warn("usage-limit response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
@@ -5814,7 +5822,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.logClaudeUnusableResponse(response, accountID)
 			// Only poison the score on genuine quota exhaustion; a transient
 			// "allowed"/"allowed_warning" 429 still fails over for this request.
-			exhausted = claudeAccountExhaustedByResponse(response.StatusCode, response.Header)
+			exhausted = billingRejected || claudeAccountExhaustedByResponse(response.StatusCode, response.Header)
 		}
 		var compatibilityNext accounts.Account
 		var compatibilityPickErr error
@@ -5823,7 +5831,14 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				req.Context(), t.provider, t.agent, t.session, t.userEmail, accountID, exhaustionPool, tried,
 			)
 		}
-		if t.server != nil && exhausted && !modelUnsupported {
+		if billingRejected && t.server != nil && t.server.SchedulerRef != nil {
+			// A quota refresh cannot restore prepaid funds. Keep this hold
+			// independent of telemetry, with one retry after a day for top-ups.
+			t.server.SchedulerRef.MarkBillingUnavailableUntil(t.provider, accountID, time.Now().Add(24*time.Hour))
+			if t.logger != nil {
+				t.logger.Warn("claude account billing unavailable", "account", accountID, "session", t.session)
+			}
+		} else if t.server != nil && exhausted && !modelUnsupported {
 			// Use the response's own reset time so the mark self-expires when the
 			// window recovers (codex responses lack these headers and fall back
 			// to the default TTL inside claudeExhaustionExpiry).
@@ -6139,6 +6154,9 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 				return accounts.Account{}, lastErr
 			}
 			return accounts.Account{}, fmt.Errorf("no untried non-exhausted %s accounts available", provider)
+		}
+		if provider == accounts.ProviderClaude {
+			candidates = claudeSubscriptionFirst(candidates, scheduler)
 		}
 		account, err := scheduler.Pick(candidates)
 		if err != nil {
