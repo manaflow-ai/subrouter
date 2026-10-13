@@ -22,6 +22,12 @@ func (r *AccountRef) migrateUsageCredentialState(previous, current accounts.Acco
 	newCredentialKey := usageWindowsCredentialKey(current)
 
 	r.usageWindowsMu.Lock()
+	if current.Provider == accounts.ProviderClaude && previous.Token != current.Token {
+		if r.claudeFableProbeGeneration == nil {
+			r.claudeFableProbeGeneration = make(map[string]uint64)
+		}
+		r.claudeFableProbeGeneration[cacheKey]++
+	}
 	if flightKey := r.usageWindowsLatest[cacheKey]; len(flightKey) > 0 {
 		oldPrefix := cacheKey + "\x00" + oldCredentialKey + "\x00"
 		if len(flightKey) >= len(oldPrefix) && flightKey[:len(oldPrefix)] == oldPrefix {
@@ -41,6 +47,13 @@ func (r *AccountRef) migrateUsageCredentialState(previous, current accounts.Acco
 		(entry.credentialKey == "" || entry.credentialKey == oldCredentialKey) {
 		entry.credentialKey = newCredentialKey
 		r.usageWindows[cacheKey] = entry
+	}
+	if current.Provider == accounts.ProviderClaude {
+		if failure, ok := r.claudeFableProbeFailures[cacheKey]; ok &&
+			(failure.credentialKey == "" || failure.credentialKey == oldCredentialKey) {
+			failure.credentialKey = newCredentialKey
+			r.claudeFableProbeFailures[cacheKey] = failure
+		}
 	}
 	r.usageWindowsMu.Unlock()
 }

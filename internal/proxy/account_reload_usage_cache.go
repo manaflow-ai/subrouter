@@ -35,6 +35,10 @@ func (r *AccountRef) invalidateReplacedAccountUsage(previous, current []accounts
 	r.usageWindowsMu.Lock()
 	for _, account := range replaced {
 		key := account.ID + "\x00" + string(account.Provider)
+		if r.claudeFableProbeGeneration == nil {
+			r.claudeFableProbeGeneration = make(map[string]uint64)
+		}
+		r.claudeFableProbeGeneration[key]++
 		oldKey := usageWindowsCredentialKey(account)
 		// The shared windows slot contains only one credential version.
 		// Protect a newly fetched replacement from a late reload cleanup.
@@ -51,6 +55,10 @@ func (r *AccountRef) invalidateReplacedAccountUsage(previous, current []accounts
 		// clear the shared Retry-After hold. Supplementary quota remains
 		// credential-scoped, so newer grants' evidence stays intact.
 		delete(r.usageWindowsFailures, usageWindowsFailureKey(key))
+		if probeFailure, ok := r.claudeFableProbeFailures[key]; ok &&
+			(probeFailure.credentialKey == "" || probeFailure.credentialKey == oldKey) {
+			delete(r.claudeFableProbeFailures, key)
+		}
 		delete(r.claudeSupplemental, claudeSupplementalCacheKey(account))
 	}
 	r.usageWindowsMu.Unlock()

@@ -21,6 +21,9 @@ type supplementalProbeCounter struct {
 	usageScopeDenied     bool
 	probePrimary         bool
 	probeEmpty           bool
+	probeThrottle        bool
+	probeStarted         chan struct{}
+	probeRelease         chan struct{}
 	includeSupplemental  bool
 	primaryUsed          float64
 	primaryIncludesFable bool
@@ -56,6 +59,14 @@ func (c *supplementalProbeCounter) RoundTrip(req *http.Request) (*http.Response,
 	case strings.HasSuffix(req.URL.Path, "/v1/messages"):
 		c.probeCalls++
 		h := make(http.Header)
+		if c.probeStarted != nil {
+			close(c.probeStarted)
+			<-c.probeRelease
+		}
+		if c.probeThrottle {
+			h.Set("Retry-After", "1800")
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests", Header: h, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+		}
 		if c.probeEmpty {
 			// A headerless overload answer carries no limits at all.
 			return &http.Response{StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests", Header: h, Body: io.NopCloser(strings.NewReader("{}"))}, nil
@@ -456,6 +467,93 @@ func TestClaudeScopeDeniedUsageEndpointIsNotPolledAgain(t *testing.T) {
 	}
 	if transport.usageCalls != 2 {
 		t.Fatalf("new credential inherited the scope denial: usage=%d", transport.usageCalls)
+	}
+}
+
+func TestClaudeFableProbeRetryAfterIsScopedAndHonored(t *testing.T) {
+	transport := &supplementalProbeCounter{usageScopeDenied: true, probeThrottle: true, probePrimary: true}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	account := probeAccount()
+
+	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err == nil {
+		t.Fatal("throttled Fable probe unexpectedly produced a fresh result")
+	}
+	if transport.usageCalls != 1 || transport.probeCalls != 1 {
+		t.Fatalf("first fetch usage=%d probe=%d; want 1+1", transport.usageCalls, transport.probeCalls)
+	}
+	key := claudeFableProbeFailureKey(account)
+	ref.usageWindowsMu.Lock()
+	failure, ok := ref.claudeFableProbeFailures[key]
+	_, telemetryThrottle := ref.usageWindowsFailures[account.ID+"\x00"+string(account.Provider)]
+	ref.usageWindowsMu.Unlock()
+	if !ok || failure.retryAt.Before(time.Now().Add(1799*time.Second)) {
+		t.Fatalf("Fable probe Retry-After deadline = %s, want at least 1800s", failure.retryAt)
+	}
+	if telemetryThrottle {
+		t.Fatal("Fable probe throttle leaked into ordinary usage throttle state")
+	}
+
+	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err == nil {
+		t.Fatal("cooldown fetch unexpectedly produced a fresh result")
+	}
+	if transport.probeCalls != 1 {
+		t.Fatalf("Fable probe repeated before Retry-After: calls=%d", transport.probeCalls)
+	}
+	refreshed := account
+	refreshed.Token = "refresh-token"
+	refreshed.CredentialVersion = "refresh-chain"
+	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, refreshed); err == nil {
+		t.Fatal("token refresh unexpectedly produced a fresh result during Fable cooldown")
+	}
+	if transport.probeCalls != 1 {
+		t.Fatalf("Fable probe cooldown was lost across token refresh: calls=%d", transport.probeCalls)
+	}
+	ref.migrateUsageCredentialState(account, refreshed)
+	relogged := refreshed
+	relogged.Token = "relogin-token"
+	relogged.CredentialVersion = "relogin-chain"
+	ref.invalidateReplacedAccountUsage([]accounts.Account{refreshed}, []accounts.Account{relogged})
+	transport.probeThrottle = false
+	ref.usageWindowsMu.Lock()
+	if _, stillHeld := ref.claudeFableProbeFailures[key]; stillHeld {
+		t.Fatal("true re-login did not clear Fable probe cooldown")
+	}
+	ref.usageWindowsMu.Unlock()
+	windows, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, relogged)
+	if err != nil || !fresh || len(windows) == 0 || transport.probeCalls != 2 {
+		t.Fatalf("Fable probe did not recover after cooldown: fresh=%v windows=%+v err=%v calls=%d", fresh, windows, err, transport.probeCalls)
+	}
+}
+
+func TestClaudeLateFableProbeThrottleCannotCrossRefresh(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	transport := &supplementalProbeCounter{
+		usageScopeDenied: true, probeThrottle: true, probeStarted: started, probeRelease: release,
+	}
+	ref := &AccountRef{}
+	client := &http.Client{Transport: transport}
+	old := probeAccount()
+	refreshed := old
+	refreshed.Token = "refresh-token"
+	refreshed.CredentialVersion = "refresh-chain"
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := ref.FetchUsageWindowsCached(context.Background(), client, old)
+		done <- err
+	}()
+	<-started
+	ref.migrateUsageCredentialState(old, refreshed)
+	close(release)
+	if err := <-done; err == nil {
+		t.Fatal("late throttled probe unexpectedly produced a fresh result")
+	}
+	ref.usageWindowsMu.Lock()
+	_, held := ref.claudeFableProbeFailures[claudeFableProbeFailureKey(old)]
+	ref.usageWindowsMu.Unlock()
+	if held {
+		t.Fatal("late old-credential Fable throttle repopulated after re-login")
 	}
 }
 

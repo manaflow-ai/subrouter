@@ -26,6 +26,11 @@ type claudeSupplementalUsage struct {
 	requestStarted time.Time
 }
 
+type claudeFableProbeFailure struct {
+	retryAt       time.Time
+	credentialKey string
+}
+
 func claudeSupplementalCacheKey(account accounts.Account) string {
 	// A re-login or access-token rotation bypasses the prior probe result.
 	digest := sha256.Sum256([]byte(account.CredentialIdentity()))
@@ -96,6 +101,59 @@ func (r *AccountRef) rememberClaudeUsageScopeDenied(account accounts.Account) {
 	if clearPersisted {
 		r.clearUsageThrottleState(cacheKey)
 	}
+}
+
+func claudeFableProbeFailureKey(account accounts.Account) string {
+	return account.ID + "\x00" + string(account.Provider)
+}
+
+func (r *AccountRef) claudeFableProbeCooldownActive(account accounts.Account, now time.Time) bool {
+	key := claudeFableProbeFailureKey(account)
+	r.usageWindowsMu.Lock()
+	failure, ok := r.claudeFableProbeFailures[key]
+	r.usageWindowsMu.Unlock()
+	// The cooldown is account-scoped so an ordinary access-token refresh does
+	// not immediately repeat the same provider request. True re-login cleanup
+	// removes the entry through invalidateReplacedAccountUsage.
+	return ok && now.Before(failure.retryAt)
+}
+
+func (r *AccountRef) rememberClaudeFableProbeThrottle(account accounts.Account, throttle *agentclaude.FableUsageThrottleError, generation uint64) {
+	if r == nil || throttle == nil || throttle.RetryAt.IsZero() {
+		return
+	}
+	r.usageWindowsMu.Lock()
+	if r.claudeFableProbeGeneration[claudeFableProbeFailureKey(account)] != generation {
+		r.usageWindowsMu.Unlock()
+		return
+	}
+	if r.claudeFableProbeFailures == nil {
+		r.claudeFableProbeFailures = make(map[string]claudeFableProbeFailure)
+	}
+	key := claudeFableProbeFailureKey(account)
+	if existing, ok := r.claudeFableProbeFailures[key]; ok && existing.retryAt.After(throttle.RetryAt) {
+		r.usageWindowsMu.Unlock()
+		return
+	}
+	r.claudeFableProbeFailures[key] = claudeFableProbeFailure{
+		retryAt: throttle.RetryAt, credentialKey: usageWindowsCredentialKey(account),
+	}
+	r.usageWindowsMu.Unlock()
+}
+
+func (r *AccountRef) fetchClaudeFableUsageWindows(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
+	r.usageWindowsMu.Lock()
+	generation := r.claudeFableProbeGeneration[claudeFableProbeFailureKey(account)]
+	r.usageWindowsMu.Unlock()
+	if r.claudeFableProbeCooldownActive(account, time.Now()) {
+		return nil, errClaudeUsageProbeEmpty
+	}
+	windows, err := agentclaude.FetchFableUsageWindows(ctx, client, account.Token)
+	var throttle *agentclaude.FableUsageThrottleError
+	if errors.As(err, &throttle) {
+		r.rememberClaudeFableProbeThrottle(account, throttle, generation)
+	}
+	return windows, err
 }
 
 func supplementalClaudeWindows(windows []accounts.UsageWindow) []accounts.UsageWindow {
@@ -263,7 +321,22 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
 		}
 	}
 
-	fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, account.Token)
+	fableWindows, probeErr := r.fetchClaudeFableUsageWindows(ctx, client, account)
+	var fableThrottle *agentclaude.FableUsageThrottleError
+	if errors.As(probeErr, &fableThrottle) {
+		// This cooldown belongs only to the Messages probe. Do not return the
+		// typed 429 to the shared usage cache, which is for the other endpoint.
+		if len(fableThrottle.Windows) > 0 {
+			if err == nil {
+				return mergeUsageWindows(windows, supplementalClaudeWindows(fableThrottle.Windows)), false, nil
+			}
+			return mergeUsageWindows(windows, fableThrottle.Windows), false, nil
+		}
+		if len(windows) > 0 {
+			return windows, false, nil
+		}
+		return nil, true, errClaudeUsageProbeEmpty
+	}
 	if probeErr == nil {
 		if err == nil {
 			r.rememberClaudeSupplemental(account, fableWindows)
