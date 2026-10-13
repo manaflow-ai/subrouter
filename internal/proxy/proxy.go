@@ -8622,6 +8622,16 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		return account, sessionID, assignment.UserEmail, nil
 	}
 	if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) {
+		if account, ok := accountForAuthorization(availableAccounts, r.Header.Get("Authorization")); ok {
+			s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, accountMoveSticky, nil, false)
+			assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
+			if err != nil {
+				return accounts.Account{}, sessionID, userEmail, err
+			}
+			return account, sessionID, assignment.UserEmail, nil
+		}
+	}
+	if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) {
 		availableAccounts = oauthAccounts(availableAccounts)
 	}
 	if provider == accounts.ProviderClaude && !options.allowFableAPIKeyPool && s.claudeFableEnabled() && claudeFableModel(model) {
@@ -8951,6 +8961,7 @@ const (
 	accountMoveCredential accountMoveReason = "credential"
 	accountMoveModel      accountMoveReason = "model_incompatible"
 	accountMoveOverload   accountMoveReason = "overload"
+	accountMoveSticky     accountMoveReason = "sticky"
 )
 
 // logAccountMove records why a session left the account holding its upstream
@@ -9352,6 +9363,23 @@ func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []a
 func chatGPTBackendPath(path string) bool {
 	_, ok := stripChatGPTBackendPath(path)
 	return ok
+}
+
+func accountForAuthorization(available []accounts.Account, authorization string) (accounts.Account, bool) {
+	authorization = strings.TrimSpace(authorization)
+	if authorization == "" {
+		return accounts.Account{}, false
+	}
+	for _, account := range available {
+		if account.AuthMode != accounts.AuthModeOAuth {
+			continue
+		}
+		candidate := account.AuthorizationHeader()
+		if candidate != "" && len(candidate) == len(authorization) && subtle.ConstantTimeCompare([]byte(candidate), []byte(authorization)) == 1 {
+			return account, true
+		}
+	}
+	return accounts.Account{}, false
 }
 
 const codexModelCatalogSessionID = "internal:codex-model-catalog"

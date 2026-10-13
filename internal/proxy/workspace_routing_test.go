@@ -8,7 +8,23 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
+
+func TestAccountForAuthorizationPreservesWorkspaceIdentity(t *testing.T) {
+	managed := []accounts.Account{
+		{ID: "other", AuthMode: accounts.AuthModeOAuth, Token: "other-token"},
+		{ID: "selected", AuthMode: accounts.AuthModeOAuth, Token: "selected-token"},
+	}
+	got, ok := accountForAuthorization(managed, "Bearer selected-token")
+	if !ok || got.ID != "selected" {
+		t.Fatalf("accountForAuthorization = (%+v, %v), want selected account", got, ok)
+	}
+	if _, ok := accountForAuthorization(managed, "Bearer unknown-token"); ok {
+		t.Fatal("unknown authorization matched a managed account")
+	}
+}
 
 func TestRewriteWorkspaceRoutingResponseMakesSentinelOriginExplicit(t *testing.T) {
 	upstream, err := url.Parse("https://chatgpt.com/backend-api")
