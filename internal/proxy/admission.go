@@ -217,14 +217,17 @@ func (a *admissionControl) pause(key admissionKey, until time.Time) {
 }
 
 func (a *admissionControl) observe(key admissionKey, status int, header http.Header, now time.Time) {
-	if a == nil || status != http.StatusTooManyRequests {
+	if a == nil || (status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable && status != 529) {
 		return
 	}
 	until := retryAfterExpiry(header, now)
-	if key.provider == accounts.ProviderClaude {
+	if key.provider == accounts.ProviderClaude && status == http.StatusTooManyRequests {
 		until = claudeExhaustionExpiryForPool(header, now, key.model)
 	}
 	if until.IsZero() {
+		if status != http.StatusTooManyRequests {
+			return
+		}
 		until = now.Add(time.Second)
 	}
 	a.pause(key, until)

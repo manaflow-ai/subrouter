@@ -61,6 +61,8 @@ func TestCodexRetryableCapacityResponse(t *testing.T) {
 		status      int
 		contentType string
 		body        string
+		retryAfter  string
+		wantRetry   string
 		convert     bool
 	}{
 		{
@@ -78,6 +80,15 @@ func TestCodexRetryableCapacityResponse(t *testing.T) {
 			convert:     true,
 		},
 		{
+			name:        "json capacity preserves retry deadline",
+			status:      http.StatusBadGateway,
+			contentType: "application/json",
+			body:        `{"error":{"code":"server_is_overloaded"}}`,
+			retryAfter:  "60",
+			wantRetry:   "60",
+			convert:     true,
+		},
+		{
 			name:        "generic server error",
 			status:      http.StatusBadGateway,
 			contentType: "application/json",
@@ -92,9 +103,13 @@ func TestCodexRetryableCapacityResponse(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			header := http.Header{"Content-Type": []string{test.contentType}}
+			if test.retryAfter != "" {
+				header.Set("Retry-After", test.retryAfter)
+			}
 			response := &http.Response{
 				StatusCode: test.status,
-				Header:     http.Header{"Content-Type": []string{test.contentType}},
+				Header:     header,
 				Body:       io.NopCloser(strings.NewReader(test.body)),
 			}
 			response, converted := codexRetryableCapacityResponse(response)
@@ -107,8 +122,12 @@ func TestCodexRetryableCapacityResponse(t *testing.T) {
 				}
 				return
 			}
-			if response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Retry-After") != "1" {
-				t.Fatalf("response = %#v, want retryable 503", response)
+			wantRetry := test.wantRetry
+			if wantRetry == "" {
+				wantRetry = "1"
+			}
+			if response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Retry-After") != wantRetry {
+				t.Fatalf("response = %#v, want retryable 503 with Retry-After %q", response, wantRetry)
 			}
 			body, err := io.ReadAll(response.Body)
 			if err != nil {

@@ -281,7 +281,8 @@ const codexRetryableCapacityBody = `{"error":{"code":"subrouter_capacity_retry",
 // codexRetryableCapacityResponse replaces a final explicit capacity response
 // with a generic 503. Codex does not retry server_is_overloaded, but it does
 // retry an otherwise equivalent 5xx response, so this keeps the same turn
-// alive after every Subrouter retry and fallback has been exhausted.
+// alive after every Subrouter retry and fallback has been exhausted. The
+// provider's Retry-After deadline is retained when one was supplied.
 func codexRetryableCapacityResponse(response *http.Response) (*http.Response, bool) {
 	if response == nil || response.Body == nil || response.Body == http.NoBody {
 		return response, false
@@ -297,6 +298,22 @@ func codexRetryableCapacityResponse(response *http.Response) (*http.Response, bo
 	if !capacity {
 		return response, false
 	}
+	// Keep the provider's retry deadline when translating its capacity body to
+	// the generic retryable response. A fixed one-second hint would invite the
+	// client to retry before the upstream says capacity may recover.
+	retryAfter := strings.TrimSpace(response.Header.Get("Retry-After"))
+	retryAfterMs := strings.TrimSpace(response.Header.Get("Retry-After-Ms"))
+	now := time.Now()
+	validRetryAfter := retryAfter == "0"
+	if retryAfter != "" && !validRetryAfter {
+		validRetryAfter = parseRetryAfter(retryAfter, now).After(now)
+	}
+	validRetryAfterMs := false
+	if retryAfterMs != "" {
+		if milliseconds, err := strconv.ParseFloat(retryAfterMs, 64); err == nil {
+			validRetryAfterMs = milliseconds > 0
+		}
+	}
 	_ = response.Body.Close()
 	body := []byte(codexRetryableCapacityBody)
 	if response.Header == nil {
@@ -307,7 +324,15 @@ func codexRetryableCapacityResponse(response *http.Response) (*http.Response, bo
 	response.Header.Del("Content-Encoding")
 	response.Header.Del("Content-Range")
 	response.Header.Set("Content-Type", "application/json")
-	response.Header.Set("Retry-After", "1")
+	if validRetryAfter {
+		response.Header.Set("Retry-After", retryAfter)
+	} else if validRetryAfterMs {
+		response.Header.Set("Retry-After-Ms", retryAfterMs)
+		milliseconds, _ := strconv.ParseFloat(retryAfterMs, 64)
+		response.Header.Set("Retry-After", strconv.FormatInt(ceilSeconds(time.Duration(milliseconds*float64(time.Millisecond))), 10))
+	} else {
+		response.Header.Set("Retry-After", "1")
+	}
 	response.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	response.ContentLength = int64(len(body))
 	response.TransferEncoding = nil
@@ -762,7 +787,7 @@ func (t codexOverloadFailoverTransport) planDefaultRetry(ctx context.Context, ac
 func (t codexOverloadFailoverTransport) planPersistRetry(ctx context.Context, accountID string, tried map[string]struct{}, deadline time.Time, unbounded bool, retryAfter time.Duration) (codexCapacityAttemptPlan, bool) {
 	config := t.server.CodexOverloadFailover
 	gap := max(config.persistDelay(), retryAfter)
-	if !unbounded && time.Now().Add(gap).After(deadline) {
+	if !unbounded && t.clock().Add(gap).After(deadline) {
 		return codexCapacityAttemptPlan{}, false
 	}
 	if !config.enabled() {

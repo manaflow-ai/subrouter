@@ -79,6 +79,21 @@ func TestAdmissionPauseHonorsProviderRetryAfterAndCancellation(t *testing.T) {
 	}
 }
 
+func TestAdmissionPauseHonorsRetryAfterOnCapacity503(t *testing.T) {
+	control := testAdmissionControl(1, 2)
+	key := admissionKeyFor(accounts.ProviderCodex, "account-a", "gpt-6-astra")
+	now := time.Now()
+	control.observe(key, http.StatusServiceUnavailable, http.Header{"Retry-After": []string{"60"}}, now)
+	paused := control.snapshot().Accounts[0].PausedUntil
+	if paused == "" {
+		t.Fatal("capacity 503 did not pause admission")
+	}
+	got, err := time.Parse(time.RFC3339, paused)
+	if err != nil || got.Before(now.Add(59*time.Second)) || got.After(now.Add(61*time.Second)) {
+		t.Fatalf("paused until %q, parse error=%v, want about 60s", paused, err)
+	}
+}
+
 func TestAdmissionPauseUsesClaudeQuotaReset(t *testing.T) {
 	control := testAdmissionControl(1, 2)
 	key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus-5-5")
