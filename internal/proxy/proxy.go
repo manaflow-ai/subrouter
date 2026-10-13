@@ -135,6 +135,9 @@ type Server struct {
 	// codexCapacity is the per-account capacity failure history behind
 	// /_subrouter/codex-capacity and the escalated overload marks.
 	codexCapacity *codexCapacityStats
+	// codexSessionBans keeps a Codex session off an account that failed it
+	// twice in a row, for the rest of the session.
+	codexSessionBans *codexSessionBans
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// FableBedrockPrimary, when true, routes Claude Fable requests to AWS Bedrock
@@ -1133,6 +1136,9 @@ func (s Server) Handler() http.Handler {
 	}
 	if s.codexCapacity == nil {
 		s.codexCapacity = newCodexCapacityStats()
+	}
+	if s.codexSessionBans == nil {
+		s.codexSessionBans = newCodexSessionBans()
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
@@ -4677,6 +4683,11 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	if options.oauthOnly {
 		availableAccounts = oauthAccounts(availableAccounts)
 	}
+	if provider == accounts.ProviderCodex {
+		// A session banned from an account must not reuse its sticky
+		// assignment there, nor be forced onto it.
+		availableAccounts = s.withoutCodexSessionBans(agentType, sessionID, availableAccounts)
+	}
 	// The upstream prompt cache is per account, so moving a session to another
 	// account re-bills its whole conversation prefix as uncached input. Record
 	// where the session was before any branch can reassign it.
@@ -6110,6 +6121,9 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 		candidates := make([]accounts.Account, 0, len(allCandidates))
 		for _, account := range allCandidates {
 			if _, ok := tried[account.ID]; ok {
+				continue
+			}
+			if provider == accounts.ProviderCodex && s.codexSessionBanned(agentType, sessionID, account.ID) {
 				continue
 			}
 			if oauthOnly && account.AuthMode != accounts.AuthModeOAuth {

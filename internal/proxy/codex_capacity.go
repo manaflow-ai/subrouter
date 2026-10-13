@@ -562,6 +562,10 @@ func codexWebSocketResponseCompleted(body []byte) bool {
 // this pool for the verdict's TTL. It replaces the flat markAccountOverloaded
 // on both the HTTP and websocket paths.
 func (s *Server) noteCodexCapacityFailure(accountID, sessionKey, poolModel, reason string) codexCapacityVerdict {
+	if s.codexSessionBans.noteFailure(sessionKey, accountID) && s.Logger != nil {
+		s.Logger.Warn("codex session banned from account after repeated capacity failures; rotating session",
+			"account", accountID, "pool", poolModel, "reason", reason, "threshold", codexSessionBanThreshold)
+	}
 	base := s.CodexOverloadFailover.markTTL()
 	verdict := s.codexCapacity.noteFailure(accountID, sessionKey, reason, base, s.codexOAuthPoolSize())
 	if verdict.Tainted {
@@ -595,6 +599,7 @@ func (s *Server) codexOAuthPoolSize() int {
 
 func (s *Server) noteCodexCapacitySuccess(accountID, sessionKey string) {
 	s.codexCapacity.noteSuccess(accountID, sessionKey)
+	s.codexSessionBans.noteSuccess(sessionKey, accountID)
 }
 
 // handleCodexCapacity serves the per-account capacity report.
