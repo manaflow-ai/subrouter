@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +24,8 @@ func TestResponseClaudeCreditExhausted(t *testing.T) {
 		want   bool
 	}{
 		{name: "billing 400", status: http.StatusBadRequest, body: anthropicCreditBalanceBody, want: true},
+		{name: "billing wording without is", status: http.StatusBadRequest, body: `{"type":"error","error":{"message":"Credit balance too low"}}`, want: true},
+		{name: "billing insufficient wording", status: http.StatusPaymentRequired, body: `{"error":{"message":"Your credit balance is insufficient to access the Anthropic API."}}`, want: true},
 		{name: "other 400", status: http.StatusBadRequest, body: `{"type":"error","error":{"type":"invalid_request_error","message":"messages: field required"}}`},
 		{name: "rate limit 429", status: http.StatusTooManyRequests, body: anthropicCreditBalanceBody},
 		{name: "success is never read", status: http.StatusOK, body: anthropicCreditBalanceBody},
@@ -61,11 +65,16 @@ func claudeCostTierRequest(t *testing.T, apiKey string) *http.Request {
 // move to the next key and the spent key must leave routing, or every new
 // session would keep landing on it and the pool would never reach tier 3.
 func TestClaudeSpentCreditKeyFailsOverAndIsHeldOut(t *testing.T) {
+	sessions := newSessionStore(t)
+	if _, err := sessions.Put("claude", "session-spent-credit", "claude:spent", ""); err != nil {
+		t.Fatal(err)
+	}
 	server := Server{
 		Accounts: []accounts.Account{
 			{ID: "claude:spent", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-spent"},
 			{ID: "claude:funded", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-funded"},
 		},
+		Sessions:     sessions,
 		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
 	}
 	var spentHits, fundedHits int
@@ -90,6 +99,9 @@ func TestClaudeSpentCreditKeyFailsOverAndIsHeldOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatal(err)
+	}
 	if response.StatusCode != http.StatusOK || spentHits != 1 || fundedHits != 1 {
 		t.Fatalf("status %d, spent hits %d, funded hits %d; want 200 after one failover", response.StatusCode, spentHits, fundedHits)
 	}
@@ -100,11 +112,114 @@ func TestClaudeSpentCreditKeyFailsOverAndIsHeldOut(t *testing.T) {
 	if !server.scheduler().Exhausted(accounts.ProviderClaude, "claude:spent") {
 		t.Fatal("spent key still scores as routable")
 	}
+	assignment, ok := sessions.Get("claude", "session-spent-credit")
+	if !ok || assignment.AccountID != "claude:funded" {
+		t.Fatalf("sticky session assignment = %+v, ok=%v; want funded replacement", assignment, ok)
+	}
+	second, err := transport.RoundTrip(claudeCostTierRequest(t, "tok-spent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.Body.Close()
+	if spentHits != 1 || fundedHits != 2 {
+		t.Fatalf("later request hits spent=%d funded=%d; want spent=1 funded=2", spentHits, fundedHits)
+	}
 	statuses := server.withClaudeCostTiers([]AccountUsageStatus{
 		{AccountStatus: AccountStatus{ID: "claude:spent", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey}},
 	})
 	if statuses[0].CostTier != claudeCostTierAPICredits || statuses[0].CreditsExhaustedUntil.IsZero() {
 		t.Fatalf("status = %+v, want api-credits tier with a credits_exhausted_until hold", statuses[0])
+	}
+}
+
+func TestClaudeSpentCreditSSEFailsOverBeforeClientBytes(t *testing.T) {
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "claude:spent", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-spent"},
+			{ID: "claude:funded", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-funded"},
+		},
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+	}
+	var spentHits, fundedHits int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if req.Header.Get("X-Api-Key") == "tok-spent" {
+			spentHits++
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Credit balance too low\"}}\n\n"))}
+		}
+		fundedHits++
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{"id":"ok"}`))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-spent-credit-sse", account: "claude:spent",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
+		budget: newAttemptBudget(2),
+	}
+	response, err := transport.RoundTrip(claudeCostTierRequest(t, "tok-spent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || string(body) != `{"id":"ok"}` || spentHits != 1 || fundedHits != 1 {
+		t.Fatalf("status %d body %q spent=%d funded=%d; want funded response after one billing failover", response.StatusCode, body, spentHits, fundedHits)
+	}
+}
+
+func TestClaudeSpentCreditConcurrentCallersSkipHeldKey(t *testing.T) {
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "claude:spent", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-spent"},
+			{ID: "claude:funded", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-funded"},
+		},
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+	}
+	server.markClaudeCreditExhausted("claude:spent")
+	var spentHits, fundedHits atomic.Int32
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if req.Header.Get("X-Api-Key") == "tok-spent" {
+			spentHits.Add(1)
+		} else {
+			fundedHits.Add(1)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"ok"}`))}
+	}}
+	const callers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			transport := usageLimitRetryTransport{
+				base: stub, server: &server, provider: accounts.ProviderClaude,
+				agent: "claude", session: "session-concurrent-credit", account: "claude:spent",
+				method: http.MethodPost, path: "/v1/messages", maxAttempts: 2,
+				budget: newAttemptBudget(1),
+			}
+			response, err := transport.RoundTrip(claudeCostTierRequest(t, "tok-spent"))
+			if err != nil {
+				errs <- err
+				return
+			}
+			response.Body.Close()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if got := spentHits.Load(); got != 0 {
+		t.Fatalf("concurrent callers retried spent key %d times", got)
+	}
+	if got := fundedHits.Load(); got != callers {
+		t.Fatalf("funded key calls = %d, want %d", got, callers)
 	}
 }
 
