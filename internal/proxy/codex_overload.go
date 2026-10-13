@@ -326,6 +326,7 @@ func codexRetryableCapacityResponse(response *http.Response) (*http.Response, bo
 	response.Header.Set("Content-Type", "application/json")
 	if validRetryAfter && (!validRetryAfterMs || retryAfterWait >= retryAfterMsWait) {
 		response.Header.Set("Retry-After", retryAfter)
+		response.Header.Del("Retry-After-Ms")
 	} else if validRetryAfterMs {
 		response.Header.Set("Retry-After-Ms", retryAfterMs)
 		wait, _ := codexRetryAfterMilliseconds(retryAfterMs)
