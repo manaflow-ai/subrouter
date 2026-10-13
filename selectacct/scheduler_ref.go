@@ -258,6 +258,23 @@ func (r *SchedulerRef) MarkModelIncompatible(provider account.Provider, accountI
 	r.MarkModelIncompatibleUntil(provider, accountID, model, time.Now().Add(DefaultExhaustedTTL))
 }
 
+// MarkBillingUnavailableUntil holds the whole account independently of quota
+// refreshes: subscription headroom cannot prove that prepaid funds recovered.
+func (r *SchedulerRef) MarkBillingUnavailableUntil(provider account.Provider, accountID string, until time.Time) {
+	if accountID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.incompatibleUntil == nil {
+		r.incompatibleUntil = make(map[string]time.Time)
+	}
+	key := poolScopedExhaustionKey(provider, accountID, "")
+	if until.After(r.incompatibleUntil[key]) {
+		r.incompatibleUntil[key] = until
+	}
+}
+
 // ExhaustedUntilFor reports the expiry recorded for an account's exhaustion
 // mark, if any. Used by tests and diagnostics to verify TTL selection.
 func (r *SchedulerRef) ExhaustedUntilFor(provider account.Provider, accountID, poolKey string) (time.Time, bool) {
