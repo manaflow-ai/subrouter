@@ -8655,56 +8655,79 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			if sizeKeptEstimate > 0 && scheduler.CapacityEvicting(schedulerAccountProvider(account.Provider), account.ID) {
 				s.logFailoverKeptAccount("placement", agentType, sessionID, account.ID, sizeKeptEstimate)
 			}
-			if s.reuseStickyAssignment(agentType, sessionID, account, stickyScheduler) {
+			// Claude API-key assignments created by normal routing are legacy
+			// stickies. Move them onto subscription quota as soon as an OAuth
+			// account can serve this model; an explicit account selector returned
+			// above and remains pinned for that request.
+			if provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeAPIKey {
+				subscriptions := claudeSubscriptionCandidatesFromScores(base, scheduler, availableAccounts, poolModel)
+				if len(subscriptions) > 0 {
+					if candidate, pickErr := pickRoutingAccount(scheduler, subscriptions); pickErr == nil {
+						if s.Logger != nil {
+							s.Logger.Info("moving Claude session from API key to subscription quota",
+								"agent", agentType, "session", sessionID,
+								"from_account", account.ID, "to_account", candidate.ID)
+						}
+						s.SchedulerRef.NoteStickyEviction(schedulerAccountProvider(account.Provider), account.ID)
+						picked = &candidate
+					}
+				}
+			}
+			if picked == nil && s.reuseStickyAssignment(agentType, sessionID, account, stickyScheduler) {
 				s.logStickyReuse(agentType, sessionID, account, stickyScheduler)
 				s.touchSessionBestEffort(agentType, sessionID)
 				return account, sessionID, userEmail, nil
 			}
-			candidate, pickErr := pickRoutingAccount(scheduler, availableAccounts)
-			if pickErr != nil || s.keepConstrainedStickyAssignment(stickyScheduler, account, candidate) {
+			if picked != nil {
+				// Subscription-first migration selected a destination; the common
+				// assignment tail persists it below.
+			} else {
+				candidate, pickErr := pickRoutingAccount(scheduler, availableAccounts)
+				if pickErr != nil || s.keepConstrainedStickyAssignment(stickyScheduler, account, candidate) {
+					if s.Logger != nil {
+						s.Logger.Info("keeping sticky session on constrained account; no materially better account",
+							"agent", agentType,
+							"session", sessionID,
+							"account", account.ID,
+							"candidate", candidate.ID,
+							"active", s.activeSession(agentType, sessionID),
+							"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
+						)
+					}
+					s.touchSessionBestEffort(agentType, sessionID)
+					return account, sessionID, userEmail, nil
+				}
+				if candidate.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(candidate.Provider), candidate.ID) {
+					if fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, availableAccounts, poolModel); ok {
+						candidate = fallback
+					} else {
+						// The whole pool is exhausted: Pick ranks exhausted accounts
+						// last but still returns one, and the post-selection check
+						// below rejects it before the assignment is ever persisted.
+						// Reaching that check through this branch used to log a
+						// "rerouting" to an unusable account that never happened,
+						// once per request for as long as the pool stayed exhausted.
+						// Fail the selection here so the handler goes straight to the
+						// fallback chain.
+						return accounts.Account{}, sessionID, userEmail, s.poolExhaustedError(provider, availableAccounts, poolModel)
+					}
+				}
 				if s.Logger != nil {
-					s.Logger.Info("keeping sticky session on constrained account; no materially better account",
+					s.Logger.Info("rerouting cold sticky session from constrained account",
 						"agent", agentType,
 						"session", sessionID,
 						"account", account.ID,
-						"candidate", candidate.ID,
+						"to_account", candidate.ID,
 						"active", s.activeSession(agentType, sessionID),
-						"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
+						"usable_for_new_session", scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID),
+						"usable_for_sticky_session", scheduler.UsableForStickySession(schedulerAccountProvider(account.Provider), account.ID),
+						"exhausted", fromExhausted,
+						"capacity_eviction", fromCapacity,
 					)
 				}
-				s.touchSessionBestEffort(agentType, sessionID)
-				return account, sessionID, userEmail, nil
+				s.SchedulerRef.NoteStickyEviction(schedulerAccountProvider(account.Provider), account.ID)
+				picked = &candidate
 			}
-			if candidate.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(candidate.Provider), candidate.ID) {
-				if fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, availableAccounts, poolModel); ok {
-					candidate = fallback
-				} else {
-					// The whole pool is exhausted: Pick ranks exhausted accounts
-					// last but still returns one, and the post-selection check
-					// below rejects it before the assignment is ever persisted.
-					// Reaching that check through this branch used to log a
-					// "rerouting" to an unusable account that never happened,
-					// once per request for as long as the pool stayed exhausted.
-					// Fail the selection here so the handler goes straight to the
-					// fallback chain.
-					return accounts.Account{}, sessionID, userEmail, s.poolExhaustedError(provider, availableAccounts, poolModel)
-				}
-			}
-			if s.Logger != nil {
-				s.Logger.Info("rerouting cold sticky session from constrained account",
-					"agent", agentType,
-					"session", sessionID,
-					"account", account.ID,
-					"to_account", candidate.ID,
-					"active", s.activeSession(agentType, sessionID),
-					"usable_for_new_session", scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID),
-					"usable_for_sticky_session", scheduler.UsableForStickySession(schedulerAccountProvider(account.Provider), account.ID),
-					"exhausted", fromExhausted,
-					"capacity_eviction", fromCapacity,
-				)
-			}
-			s.SchedulerRef.NoteStickyEviction(schedulerAccountProvider(account.Provider), account.ID)
-			picked = &candidate
 		}
 	}
 
