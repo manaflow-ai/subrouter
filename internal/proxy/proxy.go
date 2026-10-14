@@ -9480,8 +9480,11 @@ func codexModelCatalogRequest(r *http.Request) bool {
 
 // Entitlements differ per subscription (only some plans list the Ultrafast
 // tier), so a caller pinned to an OAuth account gets that account's catalog
-// under its own catalog session. A pin to an API-key account is dropped and
-// the shared catalog session picks any OAuth account. The second result is
+// under its own catalog session. The pin resolves among OAuth records only, so
+// an API-key pin that shares a label with an OAuth record uses that record;
+// any other API-key pin is dropped and the shared catalog session picks an
+// OAuth account. A pinned refresh failure is final, like pinned /responses
+// traffic, and Codex falls back to its bundled catalog. The second result is
 // the pinned OAuth account ID, or empty.
 func (s Server) codexModelCatalogRoutingRequest(r *http.Request) (*http.Request, string) {
 	if forced, present, err := session.ExtractAccountIDWithPresence(r); err == nil && present && forced != "" {

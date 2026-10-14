@@ -493,6 +493,9 @@ func TestCodexModelCatalogHonorsOAuthAccountPin(t *testing.T) {
 	if got := fetch(""); got != `{"models":[{"slug":"gpt-6-astra","tier":"priority"}]}` {
 		t.Fatalf("unpinned catalog = %s, want the shared catalog session unaffected by the pin", got)
 	}
+	if assignment, ok := store.Get("codex", codexModelCatalogSessionID+":promax@example.com"); !ok || assignment.AccountID != "promax@example.com" {
+		t.Fatalf("pinned catalog assignment = %#v, %t; want promax@example.com", assignment, ok)
+	}
 	if assignment, ok := store.Get("codex", codexModelCatalogSessionID); !ok || assignment.AccountID != "pro@example.com" {
 		t.Fatalf("shared catalog assignment = %#v, %t; want pro@example.com", assignment, ok)
 	}
