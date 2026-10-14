@@ -5429,6 +5429,10 @@ func (s Server) proxyHandler() http.Handler {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		if !s.RequireSessionLease && rootHealthProbeRequest(r) {
+			s.handleHealth(w, r)
+			return
+		}
 		agentType := session.ExtractAgentType(r)
 		requestProvider := providerForRequest(agentType, r.URL.Path)
 		if requestProvider == accounts.ProviderCodex && strings.HasPrefix(r.URL.Path, "/v1/live/") && !codexLivePath(r.URL.Path) {
@@ -6221,6 +6225,23 @@ func proxyMethodAllowed(method string) bool {
 	default:
 		return false
 	}
+}
+
+// rootHealthProbeRequest reports a liveness probe aimed at the router root.
+// Clients and agents checking whether the router is up try these paths.
+// Forwarded, they reached chatgpt.com on a pooled account and came back as a
+// Cloudflare 403 page, which reads as "the router is broken". No supported
+// agent calls them upstream, so the proxy answers with this worker's health.
+// HEAD / keeps its own base-URL answer (baseURLProbeRequest).
+func rootHealthProbeRequest(r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	switch r.URL.Path {
+	case "/", "/health", "/healthz", "/v1/health", "/status":
+		return true
+	}
+	return false
 }
 
 func baseURLProbeRequest(r *http.Request) bool {
