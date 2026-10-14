@@ -6068,7 +6068,7 @@ func (s Server) proxyHandler() http.Handler {
 			markUpstreamResponse(r.Context(), false)
 			markTrafficErrorClass(r.Context(), trafficErrorClass(err))
 			if admissionRejected(err) {
-				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				writeAdmissionRejected(w, err)
 				return
 			}
 			if s.Logger != nil {
@@ -6413,7 +6413,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
 			}
-			http.Error(w, "upstream admission queue is full", http.StatusServiceUnavailable)
+			writeAdmissionRejected(w, err)
 			return
 		}
 	}
@@ -10869,6 +10869,29 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				continue
 			}
 		}
+		// A session fanning out (subagents, workflows) shares one sticky
+		// account, so its requests queue behind that account's admission
+		// limit while the rest of the pool idles. Place this one request on
+		// the least-loaded account with a free slot instead. Stickiness stays
+		// put: moving it would move the whole fan-out and its hot spot.
+		if next, ok := t.admissionSpill(req.Context(), accountID, tried); ok {
+			nextReq, replayErr := a.replay(replayReq, &next)
+			if replayErr == nil {
+				if t.logger != nil {
+					t.logger.Info("admission spill",
+						"agent", t.agent,
+						"session", t.session,
+						"from_account", accountID,
+						"to_account", next.ID,
+						"pool_model", t.poolModel)
+				}
+				tried[accountID] = struct{}{}
+				accountID = next.ID
+				accountCredential = next.CredentialIdentity()
+				tried[accountID] = struct{}{}
+				attemptReq = nextReq
+			}
+		}
 		addressed := accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential}
 		response, err := a.send(base, attemptReq, addressed)
 		response = tagRoutedResponseAccount(response, addressed)
@@ -11376,6 +11399,79 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	addressed := accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential}
 	response, err := a.send(base, attemptReq, addressed)
 	return tagRoutedResponseAccount(response, addressed), err
+}
+
+// admissionSpill picks the account a request should move to when its own
+// account's admission queue is long: the least-loaded Claude subscription
+// account of the same auth mode that would admit it now and has headroom for
+// the pool model. It returns false to keep the request where it is.
+func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID string, tried map[string]struct{}) (accounts.Account, bool) {
+	s := t.server
+	if s == nil || s.admission == nil || s.CredentialBroker != nil || t.provider != accounts.ProviderClaude ||
+		t.attempt == nil || !t.attempt.replayable() {
+		return accounts.Account{}, false
+	}
+	provider := schedulerAccountProvider(t.provider)
+	if !s.admission.shouldSpill(admissionKeyFor(provider, accountID, t.poolModel)) {
+		return accounts.Account{}, false
+	}
+	all := filterAccountsForProvider(s.accountListContext(ctx), t.provider)
+	authMode := accounts.AuthModeOAuth
+	for _, candidate := range all {
+		if candidate.ID == accountID {
+			authMode = candidate.AuthMode
+			break
+		}
+	}
+	scheduler := s.withCapacityMarks(s.scheduler().ForModel(t.poolModel), t.provider, t.poolModel, codexServiceTierFromContext(ctx))
+	now := time.Now()
+	skip := map[string]struct{}{}
+	for {
+		var best accounts.Account
+		bestLoad := -1
+		for _, candidate := range all {
+			if candidate.ID == accountID || candidate.AuthMode != authMode {
+				continue
+			}
+			if _, ok := tried[candidate.ID]; ok {
+				continue
+			}
+			if _, ok := skip[candidate.ID]; ok {
+				continue
+			}
+			candidateProvider := schedulerAccountProvider(candidate.Provider)
+			if s.SchedulerRef != nil {
+				if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(candidateProvider, candidate.ID, t.poolModel, now); blocked {
+					continue
+				}
+			}
+			if !scheduler.UsableForStickySession(candidateProvider, candidate.ID) {
+				continue
+			}
+			free, load := s.admission.freeLoad(admissionKeyFor(candidateProvider, candidate.ID, t.poolModel))
+			if !free {
+				continue
+			}
+			if bestLoad < 0 || load < bestLoad {
+				best, bestLoad = candidate, load
+			}
+		}
+		if bestLoad < 0 {
+			return accounts.Account{}, false
+		}
+		if best.AuthMode == accounts.AuthModeAPIKey {
+			return best, true
+		}
+		refreshed, err := s.refreshAccount(ctx, best)
+		if err != nil {
+			if ctx.Err() != nil {
+				return accounts.Account{}, false
+			}
+			skip[best.ID] = struct{}{}
+			continue
+		}
+		return refreshed, true
+	}
 }
 
 // commitSuccessfulFailover persists a retry-selected account only after the

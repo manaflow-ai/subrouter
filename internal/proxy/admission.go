@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -15,6 +16,15 @@ import (
 const (
 	defaultAdmissionLimit = 6
 	defaultAdmissionQueue = 64
+	// defaultAdmissionSpillQueue is how many requests may wait behind a full
+	// account before new ones spill to an account with a free slot. A short
+	// queue keeps a session's prompt cache; a long one only adds latency.
+	defaultAdmissionSpillQueue = 8
+	// Retry-After bounds for a full queue. The queue drains in seconds, so a
+	// client told to wait longer idles needlessly, and one told 0 burns its
+	// retry attempts against the same full queue.
+	minAdmissionRetryAfter = 1
+	maxAdmissionRetryAfter = 5
 )
 
 var errAdmissionQueueFull = errors.New("upstream admission queue is full")
@@ -37,6 +47,54 @@ const admissionPauseWaitMax = 5 * time.Second
 // serve: the queue is full or the account is paused.
 func admissionRejected(err error) bool {
 	return errors.Is(err, errAdmissionQueueFull) || errors.Is(err, errAdmissionPaused)
+}
+
+// subrouterReasonHeader names why subrouter itself answered a request.
+const subrouterReasonHeader = "X-Subrouter-Reason"
+
+// admissionReasonQueueFull is the X-Subrouter-Reason for a full admission
+// queue, so a client or operator can tell it from an upstream 503.
+const admissionReasonQueueFull = "admission_queue_full"
+
+// admissionQueueFullError is errAdmissionQueueFull with the wait the queue
+// implies, so the 503 can carry a Retry-After.
+type admissionQueueFullError struct {
+	retryAfterSeconds int
+}
+
+func (e admissionQueueFullError) Error() string { return errAdmissionQueueFull.Error() }
+
+func (e admissionQueueFullError) Is(target error) bool { return target == errAdmissionQueueFull }
+
+// admissionRetryAfterSeconds is the Retry-After for err, or 0 when err is not
+// a full admission queue.
+func admissionRetryAfterSeconds(err error) int {
+	var full admissionQueueFullError
+	if errors.As(err, &full) {
+		return full.retryAfterSeconds
+	}
+	if errors.Is(err, errAdmissionQueueFull) {
+		return minAdmissionRetryAfter
+	}
+	return 0
+}
+
+// admissionReasonPaused is the X-Subrouter-Reason for an account paused by a
+// rate limit when no other account could take the request.
+const admissionReasonPaused = "admission_paused"
+
+// writeAdmissionRejected answers a request the admission gate turned away
+// after failover found no other account: a full queue, or a long pause.
+func writeAdmissionRejected(w http.ResponseWriter, err error) {
+	if errors.Is(err, errAdmissionPaused) {
+		w.Header().Set("Retry-After", strconv.Itoa(minAdmissionRetryAfter))
+		w.Header().Set(subrouterReasonHeader, admissionReasonPaused)
+		http.Error(w, errAdmissionPaused.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(admissionRetryAfterSeconds(err)))
+	w.Header().Set(subrouterReasonHeader, admissionReasonQueueFull)
+	http.Error(w, errAdmissionQueueFull.Error(), http.StatusServiceUnavailable)
 }
 
 type admissionKey struct {
@@ -67,10 +125,11 @@ type admissionBucket struct {
 // clients enter through this process. The lease spans response-body lifetime,
 // just like SchedulerRef's in-flight count.
 type admissionControl struct {
-	mu       sync.Mutex
-	limit    int
-	queueCap int
-	buckets  map[admissionKey]*admissionBucket
+	mu         sync.Mutex
+	limit      int
+	queueCap   int
+	spillQueue int
+	buckets    map[admissionKey]*admissionBucket
 }
 
 type admissionLease struct {
@@ -99,9 +158,10 @@ type admissionSnapshot struct {
 
 func newAdmissionControl() *admissionControl {
 	return &admissionControl{
-		limit:    defaultAdmissionLimit,
-		queueCap: defaultAdmissionQueue,
-		buckets:  make(map[admissionKey]*admissionBucket),
+		limit:      defaultAdmissionLimit,
+		queueCap:   defaultAdmissionQueue,
+		spillQueue: defaultAdmissionSpillQueue,
+		buckets:    make(map[admissionKey]*admissionBucket),
 	}
 }
 
@@ -149,8 +209,9 @@ func (a *admissionControl) acquire(ctx context.Context, key admissionKey) (*admi
 			}
 			if len(bucket.waiters) >= a.queueCap {
 				bucket.blocked++
+				retryAfter := a.retryAfterLocked(bucket)
 				a.mu.Unlock()
-				return nil, errAdmissionQueueFull
+				return nil, admissionQueueFullError{retryAfterSeconds: retryAfter}
 			}
 			waiter = &admissionWaiter{ready: make(chan struct{})}
 			bucket.waiters = append(bucket.waiters, waiter)
@@ -195,6 +256,51 @@ func (a *admissionControl) acquire(ctx context.Context, key admissionKey) (*admi
 			// release path wakes it so a long Retry-After never drains a burst.
 		}
 	}
+}
+
+// retryAfterLocked estimates how long a full queue takes to drain: one
+// second per limit-sized batch ahead, clamped to a range clients honor.
+func (a *admissionControl) retryAfterLocked(bucket *admissionBucket) int {
+	limit := a.limit
+	if limit < 1 {
+		limit = 1
+	}
+	seconds := (len(bucket.waiters) + limit - 1) / limit
+	if seconds < minAdmissionRetryAfter {
+		seconds = minAdmissionRetryAfter
+	}
+	if seconds > maxAdmissionRetryAfter {
+		seconds = maxAdmissionRetryAfter
+	}
+	return seconds
+}
+
+// shouldSpill reports whether a new request for key would wait behind at
+// least spillQueue others, so it is better placed on another account.
+func (a *admissionControl) shouldSpill(key admissionKey) bool {
+	if a == nil || key.account == "" || a.spillQueue < 1 {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	bucket := a.buckets[key]
+	return bucket != nil && len(bucket.waiters) >= a.spillQueue
+}
+
+// freeLoad reports whether key would admit a request immediately, and how
+// many requests it is already serving, for picking the least-loaded account.
+func (a *admissionControl) freeLoad(key admissionKey) (free bool, load int) {
+	if a == nil || key.account == "" {
+		return false, 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	bucket := a.buckets[key]
+	if bucket == nil {
+		return true, 0
+	}
+	free = len(bucket.waiters) == 0 && bucket.active < a.limit && !bucket.pausedTil.After(time.Now())
+	return free, bucket.active + len(bucket.waiters)
 }
 
 func (a *admissionControl) cancelWaiter(key admissionKey, waiter *admissionWaiter) bool {
