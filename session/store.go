@@ -45,7 +45,9 @@ type Store struct {
 	// seen is this process's last use of each assignment key. UpdatedAt is
 	// written at most once per sessionActivityWriteInterval, so it cannot
 	// tell a session that ran a minute ago from one idle for a day; seen can.
-	// It is memory only: the routing process is the one that touches.
+	// It is memory only: the routing process is the one that touches. After
+	// a restart a running session older than the window counts as idle until
+	// its next request.
 	seen map[string]time.Time
 }
 

@@ -571,7 +571,7 @@ var wfScenarios = []wfScenario{
 	},
 }
 
-// Candidate policies. Commit 959ca06a also ran three rejected variants
+// Candidate policies. Commit 31ba40c1 also ran three rejected variants
 // through temporary knobs: in-flight requests counted as load in the
 // denominator instead of as a headroom penalty (worse p95 in every Claude
 // scenario), headroom instead of surplus as the quota term, and cubed load.

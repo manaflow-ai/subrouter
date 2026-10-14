@@ -134,3 +134,89 @@ func TestAdmissionRejectionFailsOverToAnotherAccount(t *testing.T) {
 		})
 	}
 }
+
+// TestQueueFullAfterPausedFailoverStillMovesSession drives Server.Handler()
+// with a session pinned to a paused account. The failover lands on an account
+// whose queue is full and then on a third account, which serves the request.
+// The pause justified moving the session, so it must move to the account that
+// served, not stay on the paused one because the queue-full hop overflowed
+// only the request.
+func TestQueueFullAfterPausedFailoverStillMovesSession(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[string]int{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		hits[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer tok-")]++
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"id":"msg_ok","type":"message"}`))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("claude", "session-pinned", "pinned@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	control := testAdmissionControl(1, 0)
+	models := []string{"", "default", "claude-opus", "claude-sonnet", "claude-fable"}
+	for _, model := range models {
+		control.pause(admissionKeyFor(accounts.ProviderClaude, "pinned@example.com", model), time.Now().Add(time.Hour))
+		// Names that normalize to one key find its only slot held.
+		if _, err := control.acquire(context.Background(), admissionKeyFor(accounts.ProviderClaude, "busy@example.com", model)); err != nil && !admissionRejected(err) {
+			t.Fatal(err)
+		}
+	}
+	handler := Server{
+		ClaudeUpstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "pinned@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-pinned"},
+			{ID: "busy@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-busy"},
+			{ID: "last@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-last"},
+		},
+		Sessions: store,
+		// last sits under the new-session floor, so failover tries busy
+		// first and reaches last only after busy's queue turns it away.
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "pinned@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+			{AccountID: "busy@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+			{AccountID: "last@example.com", Provider: accounts.ProviderClaude, Headroom: 0.2, ShortHeadroom: 0.2},
+		})),
+		MaxBodyBytes: 1 << 20,
+		admission:    control,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, subrouter.URL+"/v1/messages", strings.NewReader(`{"model":"claude-opus-5-5","messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-pinned")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request did not complete: %v", err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%.200s, want 200 from the last account", response.StatusCode, body)
+	}
+	mu.Lock()
+	if hits["last"] != 1 || hits["pinned"] != 0 || hits["busy"] != 0 {
+		t.Fatalf("upstream hits = %v, want only the last account", hits)
+	}
+	mu.Unlock()
+	if assignment, ok := store.Get("claude", "session-pinned"); !ok || assignment.AccountID != "last@example.com" {
+		t.Fatalf("session assignment = %+v (found %v), want it moved off the paused account to last@example.com", assignment, ok)
+	}
+}

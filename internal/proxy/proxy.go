@@ -10995,7 +10995,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				}
 				t.server.admission.noteSpill(admissionSessionKey{agent: t.agent, session: t.session})
 				a.reserve(lease)
-				if spilledFrom == "" {
+				// A request that already failed over off a paused or
+				// exhausted sticky account must still move the session.
+				if spilledFrom == "" && !quotaFailedOver {
 					spilledFrom = accountID
 				}
 				accountID = next.ID
@@ -11027,8 +11029,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 					// session keeps the account that holds its prompt cache. A
 					// paused account is rate limited for a long while, so the
 					// session follows the request.
+					// A request that already failed over off a paused or
+					// exhausted sticky account still moves the session, to
+					// whichever account finally serves it.
 					if errors.Is(err, errAdmissionQueueFull) && !errors.Is(err, errAdmissionPaused) {
-						if spilledFrom == "" {
+						if spilledFrom == "" && !quotaFailedOver {
 							spilledFrom = accountID
 						}
 					} else {
