@@ -13,57 +13,79 @@ import (
 	"testing"
 )
 
-// treeSearchID and treeSearchModel are the tree searches walkJSONFields
-// replaced, kept as the reference its results are checked against.
-func treeSearchID(value any) string {
-	switch typed := value.(type) {
-	case map[string]any:
+// treeSearchIDs and treeSearchModels are the tree searches walkJSONFields
+// replaced, kept as the reference its results are checked against. The
+// original searches ranged over Go maps, so their answer depended on map
+// iteration order. These return every answer the original could give under
+// some iteration order, computed exactly rather than by sampling: Go's
+// small-map iteration is not uniform over orderings, and sampling it missed
+// an answer that only one start offset in eight reaches.
+func treeSearchIDs(value any) map[string]bool {
+	if typed, ok := value.(map[string]any); ok {
+		direct := map[string]bool{}
 		for key, child := range typed {
 			if _, ok := jsonCandidates[strings.ToLower(key)]; ok {
 				if str, ok := child.(string); ok && strings.TrimSpace(str) != "" {
-					return strings.TrimSpace(str)
+					direct[strings.TrimSpace(str)] = true
 				}
 			}
 		}
-		for _, child := range typed {
-			if id := treeSearchID(child); id != "" {
-				return id
-			}
-		}
-	case []any:
-		for _, child := range typed {
-			if id := treeSearchID(child); id != "" {
-				return id
-			}
+		if len(direct) > 0 {
+			return direct
 		}
 	}
-	return ""
+	return firstNonEmpty(value, treeSearchIDs)
 }
 
-func treeSearchModel(value any) string {
+func treeSearchModels(value any) map[string]bool {
+	if typed, ok := value.(map[string]any); ok {
+		if str, ok := typed["model"].(string); ok {
+			return map[string]bool{NormalizeModel(str): true}
+		}
+	}
+	return firstNonEmpty(value, treeSearchModels)
+}
+
+// firstNonEmpty is the set of answers a search returning the first child's
+// non-empty answer can give. Map children may come in any order, so any
+// child's non-empty answer is possible. Array children come in order, so the
+// search stops at the first child that cannot answer "".
+func firstNonEmpty(value any, search func(any) map[string]bool) map[string]bool {
+	var children []any
+	ordered := false
 	switch typed := value.(type) {
 	case map[string]any:
-		if str, ok := typed["model"].(string); ok {
-			return NormalizeModel(str)
-		}
 		for _, child := range typed {
-			if model := treeSearchModel(child); model != "" {
-				return model
-			}
+			children = append(children, child)
 		}
 	case []any:
-		for _, child := range typed {
-			if model := treeSearchModel(child); model != "" {
-				return model
+		children, ordered = typed, true
+	}
+	out := map[string]bool{}
+	allEmpty := true
+	for _, child := range children {
+		answers := search(child)
+		for answer := range answers {
+			if answer != "" {
+				out[answer] = true
+			}
+		}
+		if !answers[""] {
+			allEmpty = false
+			if ordered {
+				break
 			}
 		}
 	}
-	return ""
+	if allEmpty {
+		out[""] = true
+	}
+	return out
 }
 
 // checkWalkMatchesTreeSearch compares the walker with the tree search. The
-// tree search visits map entries in random order, so when it can return more
-// than one answer the walker only has to return one of them.
+// tree search depends on map order, so when it can return more than one
+// answer the walker only has to return one of them.
 func checkWalkMatchesTreeSearch(t *testing.T, data []byte) {
 	t.Helper()
 	var value any
@@ -78,18 +100,31 @@ func checkWalkMatchesTreeSearch(t *testing.T, data []byte) {
 	if !ok {
 		t.Fatalf("walker rejected a body the tree search accepts: %q", data)
 	}
-	ids := map[string]bool{}
-	models := map[string]bool{}
-	for range 64 {
-		ids[treeSearchID(value)] = true
-		models[treeSearchModel(value)] = true
+	if ids := treeSearchIDs(value); !ids[id] {
+		t.Fatalf("walker id %q, tree search gives %v for %q", id, ids, data)
 	}
-	if !ids[id] {
-		t.Fatalf("walker id %q, tree search gave %v for %q", id, ids, data)
+	if models := treeSearchModels(value); !models[model] {
+		t.Fatalf("walker model %q, tree search gives %v for %q", model, models, data)
 	}
-	if !models[model] {
-		t.Fatalf("walker model %q, tree search gave %v for %q", model, models, data)
+}
+
+// Hosted CI failed on this body: the tree search reaches "sessİon_id" only
+// when map iteration starts at its slot, one start offset in eight, so 64
+// samples of it missed the walker's answer about once in 5000 runs.
+func TestWalkJSONFieldsAcceptsRareMapOrderAnswer(t *testing.T) {
+	data := []byte(`{"SESSION_ID": false,"Thread_Id": -2.5e3,"sessİon_id": "c\"d","Thread_Id": "é"}`)
+	var value any
+	if err := json.Unmarshal(data, &value); err != nil {
+		t.Fatal(err)
 	}
+	ids := treeSearchIDs(value)
+	if want := map[string]bool{`c"d`: true, "é": true}; fmt.Sprint(ids) != fmt.Sprint(want) {
+		t.Fatalf("tree search answers %v, want %v", ids, want)
+	}
+	if id, _, ok := walkJSONFields(data); !ok || id != `c"d` {
+		t.Fatalf("walker id %q ok %t, want %q", id, ok, `c"d`)
+	}
+	checkWalkMatchesTreeSearch(t, data)
 }
 
 func randomJSONValue(rng *rand.Rand, depth int) string {
