@@ -458,6 +458,11 @@ func TestCodexModelCatalogHonorsOAuthAccountPin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// New-session placement is randomly spread, so seed the shared catalog
+	// session; a pin that leaked into it would move this assignment.
+	if _, err := store.Put("codex", codexModelCatalogSessionID, "pro@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
 	handler := Server{
 		CodexUpstream: upstream,
 		Accounts: []accounts.Account{
