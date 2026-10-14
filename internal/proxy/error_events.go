@@ -77,8 +77,11 @@ type AccountPoolSnapshot struct {
 	Provider  accounts.Provider `json:"provider"`
 	PoolModel string            `json:"pool_model,omitempty"`
 	Total     int               `json:"total"`
-	// UsableNew counts accounts with room for a new session and no active
-	// block. Usable adds accounts below that floor that are not exhausted.
+	// UsableNew counts accounts whose measured quota has room for a new
+	// session and that carry no active block. Usable adds accounts below that
+	// floor that are not exhausted. Both read measured quota, not the
+	// placement score: the live-load debit that steers picks away from a busy
+	// account is not evidence that its quota is gone.
 	UsableNew int            `json:"usable_new"`
 	Usable    int            `json:"usable"`
 	Accounts  []AccountState `json:"accounts"`
@@ -607,19 +610,21 @@ func (s Server) accountPoolSnapshot(ctx context.Context, provider accounts.Provi
 	for _, account := range candidates {
 		score, known := scheduler.KnownScore(scoreProvider, account.ID)
 		key := selectacct.ScoreKey(scoreProvider, account.ID)
+		tier := scheduler.SelectionTier(account)
 		state := AccountState{
 			Account:        account.ID,
 			AuthMode:       account.AuthMode,
-			Tier:           selectionTierName(scheduler.SelectionTier(account)),
+			Tier:           selectionTierName(tier),
 			Known:          known,
 			Fresh:          score.Fresh,
 			Headroom:       roundHeadroom(score.Headroom),
 			ShortHeadroom:  roundHeadroom(score.ShortHeadroom),
 			WeeklyHeadroom: roundHeadroom(score.WeeklyHeadroom),
-			UsableNew:      scheduler.UsableForNewSession(scoreProvider, account.ID),
-			Exhausted:      scheduler.Exhausted(scoreProvider, account.ID),
-			Inflight:       inflight[key],
-			Sessions:       sessions[key],
+			UsableNew: tier == selectacct.SelectionTierPromotedCredits || tier == selectacct.SelectionTierPlan ||
+				tier == selectacct.SelectionTierAPIKey,
+			Exhausted: tier == selectacct.SelectionTierPlanExhausted || tier == selectacct.SelectionTierExhaustedAPIKey,
+			Inflight:  inflight[key],
+			Sessions:  sessions[key],
 		}
 		if poolModel != "" {
 			if modelScore, ok := score.ModelScores[poolModel]; ok {

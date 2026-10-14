@@ -68,17 +68,18 @@ func TestErrorEventsRecordFailedAttemptsWithPoolState(t *testing.T) {
 		close(done)
 	}()
 
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0.6, ShortHeadroom: 0.6},
+	}))
 	handler := Server{
 		ClaudeUpstream: upstreamURL,
 		Accounts: []accounts.Account{
 			{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-cooked"},
 			{ID: "fresh@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"},
 		},
-		Sessions: store,
-		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-			{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
-			{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0.6, ShortHeadroom: 0.6},
-		})),
+		Sessions:     store,
+		SchedulerRef: schedulerRef,
 		MaxBodyBytes: 1 << 20,
 		ErrorEvents:  events,
 	}.Handler()
@@ -148,6 +149,11 @@ func TestErrorEventsRecordFailedAttemptsWithPoolState(t *testing.T) {
 		t.Fatalf("summary = %+v, want one 429 and one 406", report.Summary)
 	}
 
+	// Live load lowers the placement score of a busy account; it must not
+	// make the snapshot report that the account's quota has no room.
+	for i := 0; i < 6; i++ {
+		defer schedulerRef.BeginInflight(accounts.ProviderClaude, "fresh@example.com")()
+	}
 	response, err = http.Get(subrouter.URL + AccountStatePath + "?provider=claude")
 	if err != nil {
 		t.Fatal(err)
@@ -157,6 +163,11 @@ func TestErrorEventsRecordFailedAttemptsWithPoolState(t *testing.T) {
 	response.Body.Close()
 	if err != nil || len(pools) != 1 || pools[0].Total != 2 {
 		t.Fatalf("GET %s = %+v, err %v; want one Claude pool of 2", AccountStatePath, pools, err)
+	}
+	for _, state := range pools[0].Accounts {
+		if state.Account == "fresh@example.com" && (!state.UsableNew || state.Inflight != 6) {
+			t.Fatalf("busy fresh account state = %+v, want usable_new with 6 in flight", state)
+		}
 	}
 
 	// Stop the writer, then read the file the way the next worker does.
