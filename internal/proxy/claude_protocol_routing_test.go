@@ -80,6 +80,9 @@ func TestAnthropicProtocolRequestsReachClaudeUpstream(t *testing.T) {
 	send(http.MethodHead, "/api/hello", map[string]string{"User-Agent": "Bun/1.4.3"})
 	send(http.MethodGet, "/v1/models", map[string]string{"User-Agent": "Bun/1.4.3", "Anthropic-Version": "2023-06-01"})
 	send(http.MethodGet, "/backend-api/codex/models", map[string]string{"User-Agent": "codex-tui/0.162.1"})
+	// A provider path prefix still decides the provider before any
+	// Anthropic evidence does.
+	send(http.MethodPost, "/kimi/v1/messages", map[string]string{"Anthropic-Version": "2023-06-01"})
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -91,6 +94,9 @@ func TestAnthropicProtocolRequestsReachClaudeUpstream(t *testing.T) {
 		if strings.Contains(hit, "/api/hello") || strings.Contains(hit, "/v1/models") {
 			t.Fatalf("codex upstream got Anthropic traffic %q; all codex hits: %v", hit, hits["codex"])
 		}
+	}
+	if strings.Contains(claudeHits, "/kimi/") || strings.Contains(claudeHits, "POST /v1/messages") {
+		t.Fatalf("claude upstream got the Kimi-prefixed request: %q", claudeHits)
 	}
 	if len(hits["codex"]) != 1 {
 		t.Fatalf("codex upstream hits = %v, want the one Codex request", hits["codex"])
