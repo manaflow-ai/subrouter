@@ -289,6 +289,12 @@ func (s *codexCapacityStats) allowPersistentReroute(sessionKey, accountID string
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
+	cutoff := now.Add(-codexCapacityPersistentRerouteInterval)
+	for key, last := range s.persistentReroutes {
+		if !last.After(cutoff) {
+			delete(s.persistentReroutes, key)
+		}
+	}
 	entry := s.accounts[accountID]
 	if entry == nil || !entry.persistent(now) {
 		return false
