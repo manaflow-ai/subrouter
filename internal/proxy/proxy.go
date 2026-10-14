@@ -17,8 +17,6 @@ import (
 	"log/slog"
 	"math"
 	"math/rand/v2"
-	"mime"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -5433,6 +5431,22 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		agentType := session.ExtractAgentType(r)
 		requestProvider := providerForRequest(agentType, r.URL.Path)
+		if requestProvider == accounts.ProviderCodex && strings.HasPrefix(r.URL.Path, "/v1/live/") && !codexLivePath(r.URL.Path) {
+			http.Error(w, "invalid realtime call id", http.StatusBadRequest)
+			return
+		}
+		if requestProvider == accounts.ProviderCodex && r.Method == http.MethodPost && r.URL.Path == "/v1/live" && s.Upstream == nil {
+			if err := rewriteRealtimeCallBody(r); err != nil {
+				http.Error(w, "invalid realtime call: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			r.URL.Path = "/backend-api/codex/realtime/calls"
+			r.URL.RawPath = ""
+			query := r.URL.Query()
+			query.Set("intent", "quicksilver")
+			query.Set("architecture", "avas")
+			r.URL.RawQuery = query.Encode()
+		}
 		modelCatalogRequest := requestProvider == accounts.ProviderCodex && codexModelCatalogRequest(r)
 		sessionID := session.ExtractID(r, s.MaxBodyBytes)
 		if modelCatalogRequest {
@@ -5477,6 +5491,23 @@ func (s Server) proxyHandler() http.Handler {
 		} else if s.RequireSessionLease {
 			http.Error(w, "session lease required", http.StatusUnauthorized)
 			return
+		}
+		if requestProvider == accounts.ProviderCodex && codexLivePath(r.URL.Path) && r.URL.Path != "/v1/live" && s.Upstream == nil {
+			callID := strings.TrimPrefix(r.URL.Path, "/v1/live/")
+			assignment, ok := s.Sessions.Get("codex-realtime", sessionID+":"+callID)
+			if !ok {
+				http.Error(w, "realtime call is not bound to this session; start a new voice call", http.StatusNotFound)
+				return
+			}
+			if forced := session.ExtractAccountID(r); forced != "" && forced != assignment.AccountID {
+				http.Error(w, "realtime call account does not match requested account", http.StatusConflict)
+				return
+			}
+			r.Header.Set("X-Subrouter-Account-ID", assignment.AccountID)
+			// Keep this call's forced identity separate from the chat session;
+			// reconnecting voice must not move subsequent text turns back.
+			agentType = "codex-realtime"
+			sessionID += ":" + callID
 		}
 		routingRequest := r
 		if modelCatalogRequest && boundLease == nil {
@@ -5597,7 +5628,7 @@ func (s Server) proxyHandler() http.Handler {
 		if s.CredentialBroker != nil {
 			requiredAuthMode := accounts.AuthMode("")
 			if requestProvider == accounts.ProviderCodex &&
-				(chatGPTBackendPath(r.URL.Path) || modelCatalogRequest) {
+				(codexOAuthRequiredPath(r.URL.Path) || modelCatalogRequest) {
 				requiredAuthMode = accounts.AuthModeOAuth
 			}
 			lease, leaseErr := s.CredentialBroker.Lease(r.Context(), broker.LeaseRequest{
@@ -5720,8 +5751,14 @@ func (s Server) proxyHandler() http.Handler {
 			return
 		}
 		if websocket.IsWebSocketUpgrade(r) {
+			// A voice sideband joins an already-created call. Responses-only
+			// egress diversion and turn replay cannot recreate that call.
+			realtimeSocket := codexLivePath(r.URL.Path)
+			if realtimeSocket {
+				autonomousRetry = false
+			}
 			var azureDivert func(model string) bool
-			if !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
+			if !realtimeSocket && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				requestProvider == accounts.ProviderCodex && s.CodexEgress.configured() {
 				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
 				if _, pinned := s.codexEgressSessions.lookup(key); pinned {
@@ -5743,7 +5780,7 @@ func (s Server) proxyHandler() http.Handler {
 					return false
 				}
 			}
-			if azureDivert == nil && !autonomousRetry && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
+			if !realtimeSocket && azureDivert == nil && !autonomousRetry && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				requestProvider == accounts.ProviderCodex && s.AzureCodex.configured() {
 				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
 				if _, pinned := s.azureCodexSessions.lookup(key); pinned {
@@ -5764,19 +5801,6 @@ func (s Server) proxyHandler() http.Handler {
 		proxyRequest.URL = cloneURL(r.URL)
 		proxyRequest.URL.Path = s.pathForUpstream(proxyRequest.URL.Path, account)
 		proxyRequest.URL.RawPath = ""
-		if requestProvider == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth &&
-			r.URL.Path == "/v1/live" && r.Method == http.MethodPost {
-			// Codex's API-shaped voice client sends the WebRTC offer as multipart
-			// to /v1/live. ChatGPT OAuth accepts the same call at its backend
-			// realtime endpoint as JSON, so translate only this short setup
-			// request. The subsequent sideband is a websocket and is streamed
-			// directly by proxyWebSocket.
-			addChatGPTRealtimeQuery(proxyRequest.URL)
-			if err := rewriteRealtimeCallBody(proxyRequest); err != nil {
-				http.Error(w, "invalid realtime call: "+err.Error(), http.StatusBadRequest)
-				return
-			}
-		}
 		session.StripSubrouterHeaders(proxyRequest.Header)
 		proxyRequest.Header.Del("X-Subrouter-Preferred-Account-ID")
 		// Every outbound attempt (retries, replays, fallbacks, catalog pages)
@@ -5959,6 +5983,15 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
+			if requestProvider == accounts.ProviderCodex && r.Method == http.MethodPost && r.URL.Path == "/backend-api/codex/realtime/calls" && response.StatusCode >= 200 && response.StatusCode < 300 {
+				callID := realtimeCallID(response.Header.Get("Location"))
+				if callID == "" {
+					return fmt.Errorf("realtime call response missing valid call id")
+				}
+				if _, err := s.Sessions.Put("codex-realtime", sessionID+":"+callID, account.ID, userEmail); err != nil {
+					return fmt.Errorf("bind realtime call account: %w", err)
+				}
+			}
 			if requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path) &&
 				r.Header.Get(CodexCapacityRetryableHeader) == "1" {
 				response, _ = codexRetryableCapacityResponse(response)
@@ -6455,6 +6488,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 
 	modelState := &webSocketModelState{
 		model:              compatibilityModel,
+		realtime:           codexLivePath(r.URL.Path),
 		capacityPersist:    s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger).persist,
 		capacityRetryable:  r.Header.Get(CodexCapacityRetryableHeader) == "1",
 		autonomousRetrying: autonomousRetry && account.Provider == accounts.ProviderCodex,
@@ -6582,6 +6616,9 @@ type webSocketModelState struct {
 	mu      sync.RWMutex
 	model   string
 	pending []string
+	// Voice events are not Responses turns. Pass their errors through without
+	// replay, quota reroutes, or Responses token accounting.
+	realtime bool
 	// outputForwarded is set once the current response has sent the client
 	// something it renders or records (codexStreamVisibleOutput). From then
 	// on a failure must pass through: a 1012 reroute would make Codex replay
@@ -6827,6 +6864,9 @@ func codexWebSocketResponseFinished(body []byte) bool {
 
 func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, client *websocket.Conn, link *webSocketUpstreamLink, reportLeaseFailure func(int), azureDivert func(model string) bool) {
 	observeMessage := func(messageType int, body []byte) error {
+		if modelState.realtime {
+			return nil
+		}
 		if messageType == websocket.TextMessage && direction == "client_to_upstream" && provider == accounts.ProviderCodex {
 			modelState.observe(body)
 		}
@@ -8475,6 +8515,9 @@ func (s Server) upstreamForRequest(path string, account accounts.Account) *url.U
 	if account.AuthMode == accounts.AuthModeAPIKey {
 		return s.APIUpstream
 	}
+	if codexLivePath(path) {
+		return s.APIUpstream
+	}
 	if chatGPTBackendPath(path) {
 		return chatGPTBackendUpstream(s.CodexUpstream)
 	}
@@ -8504,8 +8547,8 @@ func (s Server) pathForUpstream(path string, account accounts.Account) string {
 		return stripProviderPathPrefix(path, "antigravity")
 	}
 	if account.AuthMode == accounts.AuthModeOAuth {
-		if realtimePath, ok := chatGPTRealtimeUpstreamPath(path); ok {
-			return realtimePath
+		if codexLivePath(path) {
+			return path
 		}
 		if stripped, ok := stripChatGPTBackendPath(path); ok {
 			return stripped
@@ -8611,7 +8654,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		if !ok {
 			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("requested account %q not found", forcedAccountID)
 		}
-		if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) && account.AuthMode != accounts.AuthModeOAuth {
+		if provider == accounts.ProviderCodex && codexOAuthRequiredPath(r.URL.Path) && account.AuthMode != accounts.AuthModeOAuth {
 			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("requested account %q cannot be used for ChatGPT backend paths", forcedAccountID)
 		}
 		s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, accountMoveForced, nil, false)
@@ -8621,7 +8664,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		}
 		return account, sessionID, assignment.UserEmail, nil
 	}
-	if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) {
+	if provider == accounts.ProviderCodex && codexOAuthRequiredPath(r.URL.Path) {
 		availableAccounts = oauthAccounts(availableAccounts)
 	}
 	if provider == accounts.ProviderCodex {
@@ -9393,97 +9436,8 @@ func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []a
 }
 
 func chatGPTBackendPath(path string) bool {
-	if _, ok := stripChatGPTBackendPath(path); ok {
-		return true
-	}
-	_, ok := chatGPTRealtimeUpstreamPath(path)
+	_, ok := stripChatGPTBackendPath(path)
 	return ok
-}
-
-// chatGPTRealtimeUpstreamPath maps the API-shaped realtime paths emitted when
-// Codex is pointed at a generic proxy URL to the ChatGPT backend route. This
-// keeps /v1/live account selection OAuth-only and also covers its long-lived
-// WebRTC sideband websocket (/v1/live/<call-id>).
-func chatGPTRealtimeUpstreamPath(path string) (string, bool) {
-	if path == "/v1/live" {
-		return "/codex/realtime/calls", true
-	}
-	if strings.HasPrefix(path, "/v1/live/") {
-		return "/codex/realtime/" + strings.TrimPrefix(path, "/v1/live/"), true
-	}
-	return "", false
-}
-
-func addChatGPTRealtimeQuery(target *url.URL) {
-	query := target.Query()
-	if query.Get("intent") == "" {
-		query.Set("intent", "quicksilver")
-	}
-	if query.Get("architecture") == "" {
-		query.Set("architecture", "avas")
-	}
-	target.RawQuery = query.Encode()
-}
-
-const maxRealtimeCallBodyBytes = 8 << 20
-
-// rewriteRealtimeCallBody converts Codex's API multipart voice setup body to
-// the JSON shape accepted by chatgpt.com/backend-api/codex/realtime/calls.
-func rewriteRealtimeCallBody(request *http.Request) error {
-	if request.Body == nil {
-		return fmt.Errorf("missing request body")
-	}
-	mediaType, params, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
-	if err != nil || mediaType != "multipart/form-data" || params["boundary"] == "" {
-		return fmt.Errorf("expected multipart form data")
-	}
-	reader := multipart.NewReader(io.LimitReader(request.Body, maxRealtimeCallBodyBytes+1), params["boundary"])
-	var sdp string
-	var session json.RawMessage
-	for {
-		part, nextErr := reader.NextPart()
-		if errors.Is(nextErr, io.EOF) {
-			break
-		}
-		if nextErr != nil {
-			return fmt.Errorf("read multipart body: %w", nextErr)
-		}
-		value, readErr := io.ReadAll(io.LimitReader(part, maxRealtimeCallBodyBytes+1))
-		part.Close()
-		if readErr != nil {
-			return fmt.Errorf("read %s part: %w", part.FormName(), readErr)
-		}
-		if len(value) > maxRealtimeCallBodyBytes {
-			return fmt.Errorf("body exceeds %d bytes", maxRealtimeCallBodyBytes)
-		}
-		switch part.FormName() {
-		case "sdp":
-			sdp = string(value)
-		case "session":
-			if !json.Valid(value) {
-				return fmt.Errorf("session part is not JSON")
-			}
-			session = append(session[:0], value...)
-		}
-	}
-	if sdp == "" || len(session) == 0 {
-		return fmt.Errorf("missing sdp or session part")
-	}
-	body, err := json.Marshal(struct {
-		SDP     string          `json:"sdp"`
-		Session json.RawMessage `json:"session"`
-	}{SDP: sdp, Session: session})
-	if err != nil {
-		return fmt.Errorf("encode backend body: %w", err)
-	}
-	request.Body = io.NopCloser(bytes.NewReader(body))
-	request.ContentLength = int64(len(body))
-	request.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(body)), nil
-	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Content-Length", strconv.Itoa(len(body)))
-	return nil
 }
 
 const codexModelCatalogSessionID = "internal:codex-model-catalog"
@@ -9708,7 +9662,7 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 	s.markAccountExhaustedRefreshFailure(account, err)
 	lastErr := err
 	oauthOnly := provider == accounts.ProviderCodex &&
-		(chatGPTBackendPath(r.URL.Path) || codexModelCatalogRequest(r))
+		(codexOAuthRequiredPath(r.URL.Path) || codexModelCatalogRequest(r))
 	for {
 		next, pickErr := s.retryAccount(ctx, provider, agentType, sessionID, userEmail, tried, oauthOnly)
 		if pickErr != nil {

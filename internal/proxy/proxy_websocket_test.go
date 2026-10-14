@@ -2237,62 +2237,126 @@ func TestHandlerMapsAPIShapedRealtimeCallToChatGPTOAuthBackend(t *testing.T) {
 	}
 }
 
-func TestHandlerMapsAPIShapedRealtimeSidebandToChatGPTBackend(t *testing.T) {
-	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestHandlerMapsAPIShapedRealtimeCallAndSidebandToSameOAuthAccount(t *testing.T) {
+	var setupAuth, sidebandAuth string
+	var setupCalls, sidebandCalls atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if websocket.IsWebSocketUpgrade(r) {
+			t.Fatalf("ChatGPT backend must not receive the sideband websocket")
+		}
+		setupCalls.Add(1)
+		setupAuth = r.Header.Get("Authorization")
+		if r.URL.Path != "/backend-api/codex/realtime/calls" {
+			t.Fatalf("setup path = %q", r.URL.Path)
+		}
+		if r.Header.Get("Content-Type") != "application/json" {
+			t.Fatalf("setup content type = %q", r.Header.Get("Content-Type"))
+		}
+		w.Header().Set("Location", "/backend-api/codex/realtime/calls/rtc_test")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, "v=0\\r\\n")
+	}))
+	defer backend.Close()
+
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !websocket.IsWebSocketUpgrade(r) {
-			t.Fatalf("expected websocket upgrade")
+			t.Fatalf("expected sideband websocket")
 		}
-		if got := r.URL.Path; got != "/backend-api/codex/realtime/rtc_test" {
-			t.Fatalf("path = %q, want /backend-api/codex/realtime/rtc_test", got)
+		sidebandCalls.Add(1)
+		sidebandAuth = r.Header.Get("Authorization")
+		if r.URL.Path != "/v1/live/rtc_test" {
+			t.Fatalf("sideband path = %q, want /v1/live/rtc_test", r.URL.Path)
 		}
-		conn, err := upgrader.Upgrade(w, r, nil)
+		if r.Header.Get("ChatGPT-Account-ID") != "acct-oauth" {
+			t.Fatalf("sideband account id = %q", r.Header.Get("ChatGPT-Account-ID"))
+		}
+		conn, err := (&websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}).Upgrade(w, r, nil)
 		if err != nil {
 			t.Fatalf("upgrade: %v", err)
 		}
 		defer conn.Close()
 		if err := conn.WriteMessage(websocket.TextMessage, []byte("ok")); err != nil {
-			t.Fatalf("write message: %v", err)
+			t.Fatalf("write: %v", err)
 		}
 	}))
-	defer upstream.Close()
-
-	codexUpstream, err := url.Parse(upstream.URL + "/backend-api/codex")
-	if err != nil {
-		t.Fatal(err)
-	}
+	defer api.Close()
+	backendURL, _ := url.Parse(backend.URL + "/backend-api/codex")
+	apiURL, _ := url.Parse(api.URL)
 	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := Server{
-		CodexUpstream: codexUpstream,
-		Accounts: []accounts.Account{{
-			ID:       "chatgpt-oauth",
-			Provider: accounts.ProviderCodex,
-			AuthMode: accounts.AuthModeOAuth,
-			Token:    "oauth-token",
-		}},
-		Sessions:     store,
-		Scheduler:    selectacct.NewScheduler(nil),
-		MaxBodyBytes: 1024,
-	}.Handler()
+	primary := accounts.Account{ID: "oauth", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "oauth-token", AccountID: "acct-oauth"}
+	handler := Server{CodexUpstream: backendURL, APIUpstream: apiURL, Accounts: []accounts.Account{primary}, Sessions: store, Scheduler: selectacct.NewScheduler(nil), MaxBodyBytes: 1024 * 1024}.Handler()
 	subrouter := httptest.NewServer(handler)
 	defer subrouter.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/live/rtc_test"
-	conn, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	const boundary = "codex-realtime-call-boundary"
+	body := "--" + boundary + "\r\nContent-Disposition: form-data; name=\"sdp\"\r\n\r\nv=offer\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"session\"\r\nContent-Type: application/json\r\n\r\n{\"type\":\"realtime\"}\r\n--" + boundary + "--\r\n"
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/live", strings.NewReader(body))
 	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+	req.Header.Set("X-Subrouter-Session", "voice-session")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("setup status = %d", resp.StatusCode)
+	}
+	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/live/rtc_test"
+	wsHeaders := http.Header{"X-Subrouter-Session": []string{"voice-session"}}
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, wsHeaders)
+	if err != nil {
+		if response != nil {
+			b, _ := io.ReadAll(response.Body)
+			t.Logf("handshake status=%s body=%q", response.Status, b)
+		}
 		t.Fatalf("dial: %v", err)
 	}
 	defer response.Body.Close()
 	defer conn.Close()
-	_, body, err := conn.ReadMessage()
+	_, msg, err := conn.ReadMessage()
 	if err != nil {
-		t.Fatalf("read message: %v", err)
+		t.Fatal(err)
 	}
-	if string(body) != "ok" {
-		t.Fatalf("message = %q, want ok", string(body))
+	if string(msg) != "ok" {
+		t.Fatalf("message = %q", msg)
+	}
+	if setupCalls.Load() != 1 || sidebandCalls.Load() != 1 {
+		t.Fatalf("setup=%d sideband=%d", setupCalls.Load(), sidebandCalls.Load())
+	}
+	if setupAuth != primary.AuthorizationHeader() || sidebandAuth != primary.AuthorizationHeader() {
+		t.Fatalf("OAuth identity changed: setup=%q sideband=%q", setupAuth, sidebandAuth)
+	}
+}
+
+func TestHandlerRejectsUnknownOrInvalidRealtimeSidebandBeforeUpstream(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) { calls.Add(1) }))
+	defer upstream.Close()
+	apiURL, _ := url.Parse(upstream.URL)
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{APIUpstream: apiURL, Accounts: []accounts.Account{{ID: "oauth", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "token"}}, Sessions: store, Scheduler: selectacct.NewScheduler(nil), MaxBodyBytes: 1024}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+	for _, path := range []string{"/v1/live/missing", "/v1/live/a/b"} {
+		resp, err := http.Get(subrouter.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s status=%d", path, resp.StatusCode)
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("upstream calls = %d", calls.Load())
 	}
 }
 
