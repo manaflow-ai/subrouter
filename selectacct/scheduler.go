@@ -411,17 +411,8 @@ func (s Scheduler) spreadIndex(pool []account.Account) int {
 	}
 	total := 0.0
 	for i, candidate := range pool {
-		score := s.score(candidate.Provider, candidate.ID)
-		surplus := math.Min(score.Headroom, score.ShortHeadroom) - MinNewSessionHeadroom
-		if surplus < spreadWeightFloor {
-			surplus = spreadWeightFloor
-		}
-		weight := (surplus + weeklySurplusSpreadGain*score.WeeklySurplus) / float64(1+score.Sessions)
-		if topPressure > 0 {
-			weight *= 1 + spreadPressureGain*score.ExpiryPressure/topPressure
-		}
-		weights[i] = weight
-		total += weight
+		weights[i] = s.spreadWeight(candidate, topPressure)
+		total += weights[i]
 	}
 	target := spreadRandFloat() * total
 	for i, weight := range weights {
@@ -432,6 +423,37 @@ func (s Scheduler) spreadIndex(pool []account.Account) int {
 	}
 	return len(pool) - 1
 }
+
+func (s Scheduler) spreadWeight(candidate account.Account, topPressure float64) float64 {
+	key := ScoreKey(candidate.Provider, candidate.ID)
+	var score Score
+	load := 0.0
+	if spreadInflightAsLoad {
+		score = s.debitedScore(candidate.Provider, candidate.ID)
+		load = float64(score.Sessions + s.inflight[key])
+	} else {
+		score = s.score(candidate.Provider, candidate.ID)
+		load = float64(score.Sessions)
+	}
+	surplus := math.Min(score.Headroom, score.ShortHeadroom) - MinNewSessionHeadroom
+	if spreadQuotaIsHeadroom {
+		surplus = math.Min(score.Headroom, score.ShortHeadroom)
+	}
+	if surplus < spreadWeightFloor {
+		surplus = spreadWeightFloor
+	}
+	weight := (surplus + weeklySurplusSpreadGain*score.WeeklySurplus) / math.Pow(1+load, spreadLoadExponent)
+	if topPressure > 0 {
+		weight *= 1 + spreadPressureGain*score.ExpiryPressure/topPressure
+	}
+	return weight
+}
+
+var (
+	spreadLoadExponent    = 1.0
+	spreadInflightAsLoad  = false
+	spreadQuotaIsHeadroom = false
+)
 
 // Expiring weekly quota. An account's weekly surplus (Score.WeeklySurplus)
 // is quota that is lost at reset unless the account is used faster than its
@@ -578,13 +600,20 @@ func (s Scheduler) WithInflightCounts(counts map[string]int) Scheduler {
 }
 
 func (s Scheduler) score(provider account.Provider, accountID string) Score {
-	score := s.measuredScore(provider, accountID)
+	score := s.debitedScore(provider, accountID)
 	key := ScoreKey(provider, accountID)
-	if count := s.liveDebits[key]; count > 0 {
-		score = applyPlacementPenalty(score, LiveDebitPerRequest*float64(count))
-	}
 	if count := s.inflight[key]; count > 0 {
 		score = applyPlacementPenalty(score, InflightPenaltyPerRequest*float64(count))
+	}
+	return score
+}
+
+// debitedScore is the measured score less the live debit for requests
+// routed since the last usage refresh, without the in-flight penalty.
+func (s Scheduler) debitedScore(provider account.Provider, accountID string) Score {
+	score := s.measuredScore(provider, accountID)
+	if count := s.liveDebits[ScoreKey(provider, accountID)]; count > 0 {
+		score = applyPlacementPenalty(score, LiveDebitPerRequest*float64(count))
 	}
 	return score
 }

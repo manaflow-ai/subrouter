@@ -24,11 +24,14 @@ import (
 // case held the request until the client gave up and the second answered 503
 // on every request while other accounts had room (2026-10-14). Both must now
 // be served by the free account, and the rejection must reach the error log.
+// Only the pause moves the session: a full queue means the account is busy,
+// not out of quota, so the session keeps the account holding its prompt cache.
 func TestAdmissionRejectionFailsOverToAnotherAccount(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		prepare   func(*admissionControl)
-		wantClass string
+		name        string
+		prepare     func(*admissionControl)
+		wantClass   string
+		wantSession string
 	}{
 		{
 			name: "paused after a rate limit",
@@ -37,7 +40,8 @@ func TestAdmissionRejectionFailsOverToAnotherAccount(t *testing.T) {
 					control.pause(admissionKeyFor(accounts.ProviderClaude, "pinned@example.com", model), time.Now().Add(time.Hour))
 				}
 			},
-			wantClass: "admission_paused",
+			wantClass:   "admission_paused",
+			wantSession: "free@example.com",
 		},
 		{
 			name: "queue full",
@@ -50,7 +54,8 @@ func TestAdmissionRejectionFailsOverToAnotherAccount(t *testing.T) {
 					}
 				}
 			},
-			wantClass: "admission_queue_full",
+			wantClass:   "admission_queue_full",
+			wantSession: "pinned@example.com",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -122,6 +127,9 @@ func TestAdmissionRejectionFailsOverToAnotherAccount(t *testing.T) {
 			report := events.Query(ErrorEventQuery{Provider: "claude"})
 			if len(report.Events) == 0 || report.Events[0].ErrorClass != tc.wantClass || report.Events[0].Account != "pinned@example.com" {
 				t.Fatalf("error log = %+v, want a %s event on pinned@example.com", report.Events, tc.wantClass)
+			}
+			if assignment, ok := store.Get("claude", "session-pinned"); !ok || assignment.AccountID != tc.wantSession {
+				t.Fatalf("session assignment = %+v (found %v), want it on %s", assignment, ok, tc.wantSession)
 			}
 		})
 	}

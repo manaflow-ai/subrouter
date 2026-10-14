@@ -3493,7 +3493,7 @@ func (s Server) updateSchedulerFromUsageStatusesAtScoreRevision(
 	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
 	}
 	s.SchedulerRef.SetForAccountGenerationAtScoreRevision(scheduler, accountGeneration, scoreRevision)
 }
@@ -4371,7 +4371,7 @@ func (s Server) finishAccountReload(ctx context.Context, loaded []accounts.Accou
 	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
 	}
 	if !s.SchedulerRef.SetForAccountGenerationAtScoreRevision(scheduler, accountGeneration, scoreRevision) {
 		if s.Logger != nil {
@@ -8784,7 +8784,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	if poolModel != "" && s.Logger != nil && base.HasModelPool(poolModel) {
 		s.Logger.Debug("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
 	}
-	scheduler := base.ForModel(poolModel).WithSessionCounts(SchedulerSessionCounts(s.Sessions))
+	scheduler := base.ForModel(poolModel).WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
 	// stickyScheduler decides whether a sticky session leaves its account.
 	// Capacity marks evict a session whose account keeps shedding, but a
 	// conversation too large for the overload failover to move keeps its
@@ -9495,7 +9495,7 @@ func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []a
 	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
 	}
 	finished = true
 	if !s.SchedulerRef.FinishRefreshForAccountGeneration(scheduler, true, accountGeneration) {
@@ -9873,7 +9873,7 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	}
 	scheduler := s.scheduler()
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
 	}
 	account, err := pickRoutingAccount(scheduler, untried)
 	if err != nil {
@@ -11022,12 +11022,23 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 							"agent", t.agent, "session", t.session, "from_account", accountID,
 							"to_account", next.ID, "reason", err.Error(), "attempt", attempt)
 					}
+					// A full queue means the account is busy, not out of quota:
+					// overflow only this request, as a spill does, so the
+					// session keeps the account that holds its prompt cache. A
+					// paused account is rate limited for a long while, so the
+					// session follows the request.
+					if errors.Is(err, errAdmissionQueueFull) && !errors.Is(err, errAdmissionPaused) {
+						if spilledFrom == "" {
+							spilledFrom = accountID
+						}
+					} else {
+						quotaFailedOver = true
+						failoverReason = accountMoveCapacity
+					}
 					accountID = next.ID
 					accountCredential = next.CredentialIdentity()
 					tried[accountID] = struct{}{}
 					attemptReq = nextReq
-					quotaFailedOver = true
-					failoverReason = accountMoveCapacity
 					continue
 				}
 			}
@@ -12222,7 +12233,7 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 		quotaScheduler := s.scheduler()
 		scheduler := s.withCapacityMarks(quotaScheduler.ForModel(poolModel), provider, poolModel, codexServiceTierFromContext(ctx))
 		if s.Sessions != nil {
-			scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
+			scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
 		}
 		candidates := make([]accounts.Account, 0, len(allCandidates))
 		for _, account := range allCandidates {

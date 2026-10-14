@@ -106,6 +106,10 @@ type AccountState struct {
 	BlockedUntil   *time.Time        `json:"blocked_until,omitempty"`
 	Inflight       int               `json:"inflight,omitempty"`
 	Sessions       int               `json:"sessions,omitempty"`
+	// ActiveSessions is the placement load signal: assignments that sent a
+	// request within placementActiveWindow. Sessions counts every retained
+	// assignment.
+	ActiveSessions int `json:"active_sessions,omitempty"`
 }
 
 type errorEventRecord struct {
@@ -599,8 +603,10 @@ func (s Server) accountPoolSnapshot(ctx context.Context, provider accounts.Provi
 	snapshot := AccountPoolSnapshot{At: time.Now().UTC(), Provider: provider, PoolModel: poolModel}
 	candidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
 	scheduler := s.scheduler()
+	active := map[string]int{}
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
+		active = SchedulerActiveSessionCounts(s.Sessions)
+		scheduler = scheduler.WithSessionCounts(active)
 	}
 	scoreProvider := schedulerAccountProvider(provider)
 	inflight := map[string]int{}
@@ -627,9 +633,10 @@ func (s Server) accountPoolSnapshot(ctx context.Context, provider accounts.Provi
 			WeeklyHeadroom: roundHeadroom(score.WeeklyHeadroom),
 			UsableNew: tier == selectacct.SelectionTierPromotedCredits || tier == selectacct.SelectionTierPlan ||
 				tier == selectacct.SelectionTierAPIKey,
-			Exhausted: tier == selectacct.SelectionTierPlanExhausted || tier == selectacct.SelectionTierExhaustedAPIKey,
-			Inflight:  inflight[key],
-			Sessions:  sessions[key],
+			Exhausted:      tier == selectacct.SelectionTierPlanExhausted || tier == selectacct.SelectionTierExhaustedAPIKey,
+			Inflight:       inflight[key],
+			Sessions:       sessions[key],
+			ActiveSessions: active[key],
 		}
 		if poolModel != "" {
 			if modelScore, ok := score.ModelScores[poolModel]; ok {
