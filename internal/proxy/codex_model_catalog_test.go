@@ -505,3 +505,64 @@ func TestCodexModelCatalogHonorsOAuthAccountPin(t *testing.T) {
 		t.Fatalf("shared catalog assignment = %#v, %t; want pro@example.com", assignment, ok)
 	}
 }
+
+func TestCodexModelCatalogUsesCallersOwnPoolAccount(t *testing.T) {
+	codexUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if request.Header.Get("Authorization") == "Bearer promax-token" {
+			_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-6-astra","tier":"ultrafast"}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-6-astra","tier":"priority"}]}`)
+	}))
+	defer codexUpstream.Close()
+	upstream, err := url.Parse(codexUpstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", codexModelCatalogSessionID, "pro@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		CodexUpstream: upstream,
+		Accounts: []accounts.Account{
+			{ID: "pro@example.com", AuthMode: accounts.AuthModeOAuth, Token: "pro-token", AccountID: "team-workspace"},
+			{ID: "pro2@example.com", AuthMode: accounts.AuthModeOAuth, Token: "pro2-token", AccountID: "team-workspace"},
+			{ID: "promax@example.com", AuthMode: accounts.AuthModeOAuth, Token: "promax-token", AccountID: "promax-account"},
+		},
+		Sessions: store,
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "pro@example.com", Headroom: 0.99, ShortHeadroom: 0.99},
+			{AccountID: "pro2@example.com", Headroom: 0.99, ShortHeadroom: 0.99},
+			{AccountID: "promax@example.com", Headroom: 0.5, ShortHeadroom: 0.5},
+		}),
+		MaxBodyBytes: 1024,
+	}.Handler()
+
+	fetch := func(callerAccountID string) string {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.162.1", nil)
+		request.Header.Set("X-Subrouter-Agent", "codex")
+		request.Header.Set("ChatGPT-Account-ID", callerAccountID)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("caller %q: status = %d, body = %s", callerAccountID, response.Code, response.Body.String())
+		}
+		return response.Body.String()
+	}
+
+	if got := fetch("promax-account"); got != `{"models":[{"slug":"gpt-6-astra","tier":"ultrafast"}]}` {
+		t.Fatalf("caller's own account catalog = %s, want the promax catalog", got)
+	}
+	if got := fetch("team-workspace"); got != `{"models":[{"slug":"gpt-6-astra","tier":"priority"}]}` {
+		t.Fatalf("shared workspace catalog = %s, want the shared catalog session", got)
+	}
+	if assignment, ok := store.Get("codex", codexModelCatalogSessionID); !ok || assignment.AccountID != "pro@example.com" {
+		t.Fatalf("shared catalog assignment = %#v, %t; want pro@example.com", assignment, ok)
+	}
+}

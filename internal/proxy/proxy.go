@@ -9496,6 +9496,29 @@ func codexModelCatalogRequest(r *http.Request) bool {
 // OAuth account. A pinned refresh failure is final, like pinned /responses
 // traffic, and Codex falls back to its bundled catalog. The second result is
 // the pinned OAuth account ID, or empty.
+// codexCatalogCallerAccount maps an unpinned catalog request to the pool
+// account the caller is itself signed in as. Codex sends its own login's
+// ChatGPT-Account-ID, and a plain client (openai_base_url) cannot add a pin
+// header, so without this a Pro 500 user sees only the tiers of an arbitrary
+// pool account. A workspace ID shared by several stored records is ambiguous
+// and is ignored. Pinning by header is already open to every caller, so this
+// grants nothing new.
+func (s Server) codexCatalogCallerAccount(r *http.Request) (accounts.Account, bool) {
+	callerAccountID := strings.TrimSpace(r.Header.Get("ChatGPT-Account-ID"))
+	if callerAccountID == "" {
+		return accounts.Account{}, false
+	}
+	var match accounts.Account
+	matches := 0
+	for _, account := range oauthAccounts(filterAccountsForProvider(s.accountListContext(r.Context()), accounts.ProviderCodex)) {
+		if account.AccountID == callerAccountID {
+			match = account
+			matches++
+		}
+	}
+	return match, matches == 1
+}
+
 func (s Server) codexModelCatalogRoutingRequest(r *http.Request) (*http.Request, string) {
 	if forced, present, err := session.ExtractAccountIDWithPresence(r); err == nil && present && forced != "" {
 		available := oauthAccounts(filterAccountsForProvider(s.accountListContext(r.Context()), accounts.ProviderCodex))
@@ -9506,6 +9529,15 @@ func (s Server) codexModelCatalogRoutingRequest(r *http.Request) (*http.Request,
 			request.Header.Del("X-Model")
 			return request, account.ID
 		}
+	}
+	if account, ok := s.codexCatalogCallerAccount(r); ok {
+		request := r.Clone(r.Context())
+		request.Header = r.Header.Clone()
+		request.Header.Del("X-Subrouter-Account")
+		request.Header.Del("X-Subrouter-Model")
+		request.Header.Del("X-Model")
+		request.Header.Set("X-Subrouter-Account-ID", account.ID)
+		return request, account.ID
 	}
 	request := r.Clone(r.Context())
 	request.Header = r.Header.Clone()
