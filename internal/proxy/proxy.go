@@ -5716,6 +5716,21 @@ func (s Server) proxyHandler() http.Handler {
 				writePinnedAccountUnusable(w, requestProvider, forcedAccountID, err)
 				return
 			}
+			// Nothing upstream was tried, so without this the 503 reaches the
+			// traffic sample with no account and no class, and the log has no
+			// line for it at all.
+			reason := accountSelectionFailureReason(err)
+			markTrafficErrorClass(r.Context(), reason)
+			if s.Logger != nil {
+				s.Logger.Warn("account selection failed",
+					"agent", sessionAgentType,
+					"session", sessionID,
+					"provider", requestProvider,
+					"pool_model", requestPoolModel,
+					"reason", reason,
+					"error", err)
+			}
+			w.Header().Set(subrouterReasonHeader, reason)
 			writeAccountSelectionUnavailable(w, err)
 			return
 		}
