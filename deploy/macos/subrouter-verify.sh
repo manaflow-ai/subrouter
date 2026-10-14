@@ -14,6 +14,37 @@
 # /var/lib/subrouter-verify/alerts.log; a summary to status.json.
 set -uo pipefail
 
+# Prints "<healthy> <total>" Claude accounts from a usage-status body on stdin,
+# "0 0" when it is not JSON. Matches ../gcp/subrouter-verify.sh: API keys have
+# no usage windows and usage-status never auth-checks them (auth_valid=false),
+# so a key counts unless its spent-credit hold is live; per-model Feature
+# windows do not cook a whole account.
+count_healthy_claude() {
+  python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("0 0"); sys.exit()
+rows = d if isinstance(d, list) else d.get("accounts", [])
+cl = [x for x in rows if x.get("provider") == "claude"]
+def healthy(x):
+    if x.get("error"):
+        return False
+    if x.get("auth_mode") == "apikey":
+        return (x.get("credit") or {}).get("pace") != "spent"
+    ws = [w for w in x.get("windows") or [] if not w.get("Feature")]
+    mx = max([w.get("UsedPercent", 0) for w in ws], default=0)
+    return bool(x.get("auth_valid")) and mx < 95
+print(sum(1 for x in cl if healthy(x)), len(cl))
+' 2>/dev/null || echo "0 0"
+}
+
+if [ "${1:-}" = "--count-healthy" ]; then
+  count_healthy_claude
+  exit 0
+fi
+
 LABEL="${SUBROUTER_LABEL:-ai.manaflow.subrouter-team}"
 HEALTH="${SUBROUTER_HEALTH_URL:-http://127.0.0.1:31415/_subrouter/health}"
 USAGE="${SUBROUTER_USAGE_URL:-http://127.0.0.1:31415/_subrouter/usage-status}"
@@ -59,22 +90,9 @@ read_new_log() {
 }
 
 # --- healthy Claude account count from usage-status (for the invariant) ---
-counts=$(curl -fsS "$USAGE" 2>/dev/null | python3 -c '
-import sys, json
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print("0 0"); sys.exit()
-rows = d if isinstance(d, list) else d.get("accounts", [])
-cl = [x for x in rows if x.get("provider") == "claude"]
-def healthy(x):
-    ws = x.get("windows") or []
-    mx = max([w.get("UsedPercent", 0) for w in ws], default=0)
-    return bool(x.get("auth_valid")) and not x.get("error") and mx < 95
-print(sum(1 for x in cl if healthy(x)), len(cl))
-' 2>/dev/null || echo "0 0")
-healthy_claude=$(awk '{print $1}' <<<"$counts"); : "${healthy_claude:=0}"
-total_claude=$(awk '{print $2}' <<<"$counts"); : "${total_claude:=0}"
+healthy_counts=$(curl -fsS "$USAGE" 2>/dev/null | count_healthy_claude)
+healthy_claude=$(awk '{print $1}' <<<"$healthy_counts"); : "${healthy_claude:=0}"
+total_claude=$(awk '{print $2}' <<<"$healthy_counts"); : "${total_claude:=0}"
 
 # --- 1. health + version (detect a down service or silent rollback) ---
 state_line=$(launchctl print "system/${LABEL}" 2>/dev/null | awk -F'= ' '/[^a-z]state = /{print $2; exit}')

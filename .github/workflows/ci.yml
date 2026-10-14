@@ -114,6 +114,7 @@ jobs:
           bash deploy/macos/tests/deploy-install-test.sh
           bash deploy/macos/tests/canary-rollout-test.sh
           bash deploy/macos/tests/upgrade-host-rollouts-test.sh
+          bash deploy/macos/tests/verify-healthy-count-test.sh
 
       - name: Set up Go
         uses: actions/setup-go@v6
