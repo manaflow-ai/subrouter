@@ -1022,6 +1022,12 @@ func serve(args []string) error {
 		)
 	}
 
+	// Route on the previous worker's saved windows until the first live sweep;
+	// without them every Claude account reads as fully healthy at start.
+	if seeded := server.SeedScoresFromRestoredUsage(time.Now()); seeded > 0 {
+		slog.Info("seeded usage scores from the saved snapshot", "accounts", seeded)
+	}
+
 	// Keep usage scores fresh off the request path: idle pools stay scored and
 	// busy pools rarely hand a stale-score refresh to a request. The loop ends
 	// when this worker retires or shuts down (activeGenerationCtx) or drains.
