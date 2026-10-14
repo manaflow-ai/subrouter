@@ -2148,6 +2148,154 @@ func TestHandlerMapsRealtimeWebSocketRequestsToCodexBackendPaths(t *testing.T) {
 	}
 }
 
+func TestHandlerMapsAPIShapedRealtimeCallToChatGPTOAuthBackend(t *testing.T) {
+	var gotAuth, gotPath, gotContentType, gotIntent, gotArchitecture string
+	var gotBody map[string]json.RawMessage
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		gotContentType = r.Header.Get("Content-Type")
+		gotIntent = r.URL.Query().Get("intent")
+		gotArchitecture = r.URL.Query().Get("architecture")
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode backend body: %v", err)
+		}
+		w.Header().Set("Location", "/backend-api/codex/realtime/calls/rtc_test")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("v=0\r\n"))
+	}))
+	defer upstream.Close()
+
+	codexUpstream, err := url.Parse(upstream.URL + "/backend-api/codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		CodexUpstream: codexUpstream,
+		Accounts: []accounts.Account{{
+			ID:       "chatgpt-oauth",
+			Provider: accounts.ProviderCodex,
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "oauth-token",
+		}},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1024 * 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	const boundary = "codex-realtime-call-boundary"
+	body := "--" + boundary + "\r\n" +
+		"Content-Disposition: form-data; name=\"sdp\"\r\n" +
+		"Content-Type: application/sdp\r\n\r\n" +
+		"v=offer\r\n" +
+		"--" + boundary + "\r\n" +
+		"Content-Disposition: form-data; name=\"session\"\r\n" +
+		"Content-Type: application/json\r\n\r\n" +
+		`{"type":"realtime","id":"client-session"}` + "\r\n" +
+		"--" + boundary + "--\r\n"
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/live", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+	req.Header.Set("X-Subrouter-Session", "voice-session")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+	if gotPath != "/backend-api/codex/realtime/calls" {
+		t.Fatalf("path = %q, want /backend-api/codex/realtime/calls", gotPath)
+	}
+	if got := resp.Request.URL.Path; got != "/v1/live" {
+		t.Fatalf("client path = %q, want /v1/live", got)
+	}
+	if gotContentType != "application/json" {
+		t.Fatalf("content type = %q, want application/json", gotContentType)
+	}
+	if gotIntent != "quicksilver" || gotArchitecture != "avas" {
+		t.Fatalf("realtime query = intent %q architecture %q", gotIntent, gotArchitecture)
+	}
+	if gotAuth != "Bearer oauth-token" {
+		t.Fatalf("authorization = %q, want OAuth account", gotAuth)
+	}
+	var sdp string
+	if err := json.Unmarshal(gotBody["sdp"], &sdp); err != nil || sdp != "v=offer" {
+		t.Fatalf("backend sdp = %q, want offer", sdp)
+	}
+	if got := string(gotBody["session"]); got != `{"type":"realtime","id":"client-session"}` {
+		t.Fatalf("backend session = %s", got)
+	}
+}
+
+func TestHandlerMapsAPIShapedRealtimeSidebandToChatGPTBackend(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			t.Fatalf("expected websocket upgrade")
+		}
+		if got := r.URL.Path; got != "/backend-api/codex/realtime/rtc_test" {
+			t.Fatalf("path = %q, want /backend-api/codex/realtime/rtc_test", got)
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		if err := conn.WriteMessage(websocket.TextMessage, []byte("ok")); err != nil {
+			t.Fatalf("write message: %v", err)
+		}
+	}))
+	defer upstream.Close()
+
+	codexUpstream, err := url.Parse(upstream.URL + "/backend-api/codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		CodexUpstream: codexUpstream,
+		Accounts: []accounts.Account{{
+			ID:       "chatgpt-oauth",
+			Provider: accounts.ProviderCodex,
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "oauth-token",
+		}},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/live/rtc_test"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	defer conn.Close()
+	_, body, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read message: %v", err)
+	}
+	if string(body) != "ok" {
+		t.Fatalf("message = %q, want ok", string(body))
+	}
+}
+
 func TestHandlerMapsDesktopCodexBackendWebSocketPathsWithoutDuplicatingPrefix(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

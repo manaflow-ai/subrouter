@@ -17,6 +17,8 @@ import (
 	"log/slog"
 	"math"
 	"math/rand/v2"
+	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -5762,6 +5764,19 @@ func (s Server) proxyHandler() http.Handler {
 		proxyRequest.URL = cloneURL(r.URL)
 		proxyRequest.URL.Path = s.pathForUpstream(proxyRequest.URL.Path, account)
 		proxyRequest.URL.RawPath = ""
+		if requestProvider == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth &&
+			r.URL.Path == "/v1/live" && r.Method == http.MethodPost {
+			// Codex's API-shaped voice client sends the WebRTC offer as multipart
+			// to /v1/live. ChatGPT OAuth accepts the same call at its backend
+			// realtime endpoint as JSON, so translate only this short setup
+			// request. The subsequent sideband is a websocket and is streamed
+			// directly by proxyWebSocket.
+			addChatGPTRealtimeQuery(proxyRequest.URL)
+			if err := rewriteRealtimeCallBody(proxyRequest); err != nil {
+				http.Error(w, "invalid realtime call: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
 		session.StripSubrouterHeaders(proxyRequest.Header)
 		proxyRequest.Header.Del("X-Subrouter-Preferred-Account-ID")
 		// Every outbound attempt (retries, replays, fallbacks, catalog pages)
@@ -8489,6 +8504,9 @@ func (s Server) pathForUpstream(path string, account accounts.Account) string {
 		return stripProviderPathPrefix(path, "antigravity")
 	}
 	if account.AuthMode == accounts.AuthModeOAuth {
+		if realtimePath, ok := chatGPTRealtimeUpstreamPath(path); ok {
+			return realtimePath
+		}
 		if stripped, ok := stripChatGPTBackendPath(path); ok {
 			return stripped
 		}
@@ -9375,8 +9393,97 @@ func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []a
 }
 
 func chatGPTBackendPath(path string) bool {
-	_, ok := stripChatGPTBackendPath(path)
+	if _, ok := stripChatGPTBackendPath(path); ok {
+		return true
+	}
+	_, ok := chatGPTRealtimeUpstreamPath(path)
 	return ok
+}
+
+// chatGPTRealtimeUpstreamPath maps the API-shaped realtime paths emitted when
+// Codex is pointed at a generic proxy URL to the ChatGPT backend route. This
+// keeps /v1/live account selection OAuth-only and also covers its long-lived
+// WebRTC sideband websocket (/v1/live/<call-id>).
+func chatGPTRealtimeUpstreamPath(path string) (string, bool) {
+	if path == "/v1/live" {
+		return "/codex/realtime/calls", true
+	}
+	if strings.HasPrefix(path, "/v1/live/") {
+		return "/codex/realtime/" + strings.TrimPrefix(path, "/v1/live/"), true
+	}
+	return "", false
+}
+
+func addChatGPTRealtimeQuery(target *url.URL) {
+	query := target.Query()
+	if query.Get("intent") == "" {
+		query.Set("intent", "quicksilver")
+	}
+	if query.Get("architecture") == "" {
+		query.Set("architecture", "avas")
+	}
+	target.RawQuery = query.Encode()
+}
+
+const maxRealtimeCallBodyBytes = 8 << 20
+
+// rewriteRealtimeCallBody converts Codex's API multipart voice setup body to
+// the JSON shape accepted by chatgpt.com/backend-api/codex/realtime/calls.
+func rewriteRealtimeCallBody(request *http.Request) error {
+	if request.Body == nil {
+		return fmt.Errorf("missing request body")
+	}
+	mediaType, params, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if err != nil || mediaType != "multipart/form-data" || params["boundary"] == "" {
+		return fmt.Errorf("expected multipart form data")
+	}
+	reader := multipart.NewReader(io.LimitReader(request.Body, maxRealtimeCallBodyBytes+1), params["boundary"])
+	var sdp string
+	var session json.RawMessage
+	for {
+		part, nextErr := reader.NextPart()
+		if errors.Is(nextErr, io.EOF) {
+			break
+		}
+		if nextErr != nil {
+			return fmt.Errorf("read multipart body: %w", nextErr)
+		}
+		value, readErr := io.ReadAll(io.LimitReader(part, maxRealtimeCallBodyBytes+1))
+		part.Close()
+		if readErr != nil {
+			return fmt.Errorf("read %s part: %w", part.FormName(), readErr)
+		}
+		if len(value) > maxRealtimeCallBodyBytes {
+			return fmt.Errorf("body exceeds %d bytes", maxRealtimeCallBodyBytes)
+		}
+		switch part.FormName() {
+		case "sdp":
+			sdp = string(value)
+		case "session":
+			if !json.Valid(value) {
+				return fmt.Errorf("session part is not JSON")
+			}
+			session = append(session[:0], value...)
+		}
+	}
+	if sdp == "" || len(session) == 0 {
+		return fmt.Errorf("missing sdp or session part")
+	}
+	body, err := json.Marshal(struct {
+		SDP     string          `json:"sdp"`
+		Session json.RawMessage `json:"session"`
+	}{SDP: sdp, Session: session})
+	if err != nil {
+		return fmt.Errorf("encode backend body: %w", err)
+	}
+	request.Body = io.NopCloser(bytes.NewReader(body))
+	request.ContentLength = int64(len(body))
+	request.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	return nil
 }
 
 const codexModelCatalogSessionID = "internal:codex-model-catalog"
