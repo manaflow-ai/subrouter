@@ -308,7 +308,9 @@ func TestExpiryAwareRoutingMatchesSnapshotOrder(t *testing.T) {
 		{ID: "erin@example.com", AuthMode: account.AuthModeOAuth},
 	}
 
-	got, err := scheduler.Pick(candidates)
+	// PickBest: this asserts the expiry-aware order; Pick samples new
+	// sessions across the whole usable band.
+	got, err := scheduler.PickBest(candidates)
 	if err != nil {
 		t.Fatal(err)
 	}

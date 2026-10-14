@@ -94,6 +94,9 @@ func ExtractAgentType(r *http.Request) string {
 	if hasAnyHeader(r, claudeAgentHeaderCandidates) {
 		return "claude"
 	}
+	if anthropicProtocolRequest(r) {
+		return "claude"
+	}
 	if hasAnyHeader(r, geminiAgentHeaderCandidates) {
 		return "gemini"
 	}
@@ -101,6 +104,24 @@ func ExtractAgentType(r *http.Request) string {
 		return "codex"
 	}
 	return "codex"
+}
+
+// anthropicProtocolRequest reports Anthropic API evidence that Codex never
+// sends. Claude Code's connectivity check (HEAD /api/hello) goes out from its
+// Bun runtime with a "Bun/x" user agent and no Claude header, so without this
+// it fell through to the Codex default and reached chatgpt.com, which answers
+// with an HTML page instead of the API.
+func anthropicProtocolRequest(r *http.Request) bool {
+	if r.Header.Get("Anthropic-Version") != "" || r.Header.Get("Anthropic-Beta") != "" {
+		return true
+	}
+	switch path := r.URL.Path; {
+	case path == "/api/hello", path == "/v1/complete":
+		return true
+	case path == "/v1/messages", strings.HasPrefix(path, "/v1/messages/"):
+		return true
+	}
+	return false
 }
 
 func claudeCodeUserAgent(value string) bool {
