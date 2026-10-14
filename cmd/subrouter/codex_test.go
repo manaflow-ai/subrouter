@@ -537,6 +537,8 @@ func defaultSubrouterCodexConfigArgs(baseURL string) []string {
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
 		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous"}`,
+		"-c", `experimental_realtime_ws_base_url="` + codexProxyRootURL(baseURL) + `/v1/live"`,
+		"-c", `experimental_realtime_webrtc_call_base_url="` + codexProxyRootURL(baseURL) + `/v1"`,
 		"-c", `model_providers.subrouter={name="Subrouter",base_url="` + baseURL + `",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous"}}`,
 	}
 }
@@ -553,6 +555,8 @@ func TestCodexArgsInjectsUserEmailWithCustomSubrouterProvider(t *testing.T) {
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
 		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-User-Email"="alice@example.com"}`,
+		"-c", `experimental_realtime_ws_base_url="http://127.0.0.1:31415/v1/live"`,
+		"-c", `experimental_realtime_webrtc_call_base_url="http://127.0.0.1:31415/v1"`,
 		"-c", `model_providers.subrouter={name="Subrouter",base_url="http://127.0.0.1:31415/v1",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-User-Email"="alice@example.com"}}`,
 	}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
@@ -572,6 +576,8 @@ func TestCodexArgsInjectsAccountIDWithCustomSubrouterProvider(t *testing.T) {
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
 		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-Account-ID"="team-codex-1"}`,
+		"-c", `experimental_realtime_ws_base_url="http://127.0.0.1:31415/v1/live"`,
+		"-c", `experimental_realtime_webrtc_call_base_url="http://127.0.0.1:31415/v1"`,
 		"-c", `model_providers.subrouter={name="Subrouter",base_url="http://127.0.0.1:31415/v1",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-Account-ID"="team-codex-1"}}`,
 	}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
@@ -845,5 +851,39 @@ func TestRunCodexCommandReportsChildSignalWithoutSendingIt(t *testing.T) {
 	err := runCodexCommand(bin, nil, os.Environ())
 	if err == nil || !strings.Contains(err.Error(), "signal: terminated") {
 		t.Fatalf("runCodexCommand error = %v, want the child's signal", err)
+	}
+}
+
+// Codex voice makes a setup POST to <call base>/live and a sideband WebSocket
+// to <ws base>/live/<call-id>. Without the ws base override Codex dials
+// api.openai.com directly, bypassing sr, so both keys must point at sr.
+func TestCodexArgsRoutesRealtimeVoiceThroughSubrouter(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		baseURL string
+		root    string
+	}{
+		{name: "local", baseURL: "http://127.0.0.1:31415/v1", root: "http://127.0.0.1:31415"},
+		{name: "tenant", baseURL: "https://sr.example/t/sk-team/v1", root: "https://sr.example/t/sk-team"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := codexArgs([]string{
+				"-c", `experimental_realtime_ws_base_url="wss://stale.invalid/v1"`,
+				"--config", `experimental_realtime_webrtc_call_base_url="https://stale.invalid/v1"`,
+				"prompt",
+			}, tc.baseURL, "", "")
+			joined := strings.Join(got, "\n")
+			if strings.Contains(joined, "stale.invalid") {
+				t.Fatalf("user realtime override survived:\n%s", joined)
+			}
+			for _, want := range []string{
+				`experimental_realtime_ws_base_url="` + tc.root + `/v1/live"`,
+				`experimental_realtime_webrtc_call_base_url="` + tc.root + `/v1"`,
+			} {
+				if !contains(got, want) {
+					t.Fatalf("missing %q in:\n%s", want, joined)
+				}
+			}
+		})
 	}
 }

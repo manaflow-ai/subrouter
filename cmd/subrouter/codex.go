@@ -787,6 +787,7 @@ func isSubrouterOwnedCodexConfig(assignment string) bool {
 		"openai_base_url",
 		"chatgpt_base_url",
 		"experimental_realtime_ws_base_url",
+		"experimental_realtime_webrtc_call_base_url",
 		"model_providers.subrouter":
 		return true
 	default:
@@ -865,10 +866,28 @@ func codexConfigArgs(
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
 		"-c", `model_providers.subrouter.http_headers=` + codexSubrouterHeaders(userEmail, accountID, model),
+		// Codex voice dials its sideband WebSocket from the realtime ws base, not
+		// the provider base_url, so without these it bypasses sr entirely.
+		"-c", "experimental_realtime_ws_base_url=" + strconv.Quote(codexRealtimeWSBaseURL(baseURL)),
+		"-c", "experimental_realtime_webrtc_call_base_url=" + strconv.Quote(codexRealtimeCallBaseURL(baseURL)),
 		// A final whole-table override removes unknown leaves inherited through a
 		// parent model_providers table; leaf overrides alone do not replace them.
 		"-c", `model_providers.subrouter=` + codexSubrouterProviderTable(baseURL, userEmail, accountID, model, forceAuthenticatedProvider),
 	}
+}
+
+// codexRealtimeWSBaseURL is the base Codex appends /<call-id> to for the voice
+// sideband. Codex rewrites only a bare "/v1" path to "/v1/live" and keeps any
+// other path as is, so a tenant root (/t/<key>/v1) needs the explicit /live.
+func codexRealtimeWSBaseURL(baseURL string) string {
+	return codexProxyRootURL(baseURL) + "/v1/live"
+}
+
+// codexRealtimeCallBaseURL is the base Codex POSTs <base>/live to for voice
+// setup. It must be set alongside the ws base, which otherwise doubles as the
+// setup base and would yield /v1/live/live.
+func codexRealtimeCallBaseURL(baseURL string) string {
+	return codexProxyRootURL(baseURL) + "/v1"
 }
 
 func codexSubrouterProviderTable(baseURL, userEmail, accountID, model string, forceAuthenticatedProvider bool) string {

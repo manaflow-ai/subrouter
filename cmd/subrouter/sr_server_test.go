@@ -550,7 +550,8 @@ func TestSRServerUseSetsExplicitDefault(t *testing.T) {
 	for _, want := range []string{
 		`openai_base_url = "http://127.0.0.1:31415/v1"`,
 		`chatgpt_base_url = "http://127.0.0.1:31415/backend-api"`,
-		`experimental_realtime_ws_base_url = "http://127.0.0.1:31415/v1"`,
+		`experimental_realtime_ws_base_url = "http://127.0.0.1:31415/v1/live"`,
+		`experimental_realtime_webrtc_call_base_url = "http://127.0.0.1:31415/v1"`,
 	} {
 		if !strings.Contains(string(configBody), want) {
 			t.Fatalf("missing %q in config:\n%s", want, string(configBody))
