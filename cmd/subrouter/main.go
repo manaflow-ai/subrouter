@@ -386,6 +386,7 @@ func serve(args []string) error {
 	transcriptAzureURL := flags.String("transcript-azure-url", "", "optional Azure blob container URL (https://<account>.blob.core.windows.net/<container>[/<prefix>]) for background transcript sync; defaults to SUBROUTER_TRANSCRIPT_AZURE_URL")
 	srSwitchInterval := defaultSRSwitchInterval
 	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for refreshing OAuth usage scores used by routing; non-positive disables scheduled refresh")
+	flags.Float64Var(&selectacct.MinNewSessionHeadroom, "min-new-session-headroom", selectacct.MinNewSessionHeadroom, "headroom fraction (0-1) an account needs to take a new session; lower spreads new sessions over more accounts")
 	flags.DurationVar(&srSwitchInterval, "cx-switch-interval", defaultSRSwitchInterval, "compatibility alias for --sr-switch-interval")
 	resetCreditInterval := flags.Duration("reset-credit-interval", time.Hour, "how often to check cooked accounts for a rate-limit reset credit worth spending now (early in the weekly window, or expiring before the next chance); non-positive disables")
 	resetCreditAutospendRaw := flags.String("reset-credit-autospend", string(proxy.ResetCreditAutospendWarn), "what the reset-credit sweep does with a credit worth spending now (early cook, expiring before the next chance, or a blocked Codex pool with demand): off (evaluate nothing), warn (log it and show reset_advice in /_subrouter/usage-status, spend nothing), or spend (redeem it). The redeem lock is per process: two hosts in spend mode that share accounts could both redeem for the same reset")
@@ -419,6 +420,9 @@ func serve(args []string) error {
 	cloudCredentialSource := flags.String("cloud-credential-source", "", "override the credential source loaded from the cloud config: team, local, or legacy")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if selectacct.MinNewSessionHeadroom <= 0 || selectacct.MinNewSessionHeadroom >= 1 {
+		return fmt.Errorf("--min-new-session-headroom must be between 0 and 1, got %v", selectacct.MinNewSessionHeadroom)
 	}
 	resetCreditAutospend, err := proxy.ParseResetCreditAutospend(*resetCreditAutospendRaw)
 	if err != nil {

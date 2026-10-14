@@ -106,10 +106,12 @@ type Scheduler struct {
 	capacity map[string]int
 }
 
-const (
-	MinNewSessionHeadroom     = 0.40
-	InflightPenaltyPerRequest = 0.15
-)
+// MinNewSessionHeadroom is the headroom an account needs to take a new
+// session. The worker's --min-new-session-headroom flag sets it once at
+// startup, before any routing; nothing changes it afterwards.
+var MinNewSessionHeadroom = 0.40
+
+const InflightPenaltyPerRequest = 0.15
 
 // MinStickyRetentionHeadroom is the headroom an account must still have for an
 // idle session to stay on it. It sits far below MinNewSessionHeadroom on
