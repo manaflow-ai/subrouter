@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -854,7 +855,7 @@ func codexConfigArgs(
 	model string,
 	forceAuthenticatedProvider bool,
 ) []string {
-	authConfig := "model_providers.subrouter." + codexSubrouterProviderAuth(accountID, forceAuthenticatedProvider)
+	authConfig := "model_providers.subrouter." + codexSubrouterProviderAuth(baseURL, accountID, forceAuthenticatedProvider)
 	return []string{
 		"-c", `model_provider="subrouter"`,
 		"-c", `model_providers.subrouter.name="Subrouter"`,
@@ -895,24 +896,56 @@ func codexRealtimeCallBaseURL(baseURL string) string {
 // dropped against the bundled catalog. The router replaces the client
 // credential with the pool account's, as it already does for plain Codex
 // clients that point openai_base_url at it.
-func codexSubrouterProviderAuth(accountID string, forceAuthenticatedProvider bool) string {
+//
+// The login's access token then reaches the router, so this applies only to a
+// loopback or tailnet router, and only to a login refreshed within the last
+// week: an older one may need a refresh that a revoked token would fail after
+// launch, where bearer mode needed no login. SUBROUTER_CODEX_CHATGPT_AUTH=0
+// turns it off, for example when the pool holds this same login's refresh
+// chain and two refreshers would invalidate each other.
+func codexSubrouterProviderAuth(baseURL, accountID string, forceAuthenticatedProvider bool) string {
 	if forceAuthenticatedProvider {
 		return `env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`
 	}
-	if accountID != "" && codexHasChatGPTLogin() {
+	if accountID != "" && strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_CHATGPT_AUTH")) != "0" &&
+		codexChatGPTAuthTrustedHost(baseURL) && codexHasFreshChatGPTLogin(time.Now()) {
 		return `requires_openai_auth=true`
 	}
 	return `experimental_bearer_token="subrouter"`
 }
 
-func codexHasChatGPTLogin() bool {
+const codexChatGPTLoginMaxAge = 7 * 24 * time.Hour
+
+func codexHasFreshChatGPTLogin(now time.Time) bool {
 	auth, ok, err := accounts.ReadActiveCodexAuth()
-	return err == nil && ok && auth.Tokens != nil &&
-		strings.TrimSpace(auth.Tokens.AccessToken) != "" && strings.TrimSpace(auth.Tokens.RefreshToken) != ""
+	if err != nil || !ok || auth.Tokens == nil || auth.RefreshFailure != nil ||
+		strings.TrimSpace(auth.Tokens.AccessToken) == "" || strings.TrimSpace(auth.Tokens.RefreshToken) == "" {
+		return false
+	}
+	refreshed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(auth.LastRefresh))
+	return err == nil && now.Sub(refreshed) < codexChatGPTLoginMaxAge
+}
+
+// codexChatGPTAuthTrustedHost accepts loopback, tailnet (100.64.0.0/10,
+// *.ts.net) and single-label MagicDNS hosts.
+func codexChatGPTAuthTrustedHost(baseURL string) bool {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		_, tailnet, _ := net.ParseCIDR("100.64.0.0/10")
+		return ip.IsLoopback() || tailnet.Contains(ip)
+	}
+	return host == "localhost" || strings.HasSuffix(host, ".ts.net") || !strings.Contains(host, ".")
 }
 
 func codexSubrouterProviderTable(baseURL, userEmail, accountID, model string, forceAuthenticatedProvider bool) string {
-	auth := codexSubrouterProviderAuth(accountID, forceAuthenticatedProvider)
+	auth := codexSubrouterProviderAuth(baseURL, accountID, forceAuthenticatedProvider)
 	return `{name="Subrouter",base_url=` + strconv.Quote(baseURL) + `,` + auth + `,wire_api="responses",supports_websockets=true,http_headers=` + codexSubrouterHeaders(userEmail, accountID, model) + `}`
 }
 

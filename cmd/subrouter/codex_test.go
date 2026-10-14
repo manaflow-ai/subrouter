@@ -12,6 +12,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"time"
 )
 
 func TestCodexArgsUsesAuthenticatedSubrouterProviderByDefault(t *testing.T) {
@@ -599,6 +600,7 @@ func TestCodexArgsKeepsCustomProviderAuthInResumableArguments(t *testing.T) {
 }
 
 func TestCodexArgsInjectsUserEmailAndAccountID(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
 	got := codexArgs([]string{"exec", "prompt"}, "http://127.0.0.1:31415/v1", "alice@example.com", "apikey:paid")
 	headers := `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-User-Email"="alice@example.com","X-Subrouter-Account-ID"="apikey:paid"}`
 	if !contains(got, headers) {
@@ -893,10 +895,14 @@ func TestCodexArgsRoutesRealtimeVoiceThroughSubrouter(t *testing.T) {
 func TestCodexArgsPinnedLaunchUsesChatGPTLoginSoCatalogTiersApply(t *testing.T) {
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
-	login := `{"tokens":{"id_token":"x.e30.y","access_token":"access","refresh_token":"refresh","account_id":"acct"}}`
-	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), []byte(login), 0o600); err != nil {
-		t.Fatal(err)
+	writeLogin := func(lastRefresh time.Time) {
+		t.Helper()
+		login := `{"tokens":{"id_token":"x.e30.y","access_token":"access","refresh_token":"refresh","account_id":"acct"},"last_refresh":"` + lastRefresh.UTC().Format(time.RFC3339Nano) + `"}`
+		if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), []byte(login), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
+	writeLogin(time.Now().Add(-time.Hour))
 
 	pinned := strings.Join(codexArgs([]string{"exec", "prompt"}, "http://router:31415/v1", "", "lawrence@manaflow.ai"), "\n")
 	if !strings.Contains(pinned, `model_providers.subrouter.requires_openai_auth=true`) ||
@@ -913,6 +919,19 @@ func TestCodexArgsPinnedLaunchUsesChatGPTLoginSoCatalogTiersApply(t *testing.T) 
 		t.Fatalf("unpinned launch must keep the pooled bearer provider:\n%s", unpinned)
 	}
 
+	hosted := strings.Join(codexArgs([]string{"exec", "prompt"}, "https://sr.example.com/t/key/v1", "", "lawrence@manaflow.ai"), "\n")
+	if strings.Contains(hosted, "requires_openai_auth") {
+		t.Fatalf("a non-tailnet router must not receive the ChatGPT login:\n%s", hosted)
+	}
+	t.Setenv("SUBROUTER_CODEX_CHATGPT_AUTH", "0")
+	if optOut := strings.Join(codexArgs([]string{"exec", "prompt"}, "http://router:31415/v1", "", "lawrence@manaflow.ai"), "\n"); strings.Contains(optOut, "requires_openai_auth") {
+		t.Fatalf("SUBROUTER_CODEX_CHATGPT_AUTH=0 must keep the bearer provider:\n%s", optOut)
+	}
+	t.Setenv("SUBROUTER_CODEX_CHATGPT_AUTH", "")
+	writeLogin(time.Now().Add(-8 * 24 * time.Hour))
+	if stale := strings.Join(codexArgs([]string{"exec", "prompt"}, "http://router:31415/v1", "", "lawrence@manaflow.ai"), "\n"); strings.Contains(stale, "requires_openai_auth") {
+		t.Fatalf("a login not refreshed for a week must keep the bearer provider:\n%s", stale)
+	}
 	if err := os.Remove(filepath.Join(codexHome, "auth.json")); err != nil {
 		t.Fatal(err)
 	}
