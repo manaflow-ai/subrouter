@@ -13,9 +13,10 @@ import (
 // restores nothing and keeps the optimistic default.
 const restoredUsageMaxAge = 2 * time.Hour
 
-// SeedScoresFromRestoredUsage puts the usage windows the previous worker saved
-// into the scheduler before the first live sweep, and returns how many
-// accounts it seeded.
+// SeedScoresFromRestoredUsage puts the Claude usage windows the previous
+// worker saved into the scheduler before the first live sweep, and returns
+// how many accounts it seeded. Codex is left to its own startup scores, which
+// read the shared score store and gate readiness.
 //
 // Only Codex scores were fetched before a new worker reported ready. Every
 // Claude account read as fully healthy until the first live sweep finished,
@@ -31,6 +32,9 @@ func (s Server) SeedScoresFromRestoredUsage(now time.Time) int {
 	all, generation := s.AccountRef.Snapshot()
 	scores := make([]selectacct.Score, 0, len(all))
 	for _, account := range oauthAccounts(all) {
+		if account.Provider != accounts.ProviderClaude {
+			continue
+		}
 		windows, ok := s.AccountRef.restoredUsageWindows(account, now)
 		if !ok {
 			continue
@@ -44,13 +48,18 @@ func (s Server) SeedScoresFromRestoredUsage(now time.Time) int {
 		return 0
 	}
 	if _, published := s.SchedulerRef.MergeScoresForAccountGeneration(scores, generation); !published {
+		if s.Logger != nil {
+			s.Logger.Warn("saved usage scores were not seeded; the account generation moved",
+				"accounts", len(scores), "generation", generation)
+		}
 		return 0
 	}
 	return len(scores)
 }
 
 // restoredUsageWindows returns the saved windows for account as of now: a
-// window whose reset has passed is dropped (its quota is back), and the rest
+// window whose reset has passed reads as unused (its quota is back; keeping
+// the window keeps the account in that window's model pool), and the rest
 // count down from now rather than from when they were observed.
 func (r *AccountRef) restoredUsageWindows(account accounts.Account, now time.Time) ([]accounts.UsageWindow, bool) {
 	key := account.ID + "\x00" + string(account.Provider)
@@ -71,6 +80,10 @@ func (r *AccountRef) restoredUsageWindows(account accounts.Account, now time.Tim
 		}
 		if !resetAt.IsZero() {
 			if !resetAt.After(now) {
+				window.UsedPercent = 0
+				window.ResetAt = time.Time{}
+				window.ResetAfterSeconds = 0
+				windows = append(windows, window)
 				continue
 			}
 			window.ResetAt = resetAt
@@ -78,8 +91,5 @@ func (r *AccountRef) restoredUsageWindows(account accounts.Account, now time.Tim
 		}
 		windows = append(windows, window)
 	}
-	if len(windows) == 0 {
-		return nil, false
-	}
-	return windows, true
+	return windows, len(windows) > 0
 }
