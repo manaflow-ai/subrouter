@@ -89,3 +89,32 @@ func TestRootHealthProbesAnswerLocally(t *testing.T) {
 		t.Fatalf("POST /v1/health = %d with %d upstream hits, want it forwarded once", response.StatusCode, upstreamHits.Load())
 	}
 }
+
+// TestRootHealthProbesStayBehindProxyAuth keeps the probe answer behind the
+// local proxy token and out of session-lease-only mode: a reorder of the
+// checks in proxyHandler must not turn these paths into an open endpoint.
+func TestRootHealthProbesStayBehindProxyAuth(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		server Server
+	}{
+		{"local proxy token", Server{Sessions: store, LocalProxyToken: "proxy-secret", MaxBodyBytes: 1 << 20}},
+		{"session lease required", Server{Sessions: store, RequireSessionLease: true, MaxBodyBytes: 1 << 20}},
+	} {
+		subrouter := httptest.NewServer(tc.server.Handler())
+		response, err := http.Get(subrouter.URL + "/healthz")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		subrouter.Close()
+		if response.StatusCode == http.StatusOK {
+			t.Fatalf("%s: GET /healthz without credentials = 200 %.200s, want it refused", tc.name, body)
+		}
+	}
+}
