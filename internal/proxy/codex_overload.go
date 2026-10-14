@@ -539,6 +539,8 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		if !failed {
 			if codexSuccessStatus(response.StatusCode) {
 				t.server.clearAccountCapacity(accountID, t.poolModel)
+				t.server.noteCodexCapacitySuccess(accountID, azureCodexSessionKeyFor(t.agent, t.session))
+				t.server.noteCodexSessionCapacitySuccess(t.agent, t.session, accountID)
 				t.server.recordCodexCapacityOutcome(t.poolModel, t.serviceTier, false)
 			}
 			if t.account != "" && accountID != t.account &&
@@ -564,12 +566,12 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		if keepAccount && attempt == 1 {
 			t.server.logFailoverKeptAccount("http", t.agent, t.session, accountID, t.inputTokens)
 		}
+		t.server.noteCodexSessionCapacityFailure(t.agent, t.session, accountID)
 		if failover {
 			// Marks steer later placement away from this account, and after
 			// repeated failures evict its sticky sessions. That is a switch,
 			// so it belongs to the opt-in failover only.
-			hint := codexCapacityRetryHint(response)
-			t.server.markAccountOverloaded(accountID, t.poolModel, t.serviceTier, config.capacityMarkTTL(hint))
+			_ = t.server.noteCodexCapacityFailure(accountID, azureCodexSessionKeyFor(t.agent, t.session), t.poolModel, t.serviceTier, reason, config.capacityMarkTTL(codexCapacityRetryHint(response)))
 		}
 		t.server.recordCodexCapacityOutcome(t.poolModel, t.serviceTier, true)
 
@@ -929,16 +931,19 @@ func (s Server) codexOverloadWebSocketRerouteWithPolicy(ctx context.Context, age
 			return false
 		}
 	}
+	if s.CodexOverloadFailover.enabled() && !keepAccount {
+		_ = s.noteCodexCapacityFailure(accountID, azureCodexSessionKeyFor(agentType, sessionID), model, tier,
+			codexCapacityReason(body, "websocket"), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
+	}
 	key := azureCodexSessionKeyFor(agentType, sessionID)
 	limit := codexOverloadMaxWebSocketReroutes
 	if persist {
 		limit = codexOverloadMaxPersistWebSocketReroutes
 	}
 	if !autonomous && !s.codexOverloadRerouteCounts.allow(key, limit) {
-		return false
-	}
-	if s.CodexOverloadFailover.enabled() && !keepAccount {
-		s.markAccountOverloaded(accountID, model, tier, s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
+		if s.codexCapacity == nil || !s.codexCapacity.allowPersistentReroute(key, accountID) {
+			return false
+		}
 	}
 	s.recordCodexCapacityOutcome(model, tier, true)
 	if s.Logger != nil {

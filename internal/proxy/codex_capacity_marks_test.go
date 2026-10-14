@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -17,6 +18,46 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/selectacct"
 )
+
+// The diagnostic endpoint exposes the same persistent holdout verdict that
+// the live failover uses after repeated failures across sessions.
+func TestCodexCapacityReportShowsPersistentHoldout(t *testing.T) {
+	server := Server{
+		Accounts:              []accounts.Account{{ID: "codex-account-0", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth}},
+		SchedulerRef:          selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+		CodexOverloadFailover: &CodexOverloadFailoverConfig{Enabled: true, MarkTTL: time.Minute},
+		AdminToken:            "capacity-admin",
+	}
+	for _, sessionKey := range []string{"session-one", "session-two", "session-three"} {
+		server.noteCodexCapacityFailure("codex-account-0", sessionKey, "gpt-6-astra", "default", "server_is_overloaded", time.Minute)
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+	req, err := http.NewRequest(http.MethodGet, proxy.URL+"/_subrouter/codex-capacity", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer capacity-admin")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", res.StatusCode)
+	}
+	var report struct {
+		Accounts []struct {
+			Persistent bool `json:"persistent"`
+		} `json:"accounts"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&report); err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Accounts) != 1 || !report.Accounts[0].Persistent {
+		t.Fatalf("report=%+v, want one persistent account", report.Accounts)
+	}
+}
 
 func codexCapacityPostBody(t *testing.T, proxyURL, body string) (int, string) {
 	t.Helper()

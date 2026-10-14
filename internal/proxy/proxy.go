@@ -210,6 +210,10 @@ type Server struct {
 	CodexEgress           *CodexEgressConfig
 	codexEgressSessions   *azureCodexSticky
 	codexEgressTransports []http.RoundTripper
+	// codexCapacity keeps per-account capacity history for the live failover
+	// policy and its diagnostics report.
+	codexCapacity         *codexCapacityStats
+	codexSessionBans      *codexSessionBans
 	CodexOverloadFailover *CodexOverloadFailoverConfig
 	// ClaudeOverloadReroute opts in to moving a Claude request to another
 	// account once after sustained overload
@@ -2873,6 +2877,12 @@ func (s Server) Handler() http.Handler {
 	if s.codexOverloadRerouteCounts == nil {
 		s.codexOverloadRerouteCounts = newCodexOverloadReroutes()
 	}
+	if s.codexCapacity == nil {
+		s.codexCapacity = newCodexCapacityStats()
+	}
+	if s.codexSessionBans == nil {
+		s.codexSessionBans = newCodexSessionBans()
+	}
 	if s.codexPersistLoops == nil {
 		s.codexPersistLoops = newCodexPersistLoops()
 	}
@@ -2928,6 +2938,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/transcripts/", s.requireAdmin(s.handleTranscriptDetail))
 	mux.HandleFunc("/_subrouter/bedrock-cost", s.requireAdmin(s.handleBedrockCost))
 	mux.HandleFunc("/_subrouter/azure-codex-cost", s.requireAdmin(s.handleAzureCodexCost))
+	mux.HandleFunc("/_subrouter/codex-capacity", s.requireAdmin(s.handleCodexCapacity))
 	mux.HandleFunc(PlacementStatsPath, s.requireAdmin(s.handlePlacementStats))
 	mux.HandleFunc(MetricsPath, s.requireAdmin(s.handleMetrics))
 	mux.HandleFunc("/_subrouter/token-usage", s.requireAdmin(s.handleTokenUsage))
@@ -6800,6 +6811,9 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			if provider == accounts.ProviderCodex && !codexChatGPTModelUnsupportedJSON(body) {
 				failureClass = codexTurnFailureClass(body)
 			}
+			if failureClass == codexFailureServer {
+				s.noteCodexSessionCapacityFailure(agentType, sessionID, accountID)
+			}
 			if failureClass != codexFailureNone && modelState.hasForwardedOutput() {
 				// The client already has part of this response. Rerouting
 				// now would replay response.create elsewhere and duplicate
@@ -6808,7 +6822,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				// by the usage-limit case below).
 				if failureClass == codexFailureServer && s.CodexOverloadFailover.enabled() &&
 					!s.CodexOverloadFailover.failoverKeepsAccount(modelState.inputTokenEstimate()) {
-					s.markAccountOverloaded(accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
+					s.noteCodexCapacityFailure(accountID, azureCodexSessionKeyFor(agentType, sessionID), webSocketTurnModel(modelState, poolModel), modelState.currentTier(), codexCapacityReason(body, "websocket"), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
 					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), true)
 				}
 				if s.Logger != nil {
@@ -6838,7 +6852,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					if provider == accounts.ProviderCodex && modelState.turnRetryable() {
 						model := webSocketTurnModel(modelState, poolModel)
 						if s.CodexOverloadFailover.enabled() && !s.CodexOverloadFailover.failoverKeepsAccount(modelState.inputTokenEstimate()) {
-							s.markAccountOverloaded(accountID, model, modelState.currentTier(), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
+							s.noteCodexCapacityFailure(accountID, azureCodexSessionKeyFor(agentType, sessionID), model, modelState.currentTier(), codexCapacityReason(body, "websocket"), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
 						}
 						s.recordCodexCapacityOutcome(model, modelState.currentTier(), true)
 						if s.Logger != nil {
@@ -6862,8 +6876,13 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 							return errAzureCodexWebSocketDivert
 						}
 					}
-					if modelState.capacityRetryable && codexCapacityFailureJSON(body) && s.codexRetryableCapacityWebSocketReroute(ctx, agentType, sessionID, modelState.capacityPersist) {
-						return errCodexWebSocketCapacityRetry
+					if modelState.capacityRetryable && codexCapacityFailureJSON(body) {
+						if s.CodexOverloadFailover.enabled() && s.CodexOverloadFailover.failoverKeepsAccount(modelState.inputTokenEstimate()) {
+							s.noteCodexCapacityFailure(accountID, azureCodexSessionKeyFor(agentType, sessionID), webSocketTurnModel(modelState, poolModel), modelState.currentTier(), codexCapacityReason(body, "websocket"), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
+						}
+						if s.codexRetryableCapacityWebSocketReroute(ctx, agentType, sessionID, modelState.capacityPersist) {
+							return errCodexWebSocketCapacityRetry
+						}
 					}
 				}
 			}
@@ -6895,6 +6914,8 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				s.recordWebSocketTokenUsage(provider, accountID, modelState.usageSessionKey, modelState, poolModel, body)
 				if codexWebSocketResponseCompleted(body) {
 					s.clearAccountCapacity(accountID, webSocketTurnModel(modelState, poolModel))
+					s.noteCodexCapacitySuccess(accountID, azureCodexSessionKeyFor(agentType, sessionID))
+					s.noteCodexSessionCapacitySuccess(agentType, sessionID, accountID)
 					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), false)
 				}
 				if codexWebSocketResponseFinished(body) {
@@ -8575,6 +8596,20 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	}
 	if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) {
 		availableAccounts = oauthAccounts(availableAccounts)
+	}
+	if provider == accounts.ProviderCodex {
+		availableAccounts = s.withoutCodexSessionBans(agentType, sessionID, availableAccounts)
+		if s.CodexOverloadFailover.enabled() && s.codexCapacity != nil {
+			kept := availableAccounts[:0]
+			for _, account := range availableAccounts {
+				if !s.codexCapacity.tainted(account.ID) {
+					kept = append(kept, account)
+				}
+			}
+			if len(kept) > 0 {
+				availableAccounts = kept
+			}
+		}
 	}
 	if provider == accounts.ProviderClaude && !options.allowFableAPIKeyPool && s.claudeFableEnabled() && claudeFableModel(model) {
 		// Fable order is subscription pool -> Bedrock -> dedicated API key, so
@@ -11813,6 +11848,12 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 		candidates := make([]accounts.Account, 0, len(allCandidates))
 		for _, account := range allCandidates {
 			if _, ok := tried[account.ID]; ok {
+				continue
+			}
+			if provider == accounts.ProviderCodex && s.codexSessionBanned(agentType, sessionID, account.ID) {
+				continue
+			}
+			if provider == accounts.ProviderCodex && s.CodexOverloadFailover.enabled() && s.codexCapacity != nil && s.codexCapacity.tainted(account.ID) {
 				continue
 			}
 			if oauthOnly && account.AuthMode != accounts.AuthModeOAuth {
