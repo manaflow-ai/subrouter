@@ -9488,6 +9488,39 @@ func codexModelCatalogRequest(r *http.Request) bool {
 	return r.URL.Path == "/models" || r.URL.Path == "/v1/models"
 }
 
+// codexCatalogCallerAccount maps an unpinned catalog request to the pool
+// account whose ChatGPT workspace the caller is signed in to. Codex sends its
+// own login's ChatGPT-Account-ID (the workspace ID), and a plain client
+// (openai_base_url) cannot add a pin header, so without this a Pro 500 user
+// sees only the tiers of an arbitrary pool account. A workspace ID that
+// several logins share is ambiguous and is ignored, unless exactly one of the
+// records is owner-keyed. Pinning by header is already open to every caller,
+// so this grants nothing new.
+func (s Server) codexCatalogCallerAccount(r *http.Request) (accounts.Account, bool) {
+	callerAccountID := strings.TrimSpace(r.Header.Get("ChatGPT-Account-ID"))
+	if callerAccountID == "" {
+		return accounts.Account{}, false
+	}
+	var all, owners []accounts.Account
+	for _, account := range oauthAccounts(filterAccountsForProvider(s.accountListContext(r.Context()), accounts.ProviderCodex)) {
+		if account.AccountID == callerAccountID {
+			all = append(all, account)
+			if strings.HasPrefix(account.ID, "codex-owner-") {
+				owners = append(owners, account)
+			}
+		}
+	}
+	// A legacy record can survive next to its owner-keyed replacement for the
+	// same login; the owner-keyed record is the canonical one.
+	switch {
+	case len(all) == 1:
+		return all[0], true
+	case len(owners) == 1:
+		return owners[0], true
+	}
+	return accounts.Account{}, false
+}
+
 // Entitlements differ per subscription (only some plans list the Ultrafast
 // tier), so a caller pinned to an OAuth account gets that account's catalog
 // under its own catalog session. The pin resolves among OAuth records only, so
@@ -9496,29 +9529,6 @@ func codexModelCatalogRequest(r *http.Request) bool {
 // OAuth account. A pinned refresh failure is final, like pinned /responses
 // traffic, and Codex falls back to its bundled catalog. The second result is
 // the pinned OAuth account ID, or empty.
-// codexCatalogCallerAccount maps an unpinned catalog request to the pool
-// account the caller is itself signed in as. Codex sends its own login's
-// ChatGPT-Account-ID, and a plain client (openai_base_url) cannot add a pin
-// header, so without this a Pro 500 user sees only the tiers of an arbitrary
-// pool account. A workspace ID shared by several stored records is ambiguous
-// and is ignored. Pinning by header is already open to every caller, so this
-// grants nothing new.
-func (s Server) codexCatalogCallerAccount(r *http.Request) (accounts.Account, bool) {
-	callerAccountID := strings.TrimSpace(r.Header.Get("ChatGPT-Account-ID"))
-	if callerAccountID == "" {
-		return accounts.Account{}, false
-	}
-	var match accounts.Account
-	matches := 0
-	for _, account := range oauthAccounts(filterAccountsForProvider(s.accountListContext(r.Context()), accounts.ProviderCodex)) {
-		if account.AccountID == callerAccountID {
-			match = account
-			matches++
-		}
-	}
-	return match, matches == 1
-}
-
 func (s Server) codexModelCatalogRoutingRequest(r *http.Request) (*http.Request, string) {
 	if forced, present, err := session.ExtractAccountIDWithPresence(r); err == nil && present && forced != "" {
 		available := oauthAccounts(filterAccountsForProvider(s.accountListContext(r.Context()), accounts.ProviderCodex))
@@ -9533,10 +9543,12 @@ func (s Server) codexModelCatalogRoutingRequest(r *http.Request) (*http.Request,
 	if account, ok := s.codexCatalogCallerAccount(r); ok {
 		request := r.Clone(r.Context())
 		request.Header = r.Header.Clone()
-		request.Header.Del("X-Subrouter-Account")
-		request.Header.Del("X-Subrouter-Model")
-		request.Header.Del("X-Model")
-		request.Header.Set("X-Subrouter-Account-ID", account.ID)
+		for _, header := range []string{"X-Subrouter-Account-ID", "X-Subrouter-Account", "X-Subrouter-Model", "X-Model"} {
+			request.Header.Del(header)
+		}
+		// A preference, not a pin: an exhausted caller account or a failed
+		// refresh falls back to the pool instead of failing the catalog.
+		request.Header.Set("X-Subrouter-Preferred-Account-ID", account.ID)
 		return request, account.ID
 	}
 	request := r.Clone(r.Context())

@@ -566,3 +566,59 @@ func TestCodexModelCatalogUsesCallersOwnPoolAccount(t *testing.T) {
 		t.Fatalf("shared catalog assignment = %#v, %t; want pro@example.com", assignment, ok)
 	}
 }
+
+func TestCodexModelCatalogCallerAccountPrefersOwnerRecordAndFallsBack(t *testing.T) {
+	codexUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"models":[{"slug":"`+request.Header.Get("Authorization")+`"}]}`)
+	}))
+	defer codexUpstream.Close()
+	upstream, err := url.Parse(codexUpstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newHandler := func(t *testing.T, ownerHeadroom float64) http.Handler {
+		t.Helper()
+		store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Put("codex", codexModelCatalogSessionID, "pro@example.com", ""); err != nil {
+			t.Fatal(err)
+		}
+		return Server{
+			CodexUpstream: upstream,
+			Accounts: []accounts.Account{
+				{ID: "pro@example.com", AuthMode: accounts.AuthModeOAuth, Token: "pro-token", AccountID: "pro-account"},
+				{ID: "me@example.com", AuthMode: accounts.AuthModeOAuth, Token: "legacy-token", AccountID: "my-account"},
+				{ID: "codex-owner-abc", AuthMode: accounts.AuthModeOAuth, Token: "owner-token", AccountID: "my-account"},
+			},
+			Sessions: store,
+			Scheduler: selectacct.NewScheduler([]selectacct.Score{
+				{AccountID: "pro@example.com", Headroom: 0.99, ShortHeadroom: 0.99},
+				{AccountID: "me@example.com", Headroom: 0, ShortHeadroom: 0},
+				{AccountID: "codex-owner-abc", Headroom: ownerHeadroom, ShortHeadroom: ownerHeadroom},
+			}),
+			MaxBodyBytes: 1024,
+		}.Handler()
+	}
+	fetch := func(t *testing.T, handler http.Handler) string {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.162.1", nil)
+		request.Header.Set("X-Subrouter-Agent", "codex")
+		request.Header.Set("ChatGPT-Account-ID", "my-account")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+		}
+		return response.Body.String()
+	}
+
+	if got := fetch(t, newHandler(t, 0.5)); got != `{"models":[{"slug":"Bearer owner-token"}]}` {
+		t.Fatalf("catalog = %s, want the owner-keyed record", got)
+	}
+	if got := fetch(t, newHandler(t, 0)); got == `{"models":[{"slug":"Bearer owner-token"}]}` {
+		t.Fatalf("catalog = %s, want a pool fallback while the caller's account is exhausted", got)
+	}
+}
