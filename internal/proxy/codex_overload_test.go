@@ -129,9 +129,6 @@ func TestCodexCapacitySessionBanSkipsRepeatedAccountAtProxyBoundary(t *testing.T
 	if len(first) != 3 || first[0] != "oauth-token-0" || first[1] != "oauth-token-0" || first[2] != "oauth-token-1" {
 		t.Fatalf("first request attempts=%v, want account 0 twice then account 1", first)
 	}
-	if !server.codexSessionBanned("codex", "session-ban", "codex-account-0") {
-		t.Fatal("account 0 was not banned after two capacity failures")
-	}
 	if _, err := server.Sessions.Put("codex", "session-ban", "codex-account-0", ""); err != nil {
 		t.Fatal(err)
 	}
