@@ -5518,7 +5518,7 @@ func (s Server) proxyHandler() http.Handler {
 			var pinnedCatalogAccount string
 			routingRequest, pinnedCatalogAccount = s.codexModelCatalogRoutingRequest(r)
 			if pinnedCatalogAccount != "" {
-				sessionID = codexModelCatalogSessionID + ":" + pinnedCatalogAccount
+				sessionID = codexPinnedModelCatalogSessionID(pinnedCatalogAccount)
 			}
 		}
 		// A caller-supplied account selector is a strict per-request binding, not
@@ -8003,7 +8003,7 @@ func websocketMessageType(messageType int) string {
 // saturated the upload, and filled the disk. Nothing about it is useful for
 // debugging an agent.
 func transcriptWorthRecording(sessionID string) bool {
-	return sessionID != codexModelCatalogSessionID && !strings.HasPrefix(sessionID, codexModelCatalogSessionID+":")
+	return sessionID != codexModelCatalogSessionID && !strings.HasPrefix(sessionID, codexPinnedModelCatalogSessionPrefix)
 }
 
 func (s Server) recordHTTPMeta(r *http.Request, agentType, sessionID, userEmail string, account accounts.Account, upstream *url.URL) {
@@ -9466,6 +9466,16 @@ func chatGPTBackendPath(path string) bool {
 }
 
 const codexModelCatalogSessionID = "internal:codex-model-catalog"
+
+// Codex sticky keys keep only the text before the first ':'
+// (session.BaseSessionID), so a pinned catalog session must not share the
+// "internal:" prefix, and the account ID's own ':' is replaced, or every
+// pinned catalog would collapse into the shared catalog session.
+const codexPinnedModelCatalogSessionPrefix = "internal-codex-model-catalog-pin."
+
+func codexPinnedModelCatalogSessionID(accountID string) string {
+	return codexPinnedModelCatalogSessionPrefix + strings.ReplaceAll(accountID, ":", "_")
+}
 
 // Codex asks its provider for richer runtime metadata using client_version.
 // The OpenAI API-key /models response has a different schema, so this request
