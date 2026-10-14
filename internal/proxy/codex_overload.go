@@ -617,8 +617,12 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			if t.server.recoveryCounters != nil {
 				t.server.recoveryCounters.add(accounts.ProviderCodex, "exhausted", t.clock())
 			}
+			t.server.labelCodexCapacityExhausted(req.Context(), response, t.poolModel, t.serviceTier)
 			return response, nil
 		}
+		// A switch is the plan's choice; the retarget below for an account
+		// the layer below already moved to is still the same account.
+		switching := plan.next != nil
 		if plan.next == nil && accountID != addressed.ID {
 			// "Same account" is the account that answered, not the one this
 			// layer addressed: replaying the old request would send it back
@@ -650,6 +654,11 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		}
 		previous := accountID
 		attemptReq = nextReq
+		if switching {
+			t.server.codexCapacityCounters.add(codexCapacityCounterAccountSwitch)
+		} else {
+			t.server.codexCapacityCounters.add(codexCapacityCounterSameAccountRetry)
+		}
 		if plan.next != nil {
 			t.server.SchedulerRef.NoteFailover(accounts.ProviderCodex, accountID, selectacct.FailoverCapacity)
 			accountID = plan.next.ID
@@ -809,13 +818,21 @@ func (t codexOverloadFailoverTransport) logOverload(message, accountID, reason s
 // this pool, and a session leaves it only once it keeps failing
 // (selectacct.CapacityStickyEvictFailures).
 func (s *Server) markAccountOverloaded(accountID, model, tier string, ttl time.Duration) int {
+	return s.markAccountOverloadedReason(accountID, model, tier, "", ttl)
+}
+
+// markAccountOverloadedReason is markAccountOverloaded that labels the mark
+// with the failure's reason (codexCapacityReason or the HTTP classifier's),
+// shown in the traffic and usage-status capacity marks.
+func (s *Server) markAccountOverloadedReason(accountID, model, tier, reason string, ttl time.Duration) int {
 	if s == nil || s.SchedulerRef == nil || accountID == "" {
 		return 0
 	}
-	failures := s.SchedulerRef.MarkCapacityUntil(accounts.ProviderCodex, accountID, model, tier, time.Now().Add(ttl))
+	failures := s.SchedulerRef.MarkCapacityReasonUntil(accounts.ProviderCodex, accountID, model, tier, reason, time.Now().Add(ttl))
+	s.codexCapacityCounters.add(codexCapacityCounterMark)
 	if s.Logger != nil {
 		s.Logger.Warn("codex account marked at capacity for this model pool", "account", accountID,
-			"pool", selectacct.CapacityPoolKey(model, tier), "failures", failures, "ttl", ttl.String())
+			"pool", selectacct.CapacityPoolKey(model, tier), "failures", failures, "reason", reason, "ttl", ttl.String())
 	}
 	return failures
 }
@@ -946,6 +963,7 @@ func (s Server) codexOverloadWebSocketRerouteWithPolicy(ctx context.Context, age
 		}
 	}
 	s.recordCodexCapacityOutcome(model, tier, true)
+	s.codexCapacityCounters.add(codexCapacityCounterAccountSwitch)
 	if s.Logger != nil {
 		s.Logger.Warn("codex websocket turn hit a capacity error; closing 1012 so the session reconnects",
 			"agent", agentType, "session", sessionID, "account", accountID, "persist", persist, "autonomous", autonomous)

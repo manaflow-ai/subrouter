@@ -84,6 +84,9 @@ type TrafficSnapshot struct {
 	Streams       StreamDropSummary `json:"stream_drops"`
 	Failures      []TrafficFailure  `json:"failures,omitempty"`
 	Admission     admissionSnapshot `json:"admission,omitempty"`
+	// CodexCapacity is the live Codex capacity marks (accounts hashed) and
+	// what the capacity retry has done in this process.
+	CodexCapacity *codexCapacityTraffic `json:"codex_capacity,omitempty"`
 }
 
 // TrafficByClass groups completed responses by status class.
@@ -346,5 +349,6 @@ func (s Server) handleTraffic(w http.ResponseWriter, _ *http.Request) {
 	if s.admission != nil {
 		snapshot.Admission = s.admission.snapshot()
 	}
+	snapshot.CodexCapacity = s.codexCapacityTrafficSnapshot()
 	writeJSON(w, snapshot)
 }

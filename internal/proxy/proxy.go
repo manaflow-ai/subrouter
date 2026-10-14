@@ -230,7 +230,10 @@ type Server struct {
 	// their own account, per provider.
 	overloadHeld     *overloadHeldGauge
 	recoveryCounters *recoveryCounterStore
-	retryStatuses    *retryStatusRegistry
+	// codexCapacityCounters counts what the Codex capacity retry did
+	// (same-account retries, switches, exhaustion, marks) for traffic.
+	codexCapacityCounters *codexCapacityCounterStore
+	retryStatuses         *retryStatusRegistry
 	// softMoveState remembers recent capacity-driven session moves. It is
 	// initialized with the request handler so copies of Server share the same
 	// bounded in-process state.
@@ -1184,6 +1187,9 @@ type AccountUsageStatus struct {
 	UsageFresh            bool      `json:"-"`
 	AccountWideUsageFresh bool      `json:"-"`
 	UsageFetchedAt        time.Time `json:"usage_fetched_at,omitzero"`
+	// CapacityMarks is a Codex account's live capacity marks, one per
+	// (model, tier) pool; omitted when it has none.
+	CapacityMarks []AccountCapacityMark `json:"capacity_marks,omitempty"`
 }
 
 // withWeeklyCooked fills each status's WeeklyCooked verdict from its windows,
@@ -2898,6 +2904,9 @@ func (s Server) Handler() http.Handler {
 	if s.recoveryCounters == nil {
 		s.recoveryCounters = &recoveryCounterStore{}
 	}
+	if s.codexCapacityCounters == nil {
+		s.codexCapacityCounters = &codexCapacityCounterStore{}
+	}
 	if s.retryStatuses == nil {
 		s.retryStatuses = newRetryStatusRegistry()
 	}
@@ -3252,7 +3261,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			}
 			s.updateSchedulerFromUsageStatusesAtScoreRevision(r.Context(), statuses, scoreRevision)
 		}
-		writeJSON(w, s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses)))))))
+		writeJSON(w, s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses))))))))
 		return
 	}
 	accounts := s.accountListContext(r.Context())
@@ -3270,7 +3279,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	out = s.withKeyedProviderHealth(r.Context(), out)
-	writeJSON(w, s.withClaudeCostTiers(withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(out)))))
+	writeJSON(w, s.withCodexCapacityMarks(s.withClaudeCostTiers(withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(out))))))
 }
 
 func (s Server) handleQwenConsoleImport(w http.ResponseWriter, r *http.Request) {
@@ -6959,6 +6968,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 							s.noteCodexCapacityFailure(accountID, azureCodexSessionKeyFor(agentType, sessionID), model, modelState.currentTier(), codexCapacityReason(body, "websocket"), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
 						}
 						s.recordCodexCapacityOutcome(model, modelState.currentTier(), true)
+						s.codexCapacityCounters.add(codexCapacityCounterSameAccountRetry)
 						if s.Logger != nil {
 							s.Logger.Warn("codex websocket turn hit a capacity error; retrying behind the open client socket",
 								"agent", agentType, "session", sessionID, "account", accountID)

@@ -587,14 +587,14 @@ func (s *Server) noteCodexCapacityFailure(accountID, sessionKey, poolModel, tier
 	verdict := s.codexCapacity.noteFailure(accountID, sessionKey, reason, base, s.codexOAuthPoolSize())
 	if verdict.Tainted {
 		// Pool-wide: the rate rule judged the account, not one model.
-		s.markAccountOverloaded(accountID, "", tier, verdict.MarkTTL)
+		s.markAccountOverloadedReason(accountID, "", tier, reason, verdict.MarkTTL)
 		if s.Logger != nil {
 			s.Logger.Warn("codex account tainted by capacity failure rate; removed from the pool",
 				"account", accountID, "streak", verdict.Streak, "holdout", verdict.MarkTTL.String())
 		}
 		return verdict
 	}
-	s.markAccountOverloaded(accountID, poolModel, tier, verdict.MarkTTL)
+	s.markAccountOverloadedReason(accountID, poolModel, tier, reason, verdict.MarkTTL)
 	if verdict.Persistent && s.Logger != nil {
 		s.Logger.Warn("codex account persistently at capacity; held out on escalated mark",
 			"account", accountID, "pool", poolModel, "streak", verdict.Streak, "retry", verdict.Retry, "ttl", verdict.MarkTTL.String())
