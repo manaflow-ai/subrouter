@@ -854,10 +854,7 @@ func codexConfigArgs(
 	model string,
 	forceAuthenticatedProvider bool,
 ) []string {
-	authConfig := `model_providers.subrouter.experimental_bearer_token="subrouter"`
-	if forceAuthenticatedProvider {
-		authConfig = `model_providers.subrouter.env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`
-	}
+	authConfig := "model_providers.subrouter." + codexSubrouterProviderAuth(accountID, forceAuthenticatedProvider)
 	return []string{
 		"-c", `model_provider="subrouter"`,
 		"-c", `model_providers.subrouter.name="Subrouter"`,
@@ -890,11 +887,32 @@ func codexRealtimeCallBaseURL(baseURL string) string {
 	return codexProxyRootURL(baseURL) + "/v1"
 }
 
-func codexSubrouterProviderTable(baseURL, userEmail, accountID, model string, forceAuthenticatedProvider bool) string {
-	auth := `experimental_bearer_token="subrouter"`
+// codexSubrouterProviderAuth picks how the Codex child authenticates to the
+// Subrouter provider. A pinned launch with a ChatGPT login uses that login
+// (requires_openai_auth): only then does Codex fetch the provider's model
+// catalog, which the router serves from the pinned account, so tiers that
+// only some plans have (Ultrafast) are offered and sent instead of being
+// dropped against the bundled catalog. The router replaces the client
+// credential with the pool account's, as it already does for plain Codex
+// clients that point openai_base_url at it.
+func codexSubrouterProviderAuth(accountID string, forceAuthenticatedProvider bool) string {
 	if forceAuthenticatedProvider {
-		auth = `env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`
+		return `env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`
 	}
+	if accountID != "" && codexHasChatGPTLogin() {
+		return `requires_openai_auth=true`
+	}
+	return `experimental_bearer_token="subrouter"`
+}
+
+func codexHasChatGPTLogin() bool {
+	auth, ok, err := accounts.ReadActiveCodexAuth()
+	return err == nil && ok && auth.Tokens != nil &&
+		strings.TrimSpace(auth.Tokens.AccessToken) != "" && strings.TrimSpace(auth.Tokens.RefreshToken) != ""
+}
+
+func codexSubrouterProviderTable(baseURL, userEmail, accountID, model string, forceAuthenticatedProvider bool) string {
+	auth := codexSubrouterProviderAuth(accountID, forceAuthenticatedProvider)
 	return `{name="Subrouter",base_url=` + strconv.Quote(baseURL) + `,` + auth + `,wire_api="responses",supports_websockets=true,http_headers=` + codexSubrouterHeaders(userEmail, accountID, model) + `}`
 }
 

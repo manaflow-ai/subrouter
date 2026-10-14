@@ -565,6 +565,7 @@ func TestCodexArgsInjectsUserEmailWithCustomSubrouterProvider(t *testing.T) {
 }
 
 func TestCodexArgsInjectsAccountIDWithCustomSubrouterProvider(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
 	got := codexArgs([]string{"exec", "prompt"}, "http://127.0.0.1:31415/v1", "", "team-codex-1")
 	want := []string{
 		"exec",
@@ -586,6 +587,7 @@ func TestCodexArgsInjectsAccountIDWithCustomSubrouterProvider(t *testing.T) {
 }
 
 func TestCodexArgsKeepsCustomProviderAuthInResumableArguments(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
 	got := codexArgs([]string{"exec", "prompt"}, "http://127.0.0.1:31415/v1", "", "team-codex-1")
 	joined := strings.Join(got, "\n")
 	if strings.Contains(joined, `env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`) {
@@ -885,5 +887,37 @@ func TestCodexArgsRoutesRealtimeVoiceThroughSubrouter(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCodexArgsPinnedLaunchUsesChatGPTLoginSoCatalogTiersApply(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	login := `{"tokens":{"id_token":"x.e30.y","access_token":"access","refresh_token":"refresh","account_id":"acct"}}`
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), []byte(login), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	pinned := strings.Join(codexArgs([]string{"exec", "prompt"}, "http://router:31415/v1", "", "lawrence@manaflow.ai"), "\n")
+	if !strings.Contains(pinned, `model_providers.subrouter.requires_openai_auth=true`) ||
+		!strings.Contains(pinned, `requires_openai_auth=true,wire_api="responses"`) ||
+		strings.Contains(pinned, `experimental_bearer_token`) {
+		t.Fatalf("pinned launch with a ChatGPT login must authenticate with it so Codex loads the pinned catalog:\n%s", pinned)
+	}
+	if !strings.Contains(pinned, `"X-Subrouter-Account-ID"="lawrence@manaflow.ai"`) {
+		t.Fatalf("pinned launch lost its account header:\n%s", pinned)
+	}
+
+	unpinned := strings.Join(codexArgs([]string{"exec", "prompt"}, "http://router:31415/v1", "", ""), "\n")
+	if !strings.Contains(unpinned, `experimental_bearer_token="subrouter"`) || strings.Contains(unpinned, "requires_openai_auth") {
+		t.Fatalf("unpinned launch must keep the pooled bearer provider:\n%s", unpinned)
+	}
+
+	if err := os.Remove(filepath.Join(codexHome, "auth.json")); err != nil {
+		t.Fatal(err)
+	}
+	noLogin := strings.Join(codexArgs([]string{"exec", "prompt"}, "http://router:31415/v1", "", "lawrence@manaflow.ai"), "\n")
+	if !strings.Contains(noLogin, `experimental_bearer_token="subrouter"`) {
+		t.Fatalf("pinned launch without a ChatGPT login must keep the bearer provider:\n%s", noLogin)
 	}
 }
