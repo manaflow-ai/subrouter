@@ -448,7 +448,12 @@ func (s Server) recordUpstreamFailure(req *http.Request, a *upstreamAttempt, acc
 	}
 	if err != nil {
 		event.ErrorClass = trafficErrorClass(err)
-		if event.ErrorClass == "proxy_error" {
+		switch {
+		case errors.Is(err, errAdmissionQueueFull):
+			event.Status, event.ErrorClass = http.StatusServiceUnavailable, "admission_queue_full"
+		case errors.Is(err, errAdmissionPaused):
+			event.Status, event.ErrorClass = http.StatusServiceUnavailable, "admission_paused"
+		case event.ErrorClass == "proxy_error":
 			event.ErrorClass = "transport_error"
 		}
 		event.Message = boundedErrorText(err.Error())

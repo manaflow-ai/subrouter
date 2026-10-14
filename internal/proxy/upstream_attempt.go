@@ -140,6 +140,9 @@ func (t inflightAttemptTransport) RoundTrip(req *http.Request) (*http.Response, 
 		var err error
 		admission, err = t.attempt.server.admission.acquire(req.Context(), key)
 		if err != nil {
+			// A limiter rejection never reaches the upstream, so the error
+			// recorder below never sees it; record it here.
+			t.attempt.server.recordUpstreamFailure(req, t.attempt, account, nil, err)
 			return nil, err
 		}
 	}

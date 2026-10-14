@@ -10872,6 +10872,31 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		addressed := accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential}
 		response, err := a.send(base, attemptReq, addressed)
 		response = tagRoutedResponseAccount(response, addressed)
+		// The admission limiter turned this account away before any upstream
+		// call (its queue is full, or it is paused after a rate limit). Nothing
+		// was sent, so another account can take the request; answering 503
+		// held whole sessions on one paused account while others had room.
+		if admissionRejected(err) && a.replayable() && req.Context().Err() == nil &&
+			attempt < maxAttempts && t.server != nil {
+			tried[accountID] = struct{}{}
+			next, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
+			if pickErr == nil {
+				if nextReq, replayErr := a.replay(replayReq, &next); replayErr == nil {
+					if t.logger != nil {
+						t.logger.Warn("admission rejected the account; failing over",
+							"agent", t.agent, "session", t.session, "from_account", accountID,
+							"to_account", next.ID, "reason", err.Error(), "attempt", attempt)
+					}
+					accountID = next.ID
+					accountCredential = next.CredentialIdentity()
+					tried[accountID] = struct{}{}
+					attemptReq = nextReq
+					quotaFailedOver = true
+					failoverReason = accountMoveCapacity
+					continue
+				}
+			}
+		}
 		if err != nil || !a.replayable() || req.Context().Err() != nil {
 			return response, tagRoutedAttemptError(err, attemptReq, addressed)
 		}
