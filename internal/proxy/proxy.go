@@ -11032,7 +11032,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 					// A request that already failed over off a paused or
 					// exhausted sticky account still moves the session, to
 					// whichever account finally serves it.
-					if errors.Is(err, errAdmissionQueueFull) && !errors.Is(err, errAdmissionPaused) {
+					// A sticky account that stays full moves the session after
+					// admissionOverflowMoveAfter overflows in a row.
+					if errors.Is(err, errAdmissionQueueFull) && !errors.Is(err, errAdmissionPaused) &&
+						!t.server.admission.noteQueueFullOverflow(admissionSessionKey{agent: t.agent, session: t.session}, accountID) {
 						if spilledFrom == "" && !quotaFailedOver {
 							spilledFrom = accountID
 						}

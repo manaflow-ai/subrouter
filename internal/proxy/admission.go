@@ -130,7 +130,17 @@ type admissionSession struct {
 	spilled  uint64
 	account  string
 	lastSeen time.Time
+	// overflowFrom and overflowStreak count consecutive queue-full overflows
+	// off one sticky account; an admitted attempt there resets them.
+	overflowFrom   string
+	overflowStreak int
 }
+
+// admissionOverflowMoveAfter is how many queue-full overflows in a row move a
+// session off its sticky account. One overflow keeps the session, and its
+// prompt cache, where it is; a sticky account that stays full would instead
+// make every turn re-write the cache on a random account.
+const admissionOverflowMoveAfter = 3
 
 const (
 	// admissionSessionIdle is how long an idle session's counters are kept,
@@ -283,9 +293,37 @@ func (a *admissionControl) grantSessionLocked(who admissionSessionKey, account s
 	entry.active++
 	entry.served++
 	entry.account = account
+	if account == entry.overflowFrom {
+		entry.overflowFrom, entry.overflowStreak = "", 0
+	}
 	if load := entry.active + entry.queued; load > entry.peak {
 		entry.peak = load
 	}
+}
+
+// noteQueueFullOverflow records one queue-full overflow off from and reports
+// whether the session should now move: the streak reached
+// admissionOverflowMoveAfter, which also resets it.
+func (a *admissionControl) noteQueueFullOverflow(who admissionSessionKey, from string) bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	entry := a.sessionLocked(who, time.Now())
+	if entry == nil {
+		return false
+	}
+	entry.spilled++
+	if entry.overflowFrom != from {
+		entry.overflowFrom, entry.overflowStreak = from, 0
+	}
+	entry.overflowStreak++
+	if entry.overflowStreak < admissionOverflowMoveAfter {
+		return false
+	}
+	entry.overflowFrom, entry.overflowStreak = "", 0
+	return true
 }
 
 func (a *admissionControl) noteSpill(who admissionSessionKey) {

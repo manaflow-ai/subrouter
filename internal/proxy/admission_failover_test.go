@@ -220,3 +220,78 @@ func TestQueueFullAfterPausedFailoverStillMovesSession(t *testing.T) {
 		t.Fatalf("session assignment = %+v (found %v), want it moved off the paused account to last@example.com", assignment, ok)
 	}
 }
+
+// TestQueueFullOverflowMovesSessionAfterStreak drives Server.Handler(): while
+// the sticky account stays full, the first overflows keep the session (and its
+// prompt cache) in place, and the admissionOverflowMoveAfter-th moves it.
+func TestQueueFullOverflowMovesSessionAfterStreak(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = w.Write([]byte(`{"id":"msg_ok","type":"message"}`))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("claude", "session-pinned", "pinned@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	control := testAdmissionControl(defaultAdmissionLimit, defaultAdmissionQueue)
+	control.limit, control.queueCap = 1, 0
+	for _, model := range []string{"", "default", "claude-opus", "claude-sonnet", "claude-fable"} {
+		if _, err := control.acquire(context.Background(), admissionKeyFor(accounts.ProviderClaude, "pinned@example.com", model)); err != nil && !admissionRejected(err) {
+			t.Fatal(err)
+		}
+	}
+	handler := Server{
+		ClaudeUpstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "pinned@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-pinned"},
+			{ID: "free@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-free"},
+		},
+		Sessions: store,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "pinned@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+			{AccountID: "free@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		})),
+		MaxBodyBytes: 1 << 20,
+		admission:    control,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	for turn := 1; turn <= admissionOverflowMoveAfter; turn++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, subrouter.URL+"/v1/messages", strings.NewReader(`{"model":"claude-opus-5-5","messages":[]}`))
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Subrouter-Agent", "claude")
+		req.Header.Set("X-Subrouter-Session", "session-pinned")
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			cancel()
+			t.Fatalf("turn %d did not complete: %v", turn, err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		response.Body.Close()
+		cancel()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("turn %d status = %d, want 200 from the free account", turn, response.StatusCode)
+		}
+		want := "pinned@example.com"
+		if turn == admissionOverflowMoveAfter {
+			want = "free@example.com"
+		}
+		if assignment, ok := store.Get("claude", "session-pinned"); !ok || assignment.AccountID != want {
+			t.Fatalf("after turn %d session assignment = %+v (found %v), want %s", turn, assignment, ok, want)
+		}
+	}
+}
