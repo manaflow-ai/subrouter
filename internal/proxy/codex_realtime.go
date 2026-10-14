@@ -12,6 +12,7 @@ import (
 	"strings"
 )
 
+// codexOAuthRequiredPath reports whether Codex must use a ChatGPT OAuth account for path.
 func codexOAuthRequiredPath(path string) bool {
 	return chatGPTBackendPath(path) || codexLivePath(path)
 }
@@ -19,6 +20,7 @@ func codexOAuthRequiredPath(path string) bool {
 // Codex 0.161 creates ChatGPT-auth WebRTC calls on the ChatGPT backend, but
 // joins them using the same OAuth identity at api.openai.com/v1/live/<call-id>.
 // These paths must retain /v1 when forwarded to the API origin.
+// codexLivePath reports whether path is a supported Codex realtime endpoint.
 func codexLivePath(path string) bool {
 	if path == "/v1/live" {
 		return true
@@ -27,6 +29,7 @@ func codexLivePath(path string) bool {
 	return ok && validRealtimeCallID(id)
 }
 
+// validRealtimeCallID rejects path characters that could escape the call endpoint.
 func validRealtimeCallID(id string) bool {
 	if len(id) == 0 || len(id) > 256 || id == "." || id == ".." {
 		return false
@@ -39,6 +42,7 @@ func validRealtimeCallID(id string) bool {
 	return true
 }
 
+// realtimeCallID extracts and validates a call id from the setup Location header.
 func realtimeCallID(location string) string {
 	u, err := url.Parse(location)
 	if err != nil {
@@ -56,6 +60,7 @@ const maxRealtimeCallBodyBytes = 8 << 20
 
 // Only the finite SDP/session setup body is buffered. Audio and sideband
 // events use the existing full-duplex websocket relay, never this decoder.
+// rewriteRealtimeCallBody converts Codex multipart setup into ChatGPT JSON.
 func rewriteRealtimeCallBody(request *http.Request) error {
 	if request.Body == nil {
 		return fmt.Errorf("missing request body")
