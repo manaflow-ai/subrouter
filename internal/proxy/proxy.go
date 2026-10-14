@@ -6067,8 +6067,8 @@ func (s Server) proxyHandler() http.Handler {
 		rp.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 			markUpstreamResponse(r.Context(), false)
 			markTrafficErrorClass(r.Context(), trafficErrorClass(err))
-			if errors.Is(err, errAdmissionQueueFull) {
-				http.Error(w, "upstream admission queue is full", http.StatusServiceUnavailable)
+			if admissionRejected(err) {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
 				return
 			}
 			if s.Logger != nil {

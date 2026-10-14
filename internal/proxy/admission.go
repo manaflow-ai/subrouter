@@ -47,6 +47,9 @@ type admissionKey struct {
 
 type admissionWaiter struct {
 	ready chan struct{}
+	// rejected is set under the control mutex before ready is closed when a
+	// long pause turns the waiter away instead of granting it a slot.
+	rejected bool
 }
 
 type admissionBucket struct {
@@ -168,15 +171,23 @@ func (a *admissionControl) acquire(ctx context.Context, key admissionKey) (*admi
 			if stop != nil {
 				stop()
 			}
+			if waiter.rejected {
+				return nil, errAdmissionPaused
+			}
 			return &admissionLease{control: a, key: key}, nil
 		case <-ctx.Done():
 			if stop != nil {
 				stop()
 			}
 			if !a.cancelWaiter(key, waiter) {
-				// A release won the race and already granted this waiter.
-				// Return that slot before reporting cancellation.
-				a.release(key)
+				// A release or a long pause already took this waiter. Return the
+				// slot only if it was granted; a rejected waiter holds none.
+				a.mu.Lock()
+				rejected := waiter.rejected
+				a.mu.Unlock()
+				if !rejected {
+					a.release(key)
+				}
 			}
 			return nil, ctx.Err()
 		case <-timer:
@@ -237,6 +248,16 @@ func (a *admissionControl) pause(key admissionKey, until time.Time) {
 	bucket.throttled++
 	if until.After(bucket.pausedTil) {
 		bucket.pausedTil = until
+	}
+	// Requests already queued would otherwise sit out the whole pause. Turn
+	// them away like new attempts so their callers can fail over.
+	if bucket.pausedTil.Sub(time.Now()) > admissionPauseWaitMax {
+		for _, waiter := range bucket.waiters {
+			waiter.rejected = true
+			close(waiter.ready)
+		}
+		bucket.blocked += uint64(len(bucket.waiters))
+		bucket.waiters = nil
 	}
 	a.mu.Unlock()
 }
