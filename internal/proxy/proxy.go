@@ -10842,6 +10842,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	// retry uses it too for consistency, though today it only runs for
 	// providers that never strip.
 	replayReq := req
+	// spilledFrom is the sticky account an admission spill moved this
+	// request off. Such a request never moves the session, whatever later
+	// answers it: the sticky account was only busy.
+	spilledFrom := ""
+	defer a.releaseReserved()
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		// A denial can arrive while another request still holds the sticky
 		// assignment. Re-check the controller immediately before every physical
@@ -10872,11 +10877,15 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// A session fanning out (subagents, workflows) shares one sticky
 		// account, so its requests queue behind that account's admission
 		// limit while the rest of the pool idles. Place this one request on
-		// the least-loaded account with a free slot instead. Stickiness stays
-		// put: moving it would move the whole fan-out and its hot spot.
-		if next, ok := t.admissionSpill(req.Context(), accountID, tried); ok {
+		// the least-loaded account with a free slot instead, holding that
+		// slot. Stickiness stays put: moving it would move the whole fan-out
+		// and its hot spot. The sticky account stays out of tried: it never
+		// answered, so a later quota failover may still come back to it.
+		if next, lease, ok := t.admissionSpill(req.Context(), accountID, tried); ok {
 			nextReq, replayErr := a.replay(replayReq, &next)
-			if replayErr == nil {
+			if replayErr != nil {
+				lease.release()
+			} else {
 				if t.logger != nil {
 					t.logger.Info("admission spill",
 						"agent", t.agent,
@@ -10885,7 +10894,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 						"to_account", next.ID,
 						"pool_model", t.poolModel)
 				}
-				tried[accountID] = struct{}{}
+				a.reserve(lease)
+				if spilledFrom == "" {
+					spilledFrom = accountID
+				}
 				accountID = next.ID
 				accountCredential = next.CredentialIdentity()
 				tried[accountID] = struct{}{}
@@ -11066,6 +11078,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if !quotaFailedOver && t.pendingMoveReason != "" {
 				commitReason = t.pendingMoveReason
 			}
+			if spilledFrom != "" {
+				return response, nil
+			}
 			if err := t.commitSuccessfulFailover(response, attempt, accountID, commitReason); err != nil {
 				if response.Body != nil {
 					_ = response.Body.Close()
@@ -11190,6 +11205,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			commitReason := failoverReason
 			if !quotaFailedOver && t.pendingMoveReason != "" {
 				commitReason = t.pendingMoveReason
+			}
+			if spilledFrom != "" {
+				return response, nil
 			}
 			if err := t.commitSuccessfulFailover(response, attempt, accountID, commitReason); err != nil {
 				if response.Body != nil {
@@ -11405,15 +11423,15 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 // account's admission queue is long: the least-loaded Claude subscription
 // account of the same auth mode that would admit it now and has headroom for
 // the pool model. It returns false to keep the request where it is.
-func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID string, tried map[string]struct{}) (accounts.Account, bool) {
+func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID string, tried map[string]struct{}) (accounts.Account, *admissionLease, bool) {
 	s := t.server
 	if s == nil || s.admission == nil || s.CredentialBroker != nil || t.provider != accounts.ProviderClaude ||
 		t.attempt == nil || !t.attempt.replayable() {
-		return accounts.Account{}, false
+		return accounts.Account{}, nil, false
 	}
 	provider := schedulerAccountProvider(t.provider)
 	if !s.admission.shouldSpill(admissionKeyFor(provider, accountID, t.poolModel)) {
-		return accounts.Account{}, false
+		return accounts.Account{}, nil, false
 	}
 	all := filterAccountsForProvider(s.accountListContext(ctx), t.provider)
 	authMode := accounts.AuthModeOAuth
@@ -11457,20 +11475,27 @@ func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID 
 			}
 		}
 		if bestLoad < 0 {
-			return accounts.Account{}, false
+			return accounts.Account{}, nil, false
+		}
+		// Another spiller may have taken the slot since freeLoad looked.
+		lease, ok := s.admission.tryAcquire(admissionKeyFor(schedulerAccountProvider(best.Provider), best.ID, t.poolModel))
+		if !ok {
+			skip[best.ID] = struct{}{}
+			continue
 		}
 		if best.AuthMode == accounts.AuthModeAPIKey {
-			return best, true
+			return best, lease, true
 		}
 		refreshed, err := s.refreshAccount(ctx, best)
 		if err != nil {
+			lease.release()
 			if ctx.Err() != nil {
-				return accounts.Account{}, false
+				return accounts.Account{}, nil, false
 			}
 			skip[best.ID] = struct{}{}
 			continue
 		}
-		return refreshed, true
+		return refreshed, lease, true
 	}
 }
 

@@ -287,6 +287,25 @@ func (a *admissionControl) shouldSpill(key admissionKey) bool {
 	return bucket != nil && len(bucket.waiters) >= a.spillQueue
 }
 
+// tryAcquire admits a request on key only if it can start now. A spill
+// reserves its target this way, under the same lock that counts the slot,
+// so concurrent spillers see each other and spread out instead of all
+// picking the one account that looked free.
+func (a *admissionControl) tryAcquire(key admissionKey) (*admissionLease, bool) {
+	if a == nil || key.account == "" {
+		return nil, false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	bucket := a.bucketLocked(key)
+	if len(bucket.waiters) > 0 || bucket.active >= a.limit || bucket.pausedTil.After(time.Now()) {
+		return nil, false
+	}
+	bucket.active++
+	bucket.served++
+	return &admissionLease{control: a, key: key}, true
+}
+
 // freeLoad reports whether key would admit a request immediately, and how
 // many requests it is already serving, for picking the least-loaded account.
 func (a *admissionControl) freeLoad(key admissionKey) (free bool, load int) {

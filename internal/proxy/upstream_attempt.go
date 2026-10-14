@@ -48,6 +48,37 @@ type upstreamAttempt struct {
 	addressed            accounts.Account
 	capacityRetryStarted time.Time
 	capacityPolicy       *codexCapacityRetryPolicy
+	// reserved is an admission slot a spill already holds on the account it
+	// moved the request to. The next physical attempt on that account uses
+	// it instead of acquiring (and possibly queueing for) another.
+	reserved *admissionLease
+}
+
+// reserve hands lease to the next physical attempt on its account,
+// releasing any earlier reservation that was never used.
+func (a *upstreamAttempt) reserve(lease *admissionLease) {
+	a.mu.Lock()
+	previous := a.reserved
+	a.reserved = lease
+	a.mu.Unlock()
+	previous.release()
+}
+
+// takeReserved returns the reserved slot for accountID, if any.
+func (a *upstreamAttempt) takeReserved(accountID string) *admissionLease {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	lease := a.reserved
+	if lease == nil || lease.key.account != accountID {
+		return nil
+	}
+	a.reserved = nil
+	return lease
+}
+
+// releaseReserved returns a reservation no attempt used.
+func (a *upstreamAttempt) releaseReserved() {
+	a.reserve(nil)
 }
 
 // standaloneUpstreamAttempt is the private state a layer uses when it was
@@ -134,8 +165,8 @@ func (t inflightAttemptTransport) RoundTrip(req *http.Request) (*http.Response, 
 		(t.attempt.server.SchedulerRef == nil && t.attempt.server.admission == nil) {
 		return base.RoundTrip(req)
 	}
-	var admission *admissionLease
-	if t.attempt.server.admission != nil {
+	admission := t.attempt.takeReserved(account.ID)
+	if admission == nil && t.attempt.server.admission != nil {
 		key := admissionKeyFor(schedulerAccountProvider(account.Provider), account.ID, t.attempt.poolModel)
 		var err error
 		admission, err = t.attempt.server.admission.acquire(req.Context(), key)
