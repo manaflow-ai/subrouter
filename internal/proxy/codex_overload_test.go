@@ -572,7 +572,7 @@ func TestCodexOverloadMarkTTLHonorsRetryHints(t *testing.T) {
 		{"resets_in_seconds body", "", `{"error":{"code":"slow_down","resets_in_seconds":90}}`, 72 * time.Second, 108 * time.Second},
 		{"short hint clamps up", "", `{"error":{"code":"server_is_overloaded","retry_after_ms":2000}}`, 30 * time.Second, 30 * time.Second},
 		{"long hint clamps down", "3600", `{"error":{"code":"server_is_overloaded"}}`, 5 * time.Minute, 5 * time.Minute},
-		{"no hint uses the default", "", `{"error":{"code":"server_is_overloaded"}}`, 96 * time.Second, 144 * time.Second},
+		{"no hint uses the default", "", `{"error":{"code":"server_is_overloaded"}}`, 240 * time.Second, 360 * time.Second},
 	}
 	for index, test := range cases {
 		t.Run(test.name, func(t *testing.T) {

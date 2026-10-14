@@ -6707,6 +6707,25 @@ type webSocketModelState struct {
 	// turn in flight: the turn's latency for token usage.
 	pendingStarts []time.Time
 	headFirstByte time.Time
+	// turnCapacityAccount and turnCapacityFailures count the turn in
+	// flight's consecutive capacity failures on one account, so an
+	// autonomous retry stops replaying it there once the failover's quick
+	// same-account retries are spent.
+	turnCapacityAccount  string
+	turnCapacityFailures int
+}
+
+// noteTurnCapacityFailure records one capacity failure of the turn in flight
+// on accountID and returns how many in a row it has had there.
+func (s *webSocketModelState) noteTurnCapacityFailure(accountID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnCapacityAccount != accountID {
+		s.turnCapacityAccount = accountID
+		s.turnCapacityFailures = 0
+	}
+	s.turnCapacityFailures++
+	return s.turnCapacityFailures
 }
 
 // noteUpstreamMessage marks the first upstream message of the turn in flight.
@@ -6825,6 +6844,8 @@ func (s *webSocketModelState) complete() {
 	}
 	s.headFirstByte = time.Time{}
 	s.outputForwarded = false
+	s.turnCapacityAccount = ""
+	s.turnCapacityFailures = 0
 }
 
 // pendingCreate is the response.create of the turn in flight, nil when none
@@ -6933,8 +6954,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				// that output, so the failure reaches the client as is. The
 				// account is still marked so the next turn avoids it (quota
 				// by the usage-limit case below).
-				if failureClass == codexFailureServer && s.CodexOverloadFailover.enabled() &&
-					!s.CodexOverloadFailover.failoverKeepsAccount(modelState.inputTokenEstimate()) {
+				if failureClass == codexFailureServer && s.CodexOverloadFailover.enabled() {
 					s.noteCodexCapacityFailure(accountID, azureCodexSessionKeyFor(agentType, sessionID), webSocketTurnModel(modelState, poolModel), modelState.currentTier(), codexCapacityReason(body, "websocket"), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
 					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), true)
 				}
@@ -6964,10 +6984,32 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				case codexFailureServer:
 					if provider == accounts.ProviderCodex && modelState.turnRetryable() {
 						model := webSocketTurnModel(modelState, poolModel)
-						if s.CodexOverloadFailover.enabled() && !s.CodexOverloadFailover.failoverKeepsAccount(modelState.inputTokenEstimate()) {
-							s.noteCodexCapacityFailure(accountID, azureCodexSessionKeyFor(agentType, sessionID), model, modelState.currentTier(), codexCapacityReason(body, "websocket"), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
+						tier := modelState.currentTier()
+						if s.CodexOverloadFailover.enabled() {
+							s.noteCodexCapacityFailure(accountID, azureCodexSessionKeyFor(agentType, sessionID), model, tier, codexCapacityReason(body, "websocket"), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
 						}
-						s.recordCodexCapacityOutcome(model, modelState.currentTier(), true)
+						s.recordCodexCapacityOutcome(model, tier, true)
+						// Replaying a capacity failure on the same account
+						// without end is what kept one session on a shedding
+						// account for hundreds of turns. After the failover's
+						// quick same-account retries, leave it: the account is
+						// marked for this model and the session is banned from
+						// it, so the 1012 reconnect lands on another account.
+						// Only an explicit capacity failure moves the session,
+						// and only when another account can take the model.
+						if s.CodexOverloadFailover.enabled() && codexCapacityFailureJSON(body) &&
+							modelState.noteTurnCapacityFailure(accountID) > codexCapacitySameAccountRetries &&
+							s.codexCapacitySwitchAvailable(ctx, agentType, sessionID, accountID, model, tier) {
+							if s.Logger != nil {
+								s.Logger.Warn("codex websocket turn still at capacity after a same-account retry; switching account",
+									"agent", agentType, "session", sessionID, "account", accountID, "model", model)
+							}
+							if reportLeaseFailure != nil {
+								reportLeaseFailure(http.StatusServiceUnavailable)
+							}
+							s.codexCapacityCounters.add(codexCapacityCounterAccountSwitch)
+							return errCodexWebSocketReroute
+						}
 						s.codexCapacityCounters.add(codexCapacityCounterSameAccountRetry)
 						if s.Logger != nil {
 							s.Logger.Warn("codex websocket turn hit a capacity error; retrying behind the open client socket",
@@ -6991,9 +7033,6 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 						}
 					}
 					if modelState.capacityRetryable && codexCapacityFailureJSON(body) {
-						if s.CodexOverloadFailover.enabled() && s.CodexOverloadFailover.failoverKeepsAccount(modelState.inputTokenEstimate()) {
-							s.noteCodexCapacityFailure(accountID, azureCodexSessionKeyFor(agentType, sessionID), webSocketTurnModel(modelState, poolModel), modelState.currentTier(), codexCapacityReason(body, "websocket"), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
-						}
 						if s.codexRetryableCapacityWebSocketReroute(ctx, agentType, sessionID, modelState.capacityPersist) {
 							return errCodexWebSocketCapacityRetry
 						}
@@ -8719,17 +8758,8 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	}
 	if provider == accounts.ProviderCodex {
 		availableAccounts = s.withoutCodexSessionBans(agentType, sessionID, availableAccounts)
-		if s.CodexOverloadFailover.enabled() && s.codexCapacity != nil {
-			kept := availableAccounts[:0]
-			for _, account := range availableAccounts {
-				if !s.codexCapacity.tainted(account.ID) {
-					kept = append(kept, account)
-				}
-			}
-			if len(kept) > 0 {
-				availableAccounts = kept
-			}
-		}
+		// A failure-rate taint is a capacity mark for the failing model
+		// (noteCodexCapacityFailure), applied below with the other marks.
 	}
 	if provider == accounts.ProviderClaude && !options.allowFableAPIKeyPool && s.claudeFableEnabled() && claudeFableModel(model) {
 		// Fable order is subscription pool -> Bedrock -> dedicated API key, so
@@ -12200,9 +12230,6 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 				continue
 			}
 			if provider == accounts.ProviderCodex && s.codexSessionBanned(agentType, sessionID, account.ID) {
-				continue
-			}
-			if provider == accounts.ProviderCodex && s.CodexOverloadFailover.enabled() && s.codexCapacity != nil && s.codexCapacity.tainted(account.ID) {
 				continue
 			}
 			if oauthOnly && account.AuthMode != accounts.AuthModeOAuth {

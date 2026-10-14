@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 // Codex "Selected model is at capacity" (server_is_overloaded) is a property
@@ -586,11 +587,14 @@ func (s *Server) noteCodexCapacityFailure(accountID, sessionKey, poolModel, tier
 	}
 	verdict := s.codexCapacity.noteFailure(accountID, sessionKey, reason, base, s.codexOAuthPoolSize())
 	if verdict.Tainted {
-		// Pool-wide: the rate rule judged the account, not one model.
-		s.markAccountOverloadedReason(accountID, "", tier, reason, verdict.MarkTTL)
+		// Scoped to the model that is failing: the same account may still
+		// serve other models. The hold-out is the mark's TTL, so the first
+		// request after it expires is the probe, and a repeat failure marks
+		// it again (escalated while it stays persistent).
+		s.markAccountOverloadedReason(accountID, poolModel, tier, reason, verdict.MarkTTL)
 		if s.Logger != nil {
-			s.Logger.Warn("codex account tainted by capacity failure rate; removed from the pool",
-				"account", accountID, "streak", verdict.Streak, "holdout", verdict.MarkTTL.String())
+			s.Logger.Warn("codex account tainted by capacity failure rate; held out of this model",
+				"account", accountID, "pool", selectacct.CapacityPoolKey(poolModel, tier), "streak", verdict.Streak, "holdout", verdict.MarkTTL.String())
 		}
 		return verdict
 	}
@@ -635,4 +639,24 @@ func (s Server) handleCodexCapacity(w http.ResponseWriter, r *http.Request) {
 		s.codexCapacity = newCodexCapacityStats()
 	}
 	writeJSON(w, s.codexCapacity.snapshot(labels))
+}
+
+// codexCapacitySwitchAvailable reports whether a Codex account other than
+// accountID could take this session's next turn of model: not banned for
+// the session, not out of quota, and with no live capacity mark for the
+// model's pool. Without one, leaving accountID would only reconnect onto an
+// account just as constrained.
+func (s Server) codexCapacitySwitchAvailable(ctx context.Context, agent, sessionID, accountID, model, tier string) bool {
+	scheduler := s.withCapacityMarks(s.scheduler().ForModel(model), accounts.ProviderCodex, model, tier)
+	for _, account := range filterAccountsForProvider(s.accountListContext(ctx), accounts.ProviderCodex) {
+		if account.ID == accountID || s.codexSessionBanned(agent, sessionID, account.ID) {
+			continue
+		}
+		provider := schedulerAccountProvider(account.Provider)
+		if scheduler.Exhausted(provider, account.ID) || scheduler.CapacityFailures(provider, account.ID) > 0 {
+			continue
+		}
+		return true
+	}
+	return false
 }
