@@ -198,7 +198,9 @@ func codex(args []string) error {
 	if sharedHome != "" {
 		childEnv = upsertEnv(childEnv, "CODEX_HOME", sharedHome)
 	}
+	stopResumer := startSessionResumer("")
 	runErr := runCodexCommand(bin, childArgs, childEnv)
+	stopResumer()
 	if launchID != "" {
 		ledger := newSessionLedger(accounts.DefaultCodexStore().StoreDir())
 		// Codex runs notify asynchronously, so a one-turn `codex exec` can

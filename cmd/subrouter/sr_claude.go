@@ -952,8 +952,10 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 		childEnv = upsertEnv(childEnv, "CLAUDE_CODE_REMOTE_MEMORY_DIR", defaultStore.SharedStateDir)
 	}
 	cmd.Env = childEnv
+	stopResumer := startSessionResumer("")
 	claudeStarted = true
 	runErr := cmd.Run()
+	stopResumer()
 	if r.sessionLaunchID != "" {
 		ledger := newSessionLedger(r.store.StoreDir())
 		_, _ = ledger.finishLaunch(r.sessionLaunchID, runErr)

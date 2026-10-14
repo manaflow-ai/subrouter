@@ -16,6 +16,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
+	"github.com/manaflow-ai/subrouter/wake"
 )
 
 func TestRetryableUpstreamPostRequestClaudeMessages(t *testing.T) {
@@ -829,5 +830,34 @@ func TestPinnedClaudeAccountWithDeadCredentialFailsFast(t *testing.T) {
 				t.Fatalf("body = %+v", body)
 			}
 		})
+	}
+}
+
+// A session the proxy turns away because the whole pool is spent never reaches
+// upstream, so it must still be recorded or auto-resume never schedules it.
+// Regression: m5 Claude tab sat on "503 no non-exhausted claude accounts"
+// after the five-hour window renewed.
+func TestPoolExhaustedRefusalIsRecordedForAutoResume(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+	}))
+	soon := time.Now().Add(40 * time.Minute).Truncate(time.Second)
+	server.SchedulerRef.MarkExhaustedUntil(accounts.ProviderClaude, "cooked@example.com", "", soon.Add(2*time.Hour))
+	server.SchedulerRef.MarkExhaustedUntil(accounts.ProviderClaude, "fresh@example.com", "", soon)
+	server.Recovery = NewRecoveryTracker()
+	req, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-spent")
+	if account, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-spent", req); err == nil {
+		t.Fatalf("spent pool routed to %q", account.ID)
+	}
+	states := server.Recovery.List(time.Now())
+	if len(states) != 1 || states[0].SessionID != "session-spent" || states[0].Kind != wake.KindClaudeQuota || !states[0].ResetAt.Equal(soon) {
+		t.Fatalf("recovery states = %+v, want one claude quota failure for session-spent resetting at %v (earliest in pool)", states, soon)
 	}
 }

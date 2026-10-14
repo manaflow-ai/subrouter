@@ -44,6 +44,14 @@ func (s Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		Release:     release,
 		Recovery:    s.recoveryCounters.snapshot(time.Now()),
 	}
+	if s.AutoResumeSettingPath != "" {
+		if setting, err := ReadAutoResumeSetting(s.AutoResumeSettingPath); err == nil {
+			setting.PromptRules = setting.EffectivePromptRules()
+			setting.StallRules = setting.EffectiveStallRules()
+			data.AutoResume = &setting
+		}
+		data.Prompts = recentPrompts.list()
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := dashboardTemplate.Execute(w, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -140,6 +148,8 @@ type dashboardData struct {
 	Build       buildversion.Info
 	Release     *ReleaseState
 	Recovery    map[string]RecoveryCounters
+	AutoResume  *AutoResumeSetting
+	Prompts     []PromptReport
 }
 
 var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.FuncMap{
@@ -244,6 +254,30 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       <div class="metric">{{fmtInt .Analytics.Totals.Requests}}</div>
     </div>
   </section>
+  {{with .AutoResume}}
+  <h2 id="auto-resume">Auto-resume</h2>
+  <div class="muted">Types <code>continue</code> or <code>/goal resume</code> into a session after its pool has quota again (Codex also after a temporary provider failure). Applies to every machine using this pool.</div>
+  <form method="post" action="/_subrouter/auto-resume" style="display:inline">
+    <input type="hidden" name="agent" value="claude"><input type="hidden" name="enabled" value="{{if .Claude}}false{{else}}true{{end}}">
+    Claude: <strong>{{if .Claude}}on{{else}}off{{end}}</strong> <button type="submit">Turn {{if .Claude}}off{{else}}on{{end}}</button>
+  </form>
+  &nbsp;&nbsp;
+  <form method="post" action="/_subrouter/auto-resume" style="display:inline">
+    <input type="hidden" name="agent" value="codex"><input type="hidden" name="enabled" value="{{if .Codex}}false{{else}}true{{end}}">
+    Codex: <strong>{{if .Codex}}on{{else}}off{{end}}</strong> <button type="submit">Turn {{if .Codex}}off{{else}}on{{end}}</button>
+  </form>
+  <h3>Prompts</h3>
+  <div class="muted">Permission prompts seen in agent tabs. Waiting ones need a person, or a new rule (<code>sr auto-resume rules add</code>).</div>
+  <table><tr><th>State</th><th>Host</th><th>Agent</th><th>Question</th><th>Last seen</th></tr>
+  {{range $.Prompts}}<tr><td>{{if .AnsweredBy}}answered{{else}}<strong>waiting</strong>{{end}}</td><td>{{.Host}}</td><td>{{.Agent}}</td><td>{{.Question}}</td><td>{{.LastSeen.Local.Format "Jan 2 15:04:05"}}</td></tr>{{else}}<tr><td colspan="5" class="muted">none yet</td></tr>{{end}}
+  </table>
+  <h3>Rules</h3>
+  <table><tr><th>Agent</th><th>Question</th><th>Files</th><th>Answer</th><th>Why</th></tr>
+  {{range .PromptRules}}<tr><td>{{.Agent}}</td><td><code>{{.Question}}</code></td><td>{{.Files}}</td><td>{{.Answer}}</td><td>{{.Note}}</td></tr>{{end}}
+  {{range .StallRules}}<tr><td>{{.Agent}}</td><td><code>{{.Screen}}</code></td><td>stalled tab</td><td>continue or /goal resume</td><td>{{.Note}}</td></tr>{{end}}
+  </table>
+  {{end}}
+
   <h2>Usage</h2>
   <section class="charts">
     <div class="panel">

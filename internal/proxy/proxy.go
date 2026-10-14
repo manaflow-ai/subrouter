@@ -45,6 +45,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/transcript"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
+	"github.com/manaflow-ai/subrouter/wake"
 )
 
 // Account import states reported by /_subrouter/health.
@@ -234,6 +235,12 @@ type Server struct {
 	codexWebSocketTurnRetryDelay func(attempt int) time.Duration
 	codexPersistLoops            *codexPersistLoops
 	codexShedding                *codexSheddingTracker
+	// Recovery records classified provider/quota evidence for the shared cmux
+	// watcher. It never owns terminal reads or writes.
+	Recovery *RecoveryTracker
+	// AutoResumeSettingPath holds the pool-wide auto-resume switch that
+	// every machine's resumer follows. Empty disables the endpoint.
+	AutoResumeSettingPath string
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// claudeWebBalances holds CLI-pushed Claude prepaid balances for the
@@ -2832,6 +2839,12 @@ func (s Server) Handler() http.Handler {
 	if s.ActiveSessions == nil {
 		s.ActiveSessions = NewActiveSessions()
 	}
+	if s.Recovery == nil {
+		s.Recovery = NewRecoveryTracker()
+	}
+	if s.AutoResumeSettingPath != "" {
+		recentPrompts.usePath(filepath.Join(filepath.Dir(s.AutoResumeSettingPath), "auto-resume-prompts.json"))
+	}
 	if s.softMoveState == nil {
 		s.softMoveState = newSoftMoveState()
 	}
@@ -2922,6 +2935,12 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/reload-accounts", s.requireAdmin(s.handleReloadAccounts))
 	mux.HandleFunc("/_subrouter/account-import", s.requireAccountImportAuth(s.handleAccountImport))
 	mux.HandleFunc("/_subrouter/sessions", s.requireAdmin(s.handleSessions))
+	mux.HandleFunc("/_subrouter/recovery-status", s.requireAdmin(s.handleRecoveryStatus))
+	mux.HandleFunc("/_subrouter/auto-resume", s.requireAdmin(s.handleAutoResume))
+	mux.HandleFunc("/_subrouter/auto-resume/test", s.requireAdmin(s.handleAutoResumeTest))
+	mux.HandleFunc("/_subrouter/auto-resume/rules", s.requireAdmin(s.handleAutoResumeRules))
+	mux.HandleFunc("/_subrouter/auto-resume/prompts", s.requireAdmin(s.handleAutoResumePrompts))
+	mux.HandleFunc("/_subrouter/recovery-readiness", s.requireAdmin(s.handleRecoveryReadiness))
 	mux.HandleFunc("/_subrouter/cutover-challenge", s.requireAdmin(s.handleCutoverChallenge))
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
 	mux.HandleFunc("/_subrouter/transcripts", s.requireAdmin(s.handleTranscriptList))
@@ -5797,6 +5816,7 @@ func (s Server) proxyHandler() http.Handler {
 			usageRetryMaxAttempts = s.usageLimitRetryMaxAttempts(r.Context(), requestProvider)
 		}
 		usageFailoverInstalled := false
+		quotaOutcome := &terminalQuotaOutcome{}
 		if retryPost && postReplayable {
 			requestMaxAttempts := replayablePostMaxAttempts
 			quotaRetryBudget := requestMaxAttempts - 1
@@ -5843,6 +5863,7 @@ func (s Server) proxyHandler() http.Handler {
 					}
 				}
 				layers.usageLimit = &usageLimitRetryTransport{
+					quotaOutcome:       quotaOutcome,
 					logger:             s.Logger,
 					method:             r.Method,
 					upstream:           upstream.Host,
@@ -5924,14 +5945,25 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
+			quotaOutcome.recordIfDelivered(response, s.Recovery, sessionAgentType, sessionID)
 			if requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path) &&
 				r.Header.Get(CodexCapacityRetryableHeader) == "1" {
 				response, _ = codexRetryableCapacityResponse(response)
+			}
+			// After the capacity rewrite, so a stream it turned into a 503
+			// does not count as a successful replay.
+			if s.Recovery != nil && r.Method == http.MethodPost &&
+				(sessionAgentType == "codex" || sessionAgentType == "claude") {
+				success := response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices
+				s.Recovery.RecordReplayResponse(sessionAgentType, sessionID, success, success, 0, 0)
 			}
 			if pendingSessionCommit && !usageFailoverInstalled && response.StatusCode >= 200 && response.StatusCode < 300 {
 				if err := s.commitSuccessfulHTTPResponseWithReason(response, sessionAgentType, sessionID, pendingSessionExpectedAccount, account.ID, userEmail, pendingSessionMoveReason); err != nil {
 					return fmt.Errorf("persist successful session reassignment: %w", err)
 				}
+			}
+			if quotaOutcome.response != response {
+				wrapRecoverySuccess(response, s.Recovery, sessionAgentType, sessionID)
 			}
 			// ReverseProxy writes this response's status next. A
 			// ModifyResponse error below never reaches here, so it still
@@ -8518,7 +8550,54 @@ func (s Server) accountForSession(agentType, sessionID string, r *http.Request) 
 }
 
 func (s Server) accountForSessionProvider(provider accounts.Provider, agentType, sessionID string, r *http.Request) (accounts.Account, string, string, error) {
-	return s.accountForSessionProviderWithOptions(provider, agentType, sessionID, r, accountSelectionOptions{})
+	account, id, email, err := s.accountForSessionProviderWithOptions(provider, agentType, sessionID, r, accountSelectionOptions{})
+	if err != nil && strings.Contains(err.Error(), "no non-exhausted") {
+		s.recordPoolExhausted(provider, agentType, id, r)
+	}
+	return account, id, email, err
+}
+
+// recordPoolExhausted records a quota failure for a session the proxy turned
+// away because every account of its provider is used up. No upstream request
+// was made, so nothing else records it; without this the session never gets
+// a scheduled resume when quota returns. The reset is the earliest one the
+// proxy knows across the pool, or an hour out when it knows none.
+func (s Server) recordPoolExhausted(provider accounts.Provider, agentType, sessionID string, r *http.Request) {
+	if s.Recovery == nil || sessionID == "" || (provider != accounts.ProviderClaude && provider != accounts.ProviderCodex) {
+		return
+	}
+	kind := wake.KindClaudeQuota
+	if provider == accounts.ProviderCodex {
+		kind = wake.KindCodexQuota
+	}
+	now := time.Now().UTC()
+	resetAt := s.earliestPoolReset(provider, r)
+	if resetAt.IsZero() {
+		resetAt = now.Add(time.Hour)
+	}
+	s.Recovery.RecordQuotaFailure(agentType, sessionID, kind, "pool", now, resetAt)
+	if s.Logger != nil {
+		s.Logger.Warn("pool exhausted; recorded for auto-resume", "agent", agentType, "session", sessionID, "provider", provider, "resume_after", resetAt)
+	}
+}
+
+// earliestPoolReset is the soonest time any account of provider is marked
+// usable again.
+func (s Server) earliestPoolReset(provider accounts.Provider, r *http.Request) time.Time {
+	if s.SchedulerRef == nil {
+		return time.Time{}
+	}
+	var earliest time.Time
+	for _, account := range filterAccountsForProvider(s.accountListContext(r.Context()), provider) {
+		for _, pool := range []string{"", claudePoolModel(session.ExtractModel(r, s.MaxBodyBytes))} {
+			if until, ok := s.SchedulerRef.ExhaustedUntilFor(schedulerAccountProvider(account.Provider), account.ID, pool); ok && until.After(time.Now()) {
+				if earliest.IsZero() || until.Before(earliest) {
+					earliest = until
+				}
+			}
+		}
+	}
+	return earliest
 }
 
 type accountSelectionOptions struct {
@@ -9760,6 +9839,7 @@ type replayablePostRetryTransport struct {
 
 type usageLimitRetryTransport struct {
 	base              http.RoundTripper
+	quotaOutcome      *terminalQuotaOutcome
 	server            *Server
 	logger            *slog.Logger
 	provider          accounts.Provider
@@ -9804,6 +9884,21 @@ type usageLimitRetryTransport struct {
 	// budget and attempt: see replayablePostRetryTransport.
 	budget  *attemptBudget
 	attempt *upstreamAttempt
+}
+
+// A request-scoped observation crosses the outer fallback transports. Only
+// ModifyResponse, after every fallback has run, may turn it into a wake alarm.
+type terminalQuotaOutcome struct {
+	response *http.Response
+	kind     string
+	pool     string
+	resetAt  time.Time
+}
+
+func (o *terminalQuotaOutcome) recordIfDelivered(delivered *http.Response, tracker *RecoveryTracker, agent, session string) {
+	if o != nil && delivered != nil && delivered == o.response && o.kind != "" && tracker != nil {
+		tracker.RecordQuotaFailure(agent, session, o.kind, o.pool, time.Now().UTC(), o.resetAt)
+	}
 }
 
 type routedResponseAccountKey struct{}
@@ -10533,7 +10628,23 @@ func claudeRateLimitHeaderFields(header http.Header) []any {
 	return fields
 }
 
-func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (returned *http.Response, returnedErr error) {
+	// Account exhaustion is recorded immediately for routing, but a wake alarm
+	// belongs to the session only if the final response is still that quota
+	// failure. A successful failover must not wake an already running agent.
+	var quotaResponse *http.Response
+	var quotaKind, quotaPool string
+	var quotaReset time.Time
+	defer func() {
+		if returnedErr == nil && returned != nil && returned == quotaResponse &&
+			quotaKind != "" && t.server != nil && t.server.Recovery != nil {
+			if t.quotaOutcome != nil {
+				*t.quotaOutcome = terminalQuotaOutcome{response: returned, kind: quotaKind, pool: quotaPool, resetAt: quotaReset}
+			} else {
+				t.server.Recovery.RecordQuotaFailure(t.agent, t.session, quotaKind, quotaPool, time.Now().UTC(), quotaReset)
+			}
+		}
+	}()
 	maxAttempts := t.maxAttempts
 	if maxAttempts < 1 {
 		maxAttempts = 1
@@ -11020,6 +11131,30 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
 			})
 		} else if t.server != nil && exhausted && !modelUnsupported {
+			if t.server.Recovery != nil {
+				kind := ""
+				resetAt := time.Time{}
+				bodyPrefix := peekResponseBodyPrefix(response)
+				switch t.provider {
+				case accounts.ProviderCodex:
+					kind = wake.KindCodexQuota
+					resetAt, _ = codexUsageLimitExpiry(bodyPrefix, time.Now().UTC())
+				case accounts.ProviderClaude:
+					kind = wake.KindClaudeQuota
+					resetAt = claudeExhaustionExpiry(response.Header, time.Now().UTC())
+				}
+				if kind != "" {
+					quotaResponse, quotaKind, quotaPool = response, kind, exhaustionPool
+					if t.provider == accounts.ProviderClaude && t.poolModel != "" {
+						// An account-wide rejection can follow a model-specific one
+						// (or vice versa). Recovery must cover the requested model.
+						quotaPool = selectacct.ModelKey(t.poolModel)
+					}
+					if quotaReset.IsZero() || (!resetAt.IsZero() && resetAt.Before(quotaReset)) {
+						quotaReset = resetAt
+					}
+				}
+			}
 			// Use the response's own reset time so the mark self-expires when the
 			// window recovers. Codex responses lack these headers; their body
 			// carries resets_in_seconds or a workspace-level reason instead, so
@@ -11154,6 +11289,23 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	addressed := accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential}
 	response, err := a.send(base, attemptReq, addressed)
 	return tagRoutedResponseAccount(response, addressed), err
+}
+
+func wrapRecoverySuccess(response *http.Response, tracker *RecoveryTracker, agent, session string) {
+	if response != nil && response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices &&
+		tracker != nil && (agent == "codex" || agent == "claude") {
+		record := func() error {
+			tracker.RecordSessionSuccess(agent, session, time.Now().UTC())
+			return nil
+		}
+		if response.Body == nil || response.Body == http.NoBody {
+			_ = record()
+		} else if strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
+			response.Body = newSessionCommitSSEReadCloser(response.Body, record)
+		} else {
+			response.Body = newSessionCommitEOFReadCloser(response.Body, record)
+		}
+	}
 }
 
 // commitSuccessfulFailover persists a retry-selected account only after the
