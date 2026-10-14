@@ -9478,7 +9478,6 @@ func codexModelCatalogRequest(r *http.Request) bool {
 	return r.URL.Path == "/models" || r.URL.Path == "/v1/models"
 }
 
-//
 // Entitlements differ per subscription (only some plans list the Ultrafast
 // tier), so a caller pinned to an OAuth account gets that account's catalog
 // under its own catalog session. A pin to an API-key account is dropped and
