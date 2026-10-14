@@ -848,10 +848,15 @@ func serve(args []string) error {
 	tokenUsageCtx, stopTokenUsage := context.WithCancel(context.Background())
 	defer stopTokenUsage()
 	tokenUsage.RunFlushLoop(tokenUsageCtx)
+	// Same lifetime as token usage: a retiring worker still records the
+	// failures of the streams it finishes.
+	errorEvents := proxy.NewErrorEventLog(filepath.Join(filepath.Dir(*sessionPath), "error-events.jsonl"), slog.Default())
+	go errorEvents.Run(tokenUsageCtx)
 
 	server := proxy.Server{
 		StreamDrops:              &proxy.StreamDropStats{},
 		TokenUsage:               tokenUsage,
+		ErrorEvents:              errorEvents,
 		Traffic:                  proxy.NewTrafficStats(time.Now()),
 		ReleaseStatePath:         strings.TrimSpace(*releaseStatePath),
 		Upstream:                 upstream,

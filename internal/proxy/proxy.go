@@ -188,6 +188,9 @@ type Server struct {
 	// TokenUsage counts tokens per hour, account, model, and client. Nil
 	// disables accounting.
 	TokenUsage *TokenUsageRecorder
+	// ErrorEvents records failed upstream attempts with the account pool
+	// state at that moment. Nil disables recording.
+	ErrorEvents *ErrorEventLog
 	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
 	Bedrock *BedrockConfig
 	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic
@@ -2942,6 +2945,8 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc(PlacementStatsPath, s.requireAdmin(s.handlePlacementStats))
 	mux.HandleFunc(MetricsPath, s.requireAdmin(s.handleMetrics))
 	mux.HandleFunc("/_subrouter/token-usage", s.requireAdmin(s.handleTokenUsage))
+	mux.HandleFunc(ErrorEventsPath, s.requireAdmin(s.handleErrorEvents))
+	mux.HandleFunc(AccountStatePath, s.requireAdmin(s.handleAccountState))
 	mux.HandleFunc("/_subrouter/", http.NotFound)
 	if s.Bedrock != nil && !s.RequireSessionLease {
 		mux.Handle("/bedrock/", s.bedrockHandler())
@@ -5928,6 +5933,10 @@ func (s Server) proxyHandler() http.Handler {
 				base: transport,
 				attempt: &upstreamAttempt{
 					server:    &s,
+					provider:  requestProvider,
+					agent:     sessionAgentType,
+					session:   sessionID,
+					path:      r.URL.Path,
 					poolModel: requestPoolModel,
 					account:   accounts.Account{ID: account.ID, Provider: requestProvider},
 				},
@@ -10773,6 +10782,16 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			claudeStreamOverload = claudeStreamOverloaded(response)
 			claudeStreamDenial = claudeStreamPersistentAuthorizationDenied(response)
 			claudeStreamCredit = claudeStreamCreditExhausted(response)
+			if t.server != nil {
+				switch {
+				case claudeStreamOverload:
+					t.server.recordStreamFailure(attemptReq, a, addressed, "overloaded_error")
+				case claudeStreamDenial:
+					t.server.recordStreamFailure(attemptReq, a, addressed, "permission_error")
+				case claudeStreamCredit:
+					t.server.recordStreamFailure(attemptReq, a, addressed, "credit_exhausted")
+				}
+			}
 		}
 		claudeOverload := t.provider == accounts.ProviderClaude && !claudeResponseRejectedForPool(response.Header, t.poolModel) &&
 			(claudeOverloadStatus(response.StatusCode) || claudeStreamOverload)

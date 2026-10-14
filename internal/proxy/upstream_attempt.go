@@ -121,11 +121,19 @@ func (t inflightAttemptTransport) RoundTrip(req *http.Request) (*http.Response, 
 	}
 	// Broker mode is skipped on every path (WebSocket, non-replayable and
 	// replayable alike) so load accounting agrees across them.
-	if t.attempt == nil || t.attempt.server == nil || t.attempt.server.CredentialBroker != nil ||
-		(t.attempt.server.SchedulerRef == nil && t.attempt.server.admission == nil) {
+	if t.attempt == nil || t.attempt.server == nil {
 		return base.RoundTrip(req)
 	}
 	account := t.attempt.current()
+	if t.attempt.server.ErrorEvents != nil {
+		// Every physical attempt passes here once, so each failed attempt of
+		// a retried request is recorded against the account that answered.
+		base = errorRecordingTransport{base: base, attempt: t.attempt, account: account}
+	}
+	if t.attempt.server.CredentialBroker != nil ||
+		(t.attempt.server.SchedulerRef == nil && t.attempt.server.admission == nil) {
+		return base.RoundTrip(req)
+	}
 	var admission *admissionLease
 	if t.attempt.server.admission != nil {
 		key := admissionKeyFor(schedulerAccountProvider(account.Provider), account.ID, t.attempt.poolModel)
@@ -165,6 +173,20 @@ func (t inflightAttemptTransport) RoundTrip(req *http.Request) (*http.Response, 
 			admission.release()
 		}
 	}}
+	return response, err
+}
+
+// errorRecordingTransport records a failed physical attempt in the server's
+// error event log before the retry layers above react to it.
+type errorRecordingTransport struct {
+	base    http.RoundTripper
+	attempt *upstreamAttempt
+	account accounts.Account
+}
+
+func (t errorRecordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	response, err := t.base.RoundTrip(req)
+	t.attempt.server.recordUpstreamFailure(req, t.attempt, t.account, response, err)
 	return response, err
 }
 

@@ -45,54 +45,42 @@ func TestPickSpreadsUnscoredClaudePool(t *testing.T) {
 	}
 }
 
-// Scored Claude accounts carry distinct ExpiryPressure values, and the
-// drain-soonest ordering is deliberate (GTO: prefer the account whose window
-// resets soonest). Distinct pressures form singleton bands, so the ordering
-// stays exactly deterministic.
-func TestPickKeepsClaudeDrainOrderingForScoredAccounts(t *testing.T) {
+// Scored Claude accounts carry distinct ExpiryPressure values. Placement
+// must spread across every account with room for a new session (the
+// 2026-10-13 herd: eleven accounts had quota while sessions piled onto one),
+// while still leaning toward the account whose 5h window resets soonest.
+func TestPickSpreadsScoredClaudePoolLeaningToDrainPressure(t *testing.T) {
 	scheduler := NewScheduler([]Score{
-		{AccountID: "soon@example.com", Provider: account.ProviderClaude, Headroom: 0.90, ShortHeadroom: 0.90, ShortResetAfterSeconds: 3 * 3600, ExpiryPressure: 0.90 / float64(3*3600)},
-		{AccountID: "later@example.com", Provider: account.ProviderClaude, Headroom: 0.95, ShortHeadroom: 0.95, ShortResetAfterSeconds: 5 * 3600, ExpiryPressure: 0.95 / float64(5*3600)},
-		{AccountID: "unscored@example.com", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		{AccountID: "soon@example.com", Provider: account.ProviderClaude, Headroom: 0.90, ShortHeadroom: 0.90, ShortResetAfterSeconds: 1 * 3600, ExpiryPressure: 0.90 / float64(1*3600)},
+		{AccountID: "later@example.com", Provider: account.ProviderClaude, Headroom: 0.90, ShortHeadroom: 0.90, ShortResetAfterSeconds: 5 * 3600, ExpiryPressure: 0.90 / float64(5*3600)},
+		{AccountID: "fresh@example.com", Provider: account.ProviderClaude, Headroom: 0.90, ShortHeadroom: 0.90},
+		{AccountID: "low@example.com", Provider: account.ProviderClaude, Headroom: 0.20, ShortHeadroom: 0.20, ShortResetAfterSeconds: 1 * 3600, ExpiryPressure: 0.20 / float64(1*3600)},
 	})
-	candidates := claudeAccounts("soon@example.com", "later@example.com", "unscored@example.com")
+	candidates := claudeAccounts("soon@example.com", "later@example.com", "fresh@example.com", "low@example.com")
 
-	for i := 0; i < 100; i++ {
-		picked, err := scheduler.Pick(candidates)
-		if err != nil {
-			t.Fatal(err)
+	counts := pickCounts(t, scheduler, candidates, 2000)
+	for _, id := range []string{"soon@example.com", "later@example.com", "fresh@example.com"} {
+		if counts[id] < 150 {
+			t.Fatalf("%s got %d of 2000 placements (%v); every account with room must share new sessions", id, counts[id], counts)
 		}
-		if picked.ID != "soon@example.com" {
-			t.Fatalf("pick %d = %q, want the highest-pressure account soon@example.com every time", i, picked.ID)
-		}
+	}
+	if counts["soon@example.com"] <= counts["later@example.com"] || counts["later@example.com"] <= counts["fresh@example.com"] {
+		t.Fatalf("placements %v, want the soonest-resetting window to lead, then later, then no window", counts)
+	}
+	if counts["low@example.com"] != 0 {
+		t.Fatalf("an account below the new-session floor got %d placements while roomy accounts remained: %v", counts["low@example.com"], counts)
 	}
 }
 
-// Spreading happens only WITHIN the leading equal-pressure band: accounts
-// tied at the top pressure share the placements, accounts with less pressure
-// get none while the band is usable.
-func TestPickSpreadsOnlyWithinEqualPressureBand(t *testing.T) {
-	pressure := 0.80 / float64(4*3600)
+// Among accounts with the same reset timing, the fuller account takes more
+// new sessions, so the pool converges toward even headroom.
+func TestPickSendsMoreNewSessionsToFullerClaudeAccounts(t *testing.T) {
 	scheduler := NewScheduler([]Score{
-		{AccountID: "band-a@example.com", Provider: account.ProviderClaude, Headroom: 0.80, ShortHeadroom: 0.80, ShortResetAfterSeconds: 4 * 3600, ExpiryPressure: pressure},
-		{AccountID: "band-b@example.com", Provider: account.ProviderClaude, Headroom: 0.80, ShortHeadroom: 0.80, ShortResetAfterSeconds: 4 * 3600, ExpiryPressure: pressure},
-		{AccountID: "calm-c@example.com", Provider: account.ProviderClaude, Headroom: 0.99, ShortHeadroom: 0.99},
-		{AccountID: "calm-d@example.com", Provider: account.ProviderClaude, Headroom: 0.99, ShortHeadroom: 0.99},
+		{AccountID: "full@example.com", Provider: account.ProviderClaude, Headroom: 1.0, ShortHeadroom: 1.0},
+		{AccountID: "half@example.com", Provider: account.ProviderClaude, Headroom: 0.55, ShortHeadroom: 0.55},
 	})
-	candidates := claudeAccounts("band-a@example.com", "band-b@example.com", "calm-c@example.com", "calm-d@example.com")
-
-	counts := make(map[string]int)
-	for i := 0; i < 200; i++ {
-		picked, err := scheduler.Pick(candidates)
-		if err != nil {
-			t.Fatal(err)
-		}
-		counts[picked.ID]++
-	}
-	if counts["calm-c@example.com"] != 0 || counts["calm-d@example.com"] != 0 {
-		t.Fatalf("placements leaked outside the top-pressure band: %v", counts)
-	}
-	if counts["band-a@example.com"] == 0 || counts["band-b@example.com"] == 0 {
-		t.Fatalf("placements did not spread within the equal-pressure band: %v", counts)
+	counts := pickCounts(t, scheduler, claudeAccounts("full@example.com", "half@example.com"), 2000)
+	if counts["full@example.com"] < 3*counts["half@example.com"] || counts["half@example.com"] == 0 {
+		t.Fatalf("placements %v, want the full account to take most new sessions without starving the other", counts)
 	}
 }

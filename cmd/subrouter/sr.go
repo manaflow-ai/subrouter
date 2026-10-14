@@ -102,6 +102,8 @@ Usage:
   sr reset [email]      Redeem a rate-limit reset credit (pick best, or --all, or --dry-run)
   sr usage [days]       Refresh and show API-key spend
   sr trace <email>      Show OAuth refresh breadcrumbs for an account
+  sr errors [--provider claude|codex] [--since 1h] [--account ID] [--json]
+                        Show recent upstream errors and every account's quota at the newest one
   sr codex isolation-check [--json] [--retiring-state-dir PATH]
                         Check serving credential isolation without changing credentials
   sr codex migrate-isolation [--device-auth]
@@ -641,6 +643,8 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 		return r.claudeDirect(ctx, args[1:])
 	case "spend", "cost":
 		return r.spend(ctx)
+	case "errors", "error":
+		return r.upstreamErrors(ctx, args[1:])
 	case "gemini":
 		return r.gemini(args[1:])
 	case "oai", "openai":
