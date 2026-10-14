@@ -393,16 +393,17 @@ const spreadWeightFloor = 0.01
 // pressure earns over an account with none: weight scales by up to
 // 1+spreadPressureGain in proportion to pressure / the band's top pressure.
 // It keeps the drain-soonest preference (quota in a 5h window that resets
-// soon is lost if unused) as a lean, not an exclusive claim.
-var spreadPressureGain = 3.0
+// soon is lost if unused) as a lean, not an exclusive claim. A gain of 3
+// concentrated load on the soonest-resetting account; 1 kept the lean and
+// queued less (TestWaterfillPolicyExperiment).
+var spreadPressureGain = 1.0
 
-// spreadIndex samples one account from the pool, weighted by headroom
+// spreadIndex samples one account from the pool by spreadWeight: headroom
 // surplus above the new-session threshold, leaned toward drain pressure, and
-// damped by the number of sessions already assigned there. Surplus weighting
-// sends more new sessions to the fullest accounts, so the pool converges
-// toward even headroom instead of even request counts; live in-flight
-// pressure adds a direct short-horizon signal while the existing assignment
-// damping remains unchanged.
+// damped by the square of the sessions active there. Surplus weighting sends
+// more new sessions to the fullest accounts, so the pool converges toward
+// even headroom; the squared load damping spreads concurrent sessions so no
+// account's admission slots fill while others idle.
 func (s Scheduler) spreadIndex(pool []account.Account) int {
 	weights := make([]float64, len(pool))
 	topPressure := 0.0
@@ -424,36 +425,29 @@ func (s Scheduler) spreadIndex(pool []account.Account) int {
 	return len(pool) - 1
 }
 
+// spreadWeight is water-filling over live load: quota surplus divided by the
+// square of (1 + sessions active on the account). Squaring is what spreads
+// concurrent load: with linear damping an account holding 6 active sessions
+// still took 1/7 of a fresh account's share and kept collecting sessions
+// while its admission slots were full. In-flight requests stay a headroom
+// penalty (score), which the simulation found stronger than counting them
+// in the denominator. Tuned by TestWaterfillPolicyExperiment.
 func (s Scheduler) spreadWeight(candidate account.Account, topPressure float64) float64 {
-	key := ScoreKey(candidate.Provider, candidate.ID)
-	var score Score
-	load := 0.0
-	if spreadInflightAsLoad {
-		score = s.debitedScore(candidate.Provider, candidate.ID)
-		load = float64(score.Sessions + s.inflight[key])
-	} else {
-		score = s.score(candidate.Provider, candidate.ID)
-		load = float64(score.Sessions)
-	}
+	score := s.score(candidate.Provider, candidate.ID)
 	surplus := math.Min(score.Headroom, score.ShortHeadroom) - MinNewSessionHeadroom
-	if spreadQuotaIsHeadroom {
-		surplus = math.Min(score.Headroom, score.ShortHeadroom)
-	}
 	if surplus < spreadWeightFloor {
 		surplus = spreadWeightFloor
 	}
-	weight := (surplus + weeklySurplusSpreadGain*score.WeeklySurplus) / math.Pow(1+load, spreadLoadExponent)
+	weight := (surplus + weeklySurplusSpreadGain*score.WeeklySurplus) / math.Pow(1+float64(score.Sessions), spreadLoadExponent)
 	if topPressure > 0 {
 		weight *= 1 + spreadPressureGain*score.ExpiryPressure/topPressure
 	}
 	return weight
 }
 
-var (
-	spreadLoadExponent    = 1.0
-	spreadInflightAsLoad  = false
-	spreadQuotaIsHeadroom = false
-)
+// spreadLoadExponent is the power of (1 + active sessions) that divides a
+// spread weight.
+var spreadLoadExponent = 2.0
 
 // Expiring weekly quota. An account's weekly surplus (Score.WeeklySurplus)
 // is quota that is lost at reset unless the account is used faster than its
@@ -600,20 +594,13 @@ func (s Scheduler) WithInflightCounts(counts map[string]int) Scheduler {
 }
 
 func (s Scheduler) score(provider account.Provider, accountID string) Score {
-	score := s.debitedScore(provider, accountID)
+	score := s.measuredScore(provider, accountID)
 	key := ScoreKey(provider, accountID)
+	if count := s.liveDebits[key]; count > 0 {
+		score = applyPlacementPenalty(score, LiveDebitPerRequest*float64(count))
+	}
 	if count := s.inflight[key]; count > 0 {
 		score = applyPlacementPenalty(score, InflightPenaltyPerRequest*float64(count))
-	}
-	return score
-}
-
-// debitedScore is the measured score less the live debit for requests
-// routed since the last usage refresh, without the in-flight penalty.
-func (s Scheduler) debitedScore(provider account.Provider, accountID string) Score {
-	score := s.measuredScore(provider, accountID)
-	if count := s.liveDebits[ScoreKey(provider, accountID)]; count > 0 {
-		score = applyPlacementPenalty(score, LiveDebitPerRequest*float64(count))
 	}
 	return score
 }

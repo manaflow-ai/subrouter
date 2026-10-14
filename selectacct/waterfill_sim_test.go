@@ -64,15 +64,13 @@ type wfScenario struct {
 }
 
 type wfPolicy struct {
-	name          string
-	floor         float64
-	gain          float64
-	exponent      float64
-	inflightLoad  bool
-	quotaHeadroom bool
-	activeCounts  bool // sessions active in the last 30 min instead of every stored assignment
-	overflowOnly  bool // a queue-full rejection moves only the request, not the session
-	spillWaiters  int  // waiters that trigger a spill; 0 means wfSpillWaiters
+	name         string
+	floor        float64
+	gain         float64
+	exponent     float64
+	activeCounts bool // sessions active in the last 30 min instead of every stored assignment
+	overflowOnly bool // a queue-full rejection moves only the request, not the session
+	spillWaiters int  // waiters that trigger a spill; 0 means wfSpillWaiters
 }
 
 type wfResult struct {
@@ -132,13 +130,10 @@ func runWaterfillSim(sc wfScenario, policy wfPolicy, seed int64) wfResult {
 	rng := rand.New(rand.NewSource(seed))
 	pickRNG := rand.New(rand.NewSource(seed*7919 + 3))
 	savedRand, savedFloor, savedGain, savedExp := spreadRandFloat, MinNewSessionHeadroom, spreadPressureGain, spreadLoadExponent
-	savedInflight, savedQuota := spreadInflightAsLoad, spreadQuotaIsHeadroom
 	spreadRandFloat = pickRNG.Float64
 	MinNewSessionHeadroom, spreadPressureGain, spreadLoadExponent = policy.floor, policy.gain, policy.exponent
-	spreadInflightAsLoad, spreadQuotaIsHeadroom = policy.inflightLoad, policy.quotaHeadroom
 	defer func() {
 		spreadRandFloat, MinNewSessionHeadroom, spreadPressureGain, spreadLoadExponent = savedRand, savedFloor, savedGain, savedExp
-		spreadInflightAsLoad, spreadQuotaIsHeadroom = savedInflight, savedQuota
 	}()
 
 	n := sc.accounts
@@ -576,35 +571,26 @@ var wfScenarios = []wfScenario{
 	},
 }
 
+// Candidate policies. Commit 959ca06a also ran three rejected variants
+// through temporary knobs: in-flight requests counted as load in the
+// denominator instead of as a headroom penalty (worse p95 in every Claude
+// scenario), headroom instead of surplus as the quota term, and cubed load.
 var wfPolicies = []wfPolicy{
 	{name: "main: stored counts, 1/(1+s), lean 3, floor 0.15", floor: 0.15, gain: 3, exponent: 1},
 	{name: "main at floor 0.40", floor: 0.40, gain: 3, exponent: 1},
 	{name: "main + queue-full overflow", floor: 0.15, gain: 3, exponent: 1, overflowOnly: true},
 	{name: "active counts, 1/(1+s), lean 3", floor: 0.15, gain: 3, exponent: 1, activeCounts: true},
-	{name: "active+inflight load, 1/(1+L), lean 3", floor: 0.15, gain: 3, exponent: 1, activeCounts: true, inflightLoad: true},
-	{name: "waterfill 1/(1+L)^2, lean 3", floor: 0.15, gain: 3, exponent: 2, activeCounts: true, inflightLoad: true},
-	{name: "waterfill 1/(1+L)^2, lean 1", floor: 0.15, gain: 1, exponent: 2, activeCounts: true, inflightLoad: true},
-	{name: "waterfill 1/(1+L)^2, lean 0", floor: 0.15, gain: 0, exponent: 2, activeCounts: true, inflightLoad: true},
-	{name: "waterfill headroom/(1+L)^2, lean 1", floor: 0.15, gain: 1, exponent: 2, activeCounts: true, inflightLoad: true, quotaHeadroom: true},
-	{name: "waterfill 1/(1+L)^3, lean 1", floor: 0.15, gain: 1, exponent: 3, activeCounts: true, inflightLoad: true},
-	{name: "waterfill ^2 lean 1 + overflow", floor: 0.15, gain: 1, exponent: 2, activeCounts: true, inflightLoad: true, overflowOnly: true},
-	{name: "waterfill ^2 lean 1 + overflow, floor 0.25", floor: 0.25, gain: 1, exponent: 2, activeCounts: true, inflightLoad: true, overflowOnly: true},
-	{name: "waterfill ^2 lean 1 + overflow, floor 0.40", floor: 0.40, gain: 1, exponent: 2, activeCounts: true, inflightLoad: true, overflowOnly: true},
-	{name: "active, inflight penalty, ^2, lean 1", floor: 0.15, gain: 1, exponent: 2, activeCounts: true},
-	{name: "active, inflight penalty, ^2, lean 3", floor: 0.15, gain: 3, exponent: 2, activeCounts: true},
-	{name: "active, inflight penalty, ^1, lean 1", floor: 0.15, gain: 1, exponent: 1, activeCounts: true},
-	{name: "active, inflight penalty, ^2, lean 1 + overflow", floor: 0.15, gain: 1, exponent: 2, activeCounts: true, overflowOnly: true},
-	{name: "active, inflight penalty, ^1, lean 3 + overflow", floor: 0.15, gain: 3, exponent: 1, activeCounts: true, overflowOnly: true},
-	{name: "p17 at floor 0.10", floor: 0.10, gain: 1, exponent: 2, activeCounts: true, overflowOnly: true},
-	{name: "p17 at floor 0.25", floor: 0.25, gain: 1, exponent: 2, activeCounts: true, overflowOnly: true},
-	{name: "p17, spill at 1 waiter", floor: 0.15, gain: 1, exponent: 2, activeCounts: true, overflowOnly: true, spillWaiters: 1},
-	{name: "p17, spill at 4 waiters", floor: 0.15, gain: 1, exponent: 2, activeCounts: true, overflowOnly: true, spillWaiters: 4},
-	{name: "p17, spill at 16 waiters", floor: 0.15, gain: 1, exponent: 2, activeCounts: true, overflowOnly: true, spillWaiters: 16},
-	{name: "p17 at floor 0.05", floor: 0.05, gain: 1, exponent: 2, activeCounts: true, overflowOnly: true},
-	{name: "p17 with ^3", floor: 0.15, gain: 1, exponent: 3, activeCounts: true, overflowOnly: true},
-	{name: "p17 with lean 0", floor: 0.15, gain: 0, exponent: 2, activeCounts: true, overflowOnly: true},
-	{name: "p17 with stored counts", floor: 0.15, gain: 1, exponent: 2, overflowOnly: true},
-	{name: "p17 at floor 0.10, ^3", floor: 0.10, gain: 1, exponent: 3, activeCounts: true, overflowOnly: true},
+	{name: "active, 1/(1+s)^2, lean 3", floor: 0.15, gain: 3, exponent: 2, activeCounts: true},
+	{name: "active, 1/(1+s)^2, lean 1", floor: 0.15, gain: 1, exponent: 2, activeCounts: true},
+	{name: "active, 1/(1+s)^2, lean 0", floor: 0.15, gain: 0, exponent: 2, activeCounts: true},
+	{name: "chosen: active, 1/(1+s)^2, lean 1, overflow", floor: 0.15, gain: 1, exponent: 2, activeCounts: true, overflowOnly: true},
+	{name: "chosen, stored counts", floor: 0.15, gain: 1, exponent: 2, overflowOnly: true},
+	{name: "chosen at floor 0.05", floor: 0.05, gain: 1, exponent: 2, activeCounts: true, overflowOnly: true},
+	{name: "chosen at floor 0.10", floor: 0.10, gain: 1, exponent: 2, activeCounts: true, overflowOnly: true},
+	{name: "chosen at floor 0.25", floor: 0.25, gain: 1, exponent: 2, activeCounts: true, overflowOnly: true},
+	{name: "chosen at floor 0.40", floor: 0.40, gain: 1, exponent: 2, activeCounts: true, overflowOnly: true},
+	{name: "chosen, spill at 4 waiters", floor: 0.15, gain: 1, exponent: 2, activeCounts: true, overflowOnly: true, spillWaiters: 4},
+	{name: "chosen, spill at 16 waiters", floor: 0.15, gain: 1, exponent: 2, activeCounts: true, overflowOnly: true, spillWaiters: 16},
 }
 
 // TestWaterfillPolicyExperiment prints one table row per scenario and
@@ -626,5 +612,31 @@ func TestWaterfillPolicyExperiment(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+// The chosen policy must keep conversations on their account and spread
+// load at least as well as the linear-damping policy it replaced, on the
+// quota-tight pool where placement decides who exhausts first. The sim is
+// deterministic per seed, so these are exact comparisons, not samples.
+func TestWaterfillPlacementKeepsSessionsAndSpreadsLoad(t *testing.T) {
+	if testing.Short() {
+		t.Skip("simulation")
+	}
+	const seeds = 3
+	tight := wfScenarios[1]
+	baseline := summarizeWaterfill(tight, wfPolicies[0], seeds)
+	chosen := summarizeWaterfill(tight, wfPolicies[7], seeds)
+	t.Logf("baseline %+v", baseline)
+	t.Logf("chosen   %+v", chosen)
+	if chosen.movesPerSession > 0.6*baseline.movesPerSession {
+		t.Fatalf("moves/session %.3f, want well under the baseline's %.3f", chosen.movesPerSession, baseline.movesPerSession)
+	}
+	if chosen.blockedPct > baseline.blockedPct || chosen.p95Wait > baseline.p95Wait {
+		t.Fatalf("blocked %.2f%% p95 %.0fs, want no worse than the baseline's %.2f%% %.0fs",
+			chosen.blockedPct, chosen.p95Wait, baseline.blockedPct, baseline.p95Wait)
+	}
+	if chosen.firstExhaustMin < baseline.firstExhaustMin {
+		t.Fatalf("first exhaustion at %.0f min, want no earlier than the baseline's %.0f", chosen.firstExhaustMin, baseline.firstExhaustMin)
 	}
 }

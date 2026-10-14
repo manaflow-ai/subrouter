@@ -21,12 +21,12 @@ import (
 )
 
 // TestNewSessionsIgnoreEndedSessionsOnAnAccount drives Server.Handler() with
-// two equally full Claude accounts, one of which still holds 40 retained
+// two equally full Claude accounts, one of which still holds 200 retained
 // assignments from sessions that ended hours ago. Placement used to count
 // every retained assignment as load (2026-10-14: 40-57 "sessions" per account
 // against 1-6 requests in flight), so the account with old history got almost
 // no new sessions. Only sessions active within the last 30 minutes count now,
-// so new sessions split across both accounts.
+// so new sessions split evenly across both accounts.
 func TestNewSessionsIgnoreEndedSessionsOnAnAccount(t *testing.T) {
 	var mu sync.Mutex
 	hits := map[string]int{}
@@ -46,8 +46,8 @@ func TestNewSessionsIgnoreEndedSessionsOnAnAccount(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sessions.json")
 	ended := time.Now().UTC().Add(-3 * time.Hour)
 	retained := map[string]session.Assignment{}
-	for i := 0; i < 40; i++ {
-		id := fmt.Sprintf("ended-%02d", i)
+	for i := 0; i < 200; i++ {
+		id := fmt.Sprintf("ended-%03d", i)
 		retained[session.ScopedSessionKey("claude", id)] = session.Assignment{
 			AgentType: "claude", SessionID: id, AccountID: "history@example.com", CreatedAt: ended, UpdatedAt: ended,
 		}
@@ -63,8 +63,8 @@ func TestNewSessionsIgnoreEndedSessionsOnAnAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := SchedulerSessionCounts(store)[selectacct.ScoreKey(accounts.ProviderClaude, "history@example.com")]; got != 40 {
-		t.Fatalf("retained assignments = %d, want 40", got)
+	if got := SchedulerSessionCounts(store)[selectacct.ScoreKey(accounts.ProviderClaude, "history@example.com")]; got != 200 {
+		t.Fatalf("retained assignments = %d, want 200", got)
 	}
 
 	handler := Server{
@@ -108,7 +108,10 @@ func TestNewSessionsIgnoreEndedSessionsOnAnAccount(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if hits["history"] < placements/4 || hits["fresh"] < placements/4 {
-		t.Fatalf("new sessions per account = %v, want both accounts to take at least a quarter of %d", hits, placements)
+	t.Logf("new sessions per account: %v; assigned %v; active %v", hits, SchedulerSessionCounts(store), SchedulerActiveSessionCounts(store))
+	// Counting retained assignments, live debits alone pulled the split back
+	// only to 12-15 of 40 for the account with history.
+	if hits["history"] < 17 || hits["fresh"] < 17 {
+		t.Fatalf("new sessions per account = %v, want an even split of %d (each at least 17)", hits, placements)
 	}
 }
