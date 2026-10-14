@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -108,7 +109,39 @@ type admissionWaiter struct {
 	// rejected is set under the control mutex before ready is closed when a
 	// long pause turns the waiter away instead of granting it a slot.
 	rejected bool
+	who      admissionSessionKey
 }
+
+// admissionSessionKey names the client session a physical attempt belongs
+// to. A session fanning out (subagents, workflows) shares one id, so its
+// attempts are the ones that pile onto one sticky account.
+type admissionSessionKey struct {
+	agent   string
+	session string
+}
+
+// admissionSession is one session's share of the admission gates.
+type admissionSession struct {
+	active   int
+	queued   int
+	peak     int
+	served   uint64
+	blocked  uint64
+	spilled  uint64
+	account  string
+	lastSeen time.Time
+}
+
+const (
+	// admissionSessionIdle is how long an idle session's counters are kept,
+	// so a fan-out that just finished is still visible in the snapshot.
+	admissionSessionIdle = 15 * time.Minute
+	// admissionSessionMax bounds the per-session table. Past it, idle
+	// entries are dropped first.
+	admissionSessionMax = 1024
+	// admissionSessionTop is how many sessions the snapshot lists.
+	admissionSessionTop = 20
+)
 
 type admissionBucket struct {
 	active    int
@@ -130,11 +163,13 @@ type admissionControl struct {
 	queueCap   int
 	spillQueue int
 	buckets    map[admissionKey]*admissionBucket
+	sessions   map[admissionSessionKey]*admissionSession
 }
 
 type admissionLease struct {
 	control *admissionControl
 	key     admissionKey
+	who     admissionSessionKey
 	once    sync.Once
 }
 
@@ -151,9 +186,28 @@ type admissionKeySnapshot struct {
 	PausedUntil string            `json:"paused_until,omitempty"`
 }
 
+// admissionSessionSnapshot is one session's fan-out: how many physical
+// attempts it holds and queues across every account right now, its peak, and
+// the account it last used. The traffic endpoint is unauthenticated, so it
+// carries only a session id prefix: enough to find the session (and the
+// client address) in the server log, not enough to send requests as it.
+type admissionSessionSnapshot struct {
+	Agent         string `json:"agent"`
+	SessionPrefix string `json:"session_prefix"`
+	Active        int    `json:"active"`
+	Queued        int    `json:"queued"`
+	Peak          int    `json:"peak"`
+	Served        uint64 `json:"served"`
+	Blocked       uint64 `json:"blocked"`
+	Spilled       uint64 `json:"spilled"`
+	AccountHash   string `json:"account_hash,omitempty"`
+	LastSeen      string `json:"last_seen"`
+}
+
 type admissionSnapshot struct {
-	Limit    int                    `json:"limit"`
-	Accounts []admissionKeySnapshot `json:"accounts,omitempty"`
+	Limit    int                        `json:"limit"`
+	Accounts []admissionKeySnapshot     `json:"accounts,omitempty"`
+	Sessions []admissionSessionSnapshot `json:"sessions,omitempty"`
 }
 
 func newAdmissionControl() *admissionControl {
@@ -174,7 +228,83 @@ func (a *admissionControl) bucketLocked(key admissionKey) *admissionBucket {
 	return bucket
 }
 
+// sessionLocked returns who's counters, creating them, or nil for a request
+// without a session.
+func (a *admissionControl) sessionLocked(who admissionSessionKey, now time.Time) *admissionSession {
+	if who.session == "" {
+		return nil
+	}
+	if a.sessions == nil {
+		a.sessions = make(map[admissionSessionKey]*admissionSession)
+	}
+	entry := a.sessions[who]
+	if entry == nil {
+		if len(a.sessions) >= admissionSessionMax {
+			a.pruneSessionsLocked(now)
+		}
+		entry = &admissionSession{}
+		a.sessions[who] = entry
+	}
+	entry.lastSeen = now
+	return entry
+}
+
+// pruneSessionsLocked drops sessions idle past admissionSessionIdle, and if
+// the table is still full, the longest-idle sessions holding nothing.
+func (a *admissionControl) pruneSessionsLocked(now time.Time) {
+	var oldest admissionSessionKey
+	var oldestSeen time.Time
+	for who, entry := range a.sessions {
+		if entry.active > 0 || entry.queued > 0 {
+			continue
+		}
+		if now.Sub(entry.lastSeen) > admissionSessionIdle {
+			delete(a.sessions, who)
+			continue
+		}
+		if oldestSeen.IsZero() || entry.lastSeen.Before(oldestSeen) {
+			oldest, oldestSeen = who, entry.lastSeen
+		}
+	}
+	if len(a.sessions) >= admissionSessionMax && !oldestSeen.IsZero() {
+		delete(a.sessions, oldest)
+	}
+}
+
+// grantSessionLocked moves one of who's attempts onto account.
+func (a *admissionControl) grantSessionLocked(who admissionSessionKey, account string, fromQueue bool, now time.Time) {
+	entry := a.sessionLocked(who, now)
+	if entry == nil {
+		return
+	}
+	if fromQueue && entry.queued > 0 {
+		entry.queued--
+	}
+	entry.active++
+	entry.served++
+	entry.account = account
+	if load := entry.active + entry.queued; load > entry.peak {
+		entry.peak = load
+	}
+}
+
+func (a *admissionControl) noteSpill(who admissionSessionKey) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if entry := a.sessionLocked(who, time.Now()); entry != nil {
+		entry.spilled++
+	}
+}
+
 func (a *admissionControl) acquire(ctx context.Context, key admissionKey) (*admissionLease, error) {
+	return a.acquireFor(ctx, key, admissionSessionKey{})
+}
+
+// acquireFor is acquire with the attempt attributed to who.
+func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who admissionSessionKey) (*admissionLease, error) {
 	if a == nil || key.account == "" {
 		return nil, nil
 	}
@@ -189,8 +319,9 @@ func (a *admissionControl) acquire(ctx context.Context, key admissionKey) (*admi
 		if waiter == nil && len(bucket.waiters) == 0 && bucket.active < a.limit && !bucket.pausedTil.After(now) {
 			bucket.active++
 			bucket.served++
+			a.grantSessionLocked(who, key.account, false, now)
 			a.mu.Unlock()
-			return &admissionLease{control: a, key: key}, nil
+			return &admissionLease{control: a, key: key, who: who}, nil
 		}
 		if waiter != nil && len(bucket.waiters) > 0 && bucket.waiters[0] == waiter &&
 			bucket.active < a.limit && !bucket.pausedTil.After(now) {
@@ -198,8 +329,9 @@ func (a *admissionControl) acquire(ctx context.Context, key admissionKey) (*admi
 			bucket.waiters = bucket.waiters[:len(bucket.waiters)-1]
 			bucket.active++
 			bucket.served++
+			a.grantSessionLocked(who, key.account, true, now)
 			a.mu.Unlock()
-			return &admissionLease{control: a, key: key}, nil
+			return &admissionLease{control: a, key: key, who: who}, nil
 		}
 		if waiter == nil {
 			if bucket.pausedTil.Sub(now) > admissionPauseWaitMax {
@@ -209,13 +341,22 @@ func (a *admissionControl) acquire(ctx context.Context, key admissionKey) (*admi
 			}
 			if len(bucket.waiters) >= a.queueCap {
 				bucket.blocked++
+				if entry := a.sessionLocked(who, now); entry != nil {
+					entry.blocked++
+				}
 				retryAfter := a.retryAfterLocked(bucket)
 				a.mu.Unlock()
 				return nil, admissionQueueFullError{retryAfterSeconds: retryAfter}
 			}
-			waiter = &admissionWaiter{ready: make(chan struct{})}
+			waiter = &admissionWaiter{ready: make(chan struct{}), who: who}
 			bucket.waiters = append(bucket.waiters, waiter)
 			bucket.queued++
+			if entry := a.sessionLocked(who, now); entry != nil {
+				entry.queued++
+				if load := entry.active + entry.queued; load > entry.peak {
+					entry.peak = load
+				}
+			}
 		}
 		pausedUntil := bucket.pausedTil
 		a.mu.Unlock()
@@ -235,7 +376,7 @@ func (a *admissionControl) acquire(ctx context.Context, key admissionKey) (*admi
 			if waiter.rejected {
 				return nil, errAdmissionPaused
 			}
-			return &admissionLease{control: a, key: key}, nil
+			return &admissionLease{control: a, key: key, who: who}, nil
 		case <-ctx.Done():
 			if stop != nil {
 				stop()
@@ -247,7 +388,7 @@ func (a *admissionControl) acquire(ctx context.Context, key admissionKey) (*admi
 				rejected := waiter.rejected
 				a.mu.Unlock()
 				if !rejected {
-					a.release(key)
+					a.release(key, who)
 				}
 			}
 			return nil, ctx.Err()
@@ -291,19 +432,21 @@ func (a *admissionControl) shouldSpill(key admissionKey) bool {
 // reserves its target this way, under the same lock that counts the slot,
 // so concurrent spillers see each other and spread out instead of all
 // picking the one account that looked free.
-func (a *admissionControl) tryAcquire(key admissionKey) (*admissionLease, bool) {
+func (a *admissionControl) tryAcquire(key admissionKey, who admissionSessionKey) (*admissionLease, bool) {
 	if a == nil || key.account == "" {
 		return nil, false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	now := time.Now()
 	bucket := a.bucketLocked(key)
-	if len(bucket.waiters) > 0 || bucket.active >= a.limit || bucket.pausedTil.After(time.Now()) {
+	if len(bucket.waiters) > 0 || bucket.active >= a.limit || bucket.pausedTil.After(now) {
 		return nil, false
 	}
 	bucket.active++
 	bucket.served++
-	return &admissionLease{control: a, key: key}, true
+	a.grantSessionLocked(who, key.account, false, now)
+	return &admissionLease{control: a, key: key, who: who}, true
 }
 
 // freeLoad reports whether key would admit a request immediately, and how
@@ -333,15 +476,22 @@ func (a *admissionControl) cancelWaiter(key admissionKey, waiter *admissionWaite
 		if candidate == waiter {
 			copy(bucket.waiters[i:], bucket.waiters[i+1:])
 			bucket.waiters = bucket.waiters[:len(bucket.waiters)-1]
+			if entry := a.sessions[waiter.who]; entry != nil && entry.queued > 0 {
+				entry.queued--
+			}
 			return true
 		}
 	}
 	return false
 }
 
-func (a *admissionControl) release(key admissionKey) {
+func (a *admissionControl) release(key admissionKey, who admissionSessionKey) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if entry := a.sessions[who]; entry != nil && entry.active > 0 {
+		entry.active--
+		entry.lastSeen = time.Now()
+	}
 	bucket := a.buckets[key]
 	if bucket == nil {
 		return
@@ -352,7 +502,7 @@ func (a *admissionControl) release(key admissionKey) {
 	a.wakeLocked(key, bucket, time.Now())
 }
 
-func (a *admissionControl) wakeLocked(_ admissionKey, bucket *admissionBucket, now time.Time) {
+func (a *admissionControl) wakeLocked(key admissionKey, bucket *admissionBucket, now time.Time) {
 	if bucket.pausedTil.After(now) || bucket.active >= a.limit || len(bucket.waiters) == 0 {
 		return
 	}
@@ -361,6 +511,7 @@ func (a *admissionControl) wakeLocked(_ admissionKey, bucket *admissionBucket, n
 	bucket.waiters = bucket.waiters[:len(bucket.waiters)-1]
 	bucket.active++
 	bucket.served++
+	a.grantSessionLocked(waiter.who, key.account, true, now)
 	close(waiter.ready)
 }
 
@@ -379,6 +530,12 @@ func (a *admissionControl) pause(key admissionKey, until time.Time) {
 	if bucket.pausedTil.Sub(time.Now()) > admissionPauseWaitMax {
 		for _, waiter := range bucket.waiters {
 			waiter.rejected = true
+			if entry := a.sessions[waiter.who]; entry != nil {
+				if entry.queued > 0 {
+					entry.queued--
+				}
+				entry.blocked++
+			}
 			close(waiter.ready)
 		}
 		bucket.blocked += uint64(len(bucket.waiters))
@@ -405,7 +562,7 @@ func (l *admissionLease) release() {
 	if l == nil || l.control == nil {
 		return
 	}
-	l.once.Do(func() { l.control.release(l.key) })
+	l.once.Do(func() { l.control.release(l.key, l.who) })
 }
 
 func (a *admissionControl) snapshot() admissionSnapshot {
@@ -416,10 +573,9 @@ func (a *admissionControl) snapshot() admissionSnapshot {
 	defer a.mu.Unlock()
 	out := admissionSnapshot{Limit: a.limit}
 	for key, bucket := range a.buckets {
-		digest := sha256.Sum256([]byte(key.account))
 		entry := admissionKeySnapshot{
 			Provider:    key.provider,
-			AccountHash: "sha256:" + hex.EncodeToString(digest[:8]),
+			AccountHash: admissionAccountHash(key.account),
 			Model:       key.model,
 			Limit:       a.limit,
 			Active:      bucket.active,
@@ -433,7 +589,56 @@ func (a *admissionControl) snapshot() admissionSnapshot {
 		}
 		out.Accounts = append(out.Accounts, entry)
 	}
+	now := time.Now()
+	a.pruneSessionsLocked(now)
+	for who, entry := range a.sessions {
+		session := admissionSessionSnapshot{
+			Agent:         who.agent,
+			SessionPrefix: admissionSessionPrefix(who.session),
+			Active:        entry.active,
+			Queued:        entry.queued,
+			Peak:          entry.peak,
+			Served:        entry.served,
+			Blocked:       entry.blocked,
+			Spilled:       entry.spilled,
+			LastSeen:      entry.lastSeen.UTC().Format(time.RFC3339),
+		}
+		if entry.account != "" {
+			session.AccountHash = admissionAccountHash(entry.account)
+		}
+		out.Sessions = append(out.Sessions, session)
+	}
+	// Busiest first: what a session holds now, then the most it ever held.
+	sort.Slice(out.Sessions, func(i, j int) bool {
+		left, right := out.Sessions[i], out.Sessions[j]
+		if l, r := left.Active+left.Queued, right.Active+right.Queued; l != r {
+			return l > r
+		}
+		if left.Peak != right.Peak {
+			return left.Peak > right.Peak
+		}
+		return left.SessionPrefix < right.SessionPrefix
+	})
+	if len(out.Sessions) > admissionSessionTop {
+		out.Sessions = out.Sessions[:admissionSessionTop]
+	}
 	return out
+}
+
+// admissionSessionPrefixLen is the length of the session id shown in the
+// traffic snapshot.
+const admissionSessionPrefixLen = 8
+
+func admissionSessionPrefix(session string) string {
+	if len(session) > admissionSessionPrefixLen {
+		return session[:admissionSessionPrefixLen]
+	}
+	return session
+}
+
+func admissionAccountHash(account string) string {
+	digest := sha256.Sum256([]byte(account))
+	return "sha256:" + hex.EncodeToString(digest[:8])
 }
 
 func admissionKeyFor(provider accounts.Provider, accountID, model string) admissionKey {

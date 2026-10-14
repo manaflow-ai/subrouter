@@ -147,6 +147,13 @@ func TestHandlerSpillsSaturatedStickyAccountToFreeAccount(t *testing.T) {
 	if assignment, _ := f.store.Get("claude", sessionID); assignment.AccountID != pinned {
 		t.Fatalf("spill moved the session to %q; the fan-out's sticky account %q must stay", assignment.AccountID, pinned)
 	}
+	sessions := f.control.snapshot().Sessions
+	if len(sessions) != 1 {
+		t.Fatalf("sessions = %+v, want the one fan-out session", sessions)
+	}
+	if got := sessions[0]; got.Spilled != 1 || got.Served != 2 || got.Active != 0 || got.AccountHash != admissionAccountHash(other) {
+		t.Fatalf("session = %+v, want spilled 1, served 2 (placement + spilled attempt), active 0, last account %s", got, other)
+	}
 }
 
 func TestHandlerFullAdmissionQueueAnswersWithRetryAfter(t *testing.T) {

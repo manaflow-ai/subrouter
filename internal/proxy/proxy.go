@@ -6408,7 +6408,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	if s.CredentialBroker == nil && s.admission != nil {
 		key := admissionKeyFor(schedulerAccountProvider(account.Provider), account.ID, poolModel)
 		var err error
-		admissionLease, err = s.admission.acquire(r.Context(), key)
+		admissionLease, err = s.admission.acquireFor(r.Context(), key, admissionSessionKey{agent: agentType, session: sessionID})
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
@@ -10894,6 +10894,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 						"to_account", next.ID,
 						"pool_model", t.poolModel)
 				}
+				t.server.admission.noteSpill(admissionSessionKey{agent: t.agent, session: t.session})
 				a.reserve(lease)
 				if spilledFrom == "" {
 					spilledFrom = accountID
@@ -11478,7 +11479,7 @@ func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID 
 			return accounts.Account{}, nil, false
 		}
 		// Another spiller may have taken the slot since freeLoad looked.
-		lease, ok := s.admission.tryAcquire(admissionKeyFor(schedulerAccountProvider(best.Provider), best.ID, t.poolModel))
+		lease, ok := s.admission.tryAcquire(admissionKeyFor(schedulerAccountProvider(best.Provider), best.ID, t.poolModel), admissionSessionKey{agent: t.agent, session: t.session})
 		if !ok {
 			skip[best.ID] = struct{}{}
 			continue

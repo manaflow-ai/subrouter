@@ -169,7 +169,7 @@ func (t inflightAttemptTransport) RoundTrip(req *http.Request) (*http.Response, 
 	if admission == nil && t.attempt.server.admission != nil {
 		key := admissionKeyFor(schedulerAccountProvider(account.Provider), account.ID, t.attempt.poolModel)
 		var err error
-		admission, err = t.attempt.server.admission.acquire(req.Context(), key)
+		admission, err = t.attempt.server.admission.acquireFor(req.Context(), key, admissionSessionKey{agent: t.attempt.agent, session: t.attempt.session})
 		if err != nil {
 			// A limiter rejection never reaches the upstream, so the error
 			// recorder below never sees it; record it here.
