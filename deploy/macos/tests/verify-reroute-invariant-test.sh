@@ -20,7 +20,7 @@ check() { # check <description> <condition-result>
 # run_verify <usage-status body, or "" for an unreachable endpoint>
 run_verify() {
   ROOT="$(mktemp -d)"
-  mkdir -p "$ROOT/state" "$ROOT/bin"
+  mkdir -p "$ROOT/state" "$ROOT/bin" "$ROOT/log dir"
   cat >"$ROOT/bin/launchctl" <<'FAKE'
 #!/usr/bin/env bash
 [ "${1:-}" = "print" ] && { echo "	state = running"; exit 0; }
@@ -34,14 +34,14 @@ FAKE
   chmod 0755 "$ROOT/bin/launchctl" "$ROOT/bin/stat"
   printf '{"ok":true}' >"$ROOT/health"
   [ -n "$1" ] && printf '%s' "$1" >"$ROOT/usage"
-  : >"$ROOT/daemon.log"
+  : >"$ROOT/log dir/daemon.log"
   date -u +%s >"$ROOT/state/canary.last"
   # Seed the log cursor at 0 so the next run reads the line appended below.
-  echo 0 >"$ROOT/state/pos.$(echo "$ROOT/daemon.log" | tr '/.' '__')"
-  printf '%s\n' 'WARN claude rate-limit returned to client after failover exhausted reason=rate_limited tried_accounts=0' >>"$ROOT/daemon.log"
+  echo 0 >"$ROOT/state/pos.$(echo "$ROOT/log dir/daemon.log" | tr '/.' '__')"
+  printf '%s\n' 'WARN claude rate-limit returned to client after failover exhausted reason=rate_limited tried_accounts=0' >>"$ROOT/log dir/daemon.log"
   PATH="$ROOT/bin:$PATH" \
     SUBROUTER_VERIFY_STATE="$ROOT/state" \
-    SUBROUTER_VERIFY_LOGS="$ROOT/daemon.log" \
+    SUBROUTER_VERIFY_LOGS="$ROOT/none.log:$ROOT/log dir/daemon.log" \
     SUBROUTER_HEALTH_URL="file://$ROOT/health" \
     SUBROUTER_USAGE_URL="file://$ROOT/usage" \
     SUBROUTER_PROXY_URL="file://$ROOT/none" \
