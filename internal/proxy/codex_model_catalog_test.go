@@ -438,3 +438,62 @@ func TestCodexModelCatalogBoundLeaseRequiresOAuth(t *testing.T) {
 		})
 	}
 }
+
+func TestCodexModelCatalogHonorsOAuthAccountPin(t *testing.T) {
+	codexUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch request.Header.Get("Authorization") {
+		case "Bearer promax-token":
+			_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-6-astra","tier":"ultrafast"}]}`)
+		default:
+			_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-6-astra","tier":"priority"}]}`)
+		}
+	}))
+	defer codexUpstream.Close()
+	upstream, err := url.Parse(codexUpstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		CodexUpstream: upstream,
+		Accounts: []accounts.Account{
+			{ID: "pro@example.com", AuthMode: accounts.AuthModeOAuth, Token: "pro-token", AccountID: "pro-account"},
+			{ID: "promax@example.com", AuthMode: accounts.AuthModeOAuth, Token: "promax-token", AccountID: "promax-account"},
+		},
+		Sessions: store,
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "pro@example.com", Headroom: 0.99, ShortHeadroom: 0.99},
+			{AccountID: "promax@example.com", Headroom: 0.1, ShortHeadroom: 0.1},
+		}),
+		MaxBodyBytes: 1024,
+	}.Handler()
+
+	fetch := func(pin string) string {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.162.1", nil)
+		request.Header.Set("X-Subrouter-Agent", "codex")
+		if pin != "" {
+			request.Header.Set("X-Subrouter-Account-ID", pin)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("pin %q: status = %d, body = %s", pin, response.Code, response.Body.String())
+		}
+		return response.Body.String()
+	}
+
+	if got := fetch("promax@example.com"); got != `{"models":[{"slug":"gpt-6-astra","tier":"ultrafast"}]}` {
+		t.Fatalf("pinned catalog = %s, want the pinned account's catalog", got)
+	}
+	if got := fetch(""); got != `{"models":[{"slug":"gpt-6-astra","tier":"priority"}]}` {
+		t.Fatalf("unpinned catalog = %s, want the shared catalog session unaffected by the pin", got)
+	}
+	if assignment, ok := store.Get("codex", codexModelCatalogSessionID); !ok || assignment.AccountID != "pro@example.com" {
+		t.Fatalf("shared catalog assignment = %#v, %t; want pro@example.com", assignment, ok)
+	}
+}

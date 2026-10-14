@@ -5515,7 +5515,11 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		routingRequest := r
 		if modelCatalogRequest && boundLease == nil {
-			routingRequest = codexModelCatalogRoutingRequest(r)
+			var pinnedCatalogAccount string
+			routingRequest, pinnedCatalogAccount = s.codexModelCatalogRoutingRequest(r)
+			if pinnedCatalogAccount != "" {
+				sessionID = codexModelCatalogSessionID + ":" + pinnedCatalogAccount
+			}
 		}
 		// A caller-supplied account selector is a strict per-request binding, not
 		// a preference. Session leases install the same header internally but are
@@ -7999,7 +8003,7 @@ func websocketMessageType(messageType int) string {
 // saturated the upload, and filled the disk. Nothing about it is useful for
 // debugging an agent.
 func transcriptWorthRecording(sessionID string) bool {
-	return sessionID != codexModelCatalogSessionID
+	return sessionID != codexModelCatalogSessionID && !strings.HasPrefix(sessionID, codexModelCatalogSessionID+":")
 }
 
 func (s Server) recordHTTPMeta(r *http.Request, agentType, sessionID, userEmail string, account accounts.Account, upstream *url.URL) {
@@ -9474,7 +9478,23 @@ func codexModelCatalogRequest(r *http.Request) bool {
 	return r.URL.Path == "/models" || r.URL.Path == "/v1/models"
 }
 
-func codexModelCatalogRoutingRequest(r *http.Request) *http.Request {
+//
+// Entitlements differ per subscription (only some plans list the Ultrafast
+// tier), so a caller pinned to an OAuth account gets that account's catalog
+// under its own catalog session. A pin to an API-key account is dropped and
+// the shared catalog session picks any OAuth account. The second result is
+// the pinned OAuth account ID, or empty.
+func (s Server) codexModelCatalogRoutingRequest(r *http.Request) (*http.Request, string) {
+	if forced, present, err := session.ExtractAccountIDWithPresence(r); err == nil && present && forced != "" {
+		available := oauthAccounts(filterAccountsForProvider(s.accountListContext(r.Context()), accounts.ProviderCodex))
+		if account, ok := findAccount(available, forced); ok {
+			request := r.Clone(r.Context())
+			request.Header = r.Header.Clone()
+			request.Header.Del("X-Subrouter-Model")
+			request.Header.Del("X-Model")
+			return request, account.ID
+		}
+	}
 	request := r.Clone(r.Context())
 	request.Header = r.Header.Clone()
 	for _, header := range []string{
@@ -9485,7 +9505,7 @@ func codexModelCatalogRoutingRequest(r *http.Request) *http.Request {
 	} {
 		request.Header.Del(header)
 	}
-	return request
+	return request, ""
 }
 
 func oauthAccounts(all []accounts.Account) []accounts.Account {
