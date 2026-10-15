@@ -16,6 +16,21 @@ func claudeFableModel(model string) bool {
 	return strings.Contains(strings.ToLower(model), "fable")
 }
 
+// claudeBedrockFallbackModel reports whether a Claude request for this model
+// may use the fallback chain: Fable always, every model once a Bedrock model
+// is configured for all of them.
+func (s Server) claudeBedrockFallbackModel(model string) bool {
+	return claudeFableModel(model) || s.ClaudeBedrockModelID != ""
+}
+
+// claudeBedrockModelID is the Bedrock inference profile the chain uses.
+func (s Server) claudeBedrockModelID() string {
+	if s.ClaudeBedrockModelID != "" {
+		return s.ClaudeBedrockModelID
+	}
+	return bedrockFableModelID
+}
+
 // claudeFableEnabled reports whether a Fable fallback route is configured (the
 // Bedrock gateway or a dedicated Anthropic API key). Fable routing order is
 // subscription pool first, then Bedrock, then the API key; this only gates the
@@ -135,7 +150,7 @@ func (s Server) claudeFableFallbackResponse(r *http.Request, body []byte) (*http
 	if s.Bedrock != nil && s.Bedrock.configured() {
 		resp, err := s.claudeFableBedrockResponse(r.Context(), body)
 		if err == nil {
-			if !claudeFableBedrockUnusable(resp.StatusCode) || s.ClaudeFableAPIKey == "" {
+			if !claudeFableBedrockUnusable(resp.StatusCode) || s.ClaudeFableAPIKey == "" || !claudeFableModel(bodyModel(body)) {
 				return resp, true
 			}
 			if s.Logger != nil {
@@ -151,7 +166,9 @@ func (s Server) claudeFableFallbackResponse(r *http.Request, body []byte) (*http
 			}
 		}
 	}
-	if s.ClaudeFableAPIKey != "" {
+	// The API key is Fable's alone and has no cap; other models that reach
+	// the chain through ClaudeBedrockModelID stop at Bedrock.
+	if s.ClaudeFableAPIKey != "" && claudeFableModel(bodyModel(body)) {
 		resp, err := s.claudeFableAPIKeyResponse(r, body)
 		if err != nil {
 			if s.Logger != nil && r.Context().Err() == nil {
@@ -252,4 +269,76 @@ func stripClaudeUnsupportedFields(body []byte) []byte {
 		return rebuilt
 	}
 	return body
+}
+
+// stripBedrockUnsupportedFields removes what Anthropic-mode Claude Code sends
+// and Bedrock's schema refuses with a 400 for the whole request. The direct
+// Messages API accepts these, so only the Bedrock stage strips them.
+func stripBedrockUnsupportedFields(body []byte) []byte {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil {
+		return body
+	}
+	changed := false
+	// Claude Code in Anthropic mode sends these; Bedrock's schema has none of
+	// them and refuses the whole request.
+	for _, field := range []string{"output_config", "safeguards"} {
+		if _, ok := payload[field]; ok {
+			delete(payload, field)
+			changed = true
+		}
+	}
+	// Claude Code also puts output_config on messages; Bedrock refuses it
+	// there with "messages.N.output_config: Extra inputs are not permitted".
+	if raw, ok := payload["messages"]; ok {
+		var messages []map[string]json.RawMessage
+		if json.Unmarshal(raw, &messages) == nil {
+			stripped := false
+			for _, message := range messages {
+				if _, ok := message["output_config"]; ok {
+					delete(message, "output_config")
+					stripped = true
+				}
+			}
+			if stripped {
+				if rebuilt, err := json.Marshal(messages); err == nil {
+					payload["messages"] = rebuilt
+					changed = true
+				}
+			}
+		}
+	}
+	// Bedrock takes thinking.display only as "summarized" or "omitted".
+	if raw, ok := payload["thinking"]; ok {
+		var thinking map[string]json.RawMessage
+		if json.Unmarshal(raw, &thinking) == nil {
+			if display, ok := thinking["display"]; ok {
+				var value string
+				_ = json.Unmarshal(display, &value)
+				if value != "summarized" && value != "omitted" {
+					delete(thinking, "display")
+					if rebuilt, err := json.Marshal(thinking); err == nil {
+						payload["thinking"] = rebuilt
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	if !changed {
+		return body
+	}
+	if rebuilt, err := json.Marshal(payload); err == nil {
+		return rebuilt
+	}
+	return body
+}
+
+// bodyModel is the model a Messages request body names.
+func bodyModel(body []byte) string {
+	var payload struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	return payload.Model
 }

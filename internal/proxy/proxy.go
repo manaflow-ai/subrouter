@@ -198,6 +198,14 @@ type Server struct {
 	// ONLY to Fable; Opus/Sonnet/etc. continue to use the OAuth pool and never
 	// touch this key.
 	ClaudeFableAPIKey string
+	// ClaudeBedrockModelID, when set, opens the Fable fallback chain to every
+	// Claude model: a Messages call the subscription pool cannot serve goes
+	// to Bedrock as this inference profile, whatever model it asked for.
+	// Empty keeps the chain Fable-only.
+	ClaudeBedrockModelID string
+	// ClaudeBedrockBudget, when set, must admit each Bedrock call of the
+	// chain and of the /bedrock/* gateway. Nil means no cap.
+	ClaudeBedrockBudget *ClaudeBedrockBudget
 
 	// ClaudeFableCacheTTLUpgradeOff disables the Bedrock-path rewrite of bare
 	// ephemeral cache_control blocks to the 1-hour TTL (see
@@ -5631,14 +5639,14 @@ func (s Server) proxyHandler() http.Handler {
 			requestPoolModel = claudePoolModel(requestModel)
 			retryPoolModel = requestPoolModel
 			fableFallbackConfigured = !noRetry && !autonomousRetry && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
-				s.claudeFableEnabled() && claudeFableModel(requestModel) &&
+				s.claudeFableEnabled() && s.claudeBedrockFallbackModel(requestModel) &&
 				r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
 		}
 		// Bedrock-primary: when enabled, serve Fable straight from Bedrock before
 		// touching the subscription pool. A non-2xx or unreachable Bedrock restores
 		// the body and falls through to the normal pool path (which still carries
 		// its own Bedrock/API-key fallback), so this never hard-fails Fable.
-		if preferredAccountID == "" && s.FableBedrockPrimary && fableFallbackConfigured && s.Bedrock != nil && s.Bedrock.configured() {
+		if preferredAccountID == "" && s.FableBedrockPrimary && fableFallbackConfigured && claudeFableModel(requestModel) && s.Bedrock != nil && s.Bedrock.configured() {
 			if s.serveClaudeFableBedrockPrimary(w, r) {
 				return
 			}
@@ -11028,7 +11036,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				schedulerAccountProvider(t.provider), accountID, t.poolModel, time.Now(),
 			); blocked {
 				tried[accountID] = struct{}{}
-				next, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
+				next, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil && claudeFableModel(t.poolModel), false)
 				if pickErr != nil {
 					return nil, pickErr
 				}
@@ -11088,7 +11096,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if admissionRejected(err) && a.replayable() && req.Context().Err() == nil &&
 			attempt < maxAttempts && t.server != nil {
 			tried[accountID] = struct{}{}
-			next, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
+			next, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil && claudeFableModel(t.poolModel), false)
 			if pickErr == nil {
 				if nextReq, replayErr := a.replay(replayReq, &next); replayErr == nil {
 					if t.logger != nil {
@@ -11121,6 +11129,15 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 					attemptReq = nextReq
 					continue
 				}
+			}
+		}
+		// Every account the request could move to is paused after a rate
+		// limit too. Nothing reached an upstream, so the fallback chain can
+		// serve it. A full queue is a burst on accounts that still have quota:
+		// it keeps its 503 so the client retries onto the subscriptions.
+		if errors.Is(err, errAdmissionPaused) && a.replayable() && req.Context().Err() == nil {
+			if fallback, ok := t.fableFallbackResponse(response, accountID, "admission_rejected"); ok {
+				return fallback, nil
 			}
 		}
 		if err != nil || !a.replayable() || req.Context().Err() != nil {
@@ -11525,7 +11542,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		nextAccount, pickErr := compatibilityNext, compatibilityPickErr
 		if !modelUnsupported {
-			nextAccount, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, !claudeExtraUsageRetried)
+			nextAccount, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil && claudeFableModel(t.poolModel), !claudeExtraUsageRetried)
 		}
 		if pickErr != nil {
 			if t.logger != nil {
