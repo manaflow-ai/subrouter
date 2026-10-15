@@ -254,10 +254,29 @@ func stripClaudeUnsupportedFields(body []byte) []byte {
 		return body
 	}
 	changed := false
-	for _, field := range []string{"context_management"} {
+	// Claude Code in Anthropic mode sends these; Bedrock's schema has none of
+	// them and refuses the whole request.
+	for _, field := range []string{"context_management", "output_config", "safeguards"} {
 		if _, ok := payload[field]; ok {
 			delete(payload, field)
 			changed = true
+		}
+	}
+	// Bedrock takes thinking.display only as "summarized" or "omitted".
+	if raw, ok := payload["thinking"]; ok {
+		var thinking map[string]json.RawMessage
+		if json.Unmarshal(raw, &thinking) == nil {
+			if display, ok := thinking["display"]; ok {
+				var value string
+				_ = json.Unmarshal(display, &value)
+				if value != "summarized" && value != "omitted" {
+					delete(thinking, "display")
+					if rebuilt, err := json.Marshal(thinking); err == nil {
+						payload["thinking"] = rebuilt
+						changed = true
+					}
+				}
+			}
 		}
 	}
 	if !changed {
