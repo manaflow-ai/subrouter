@@ -3,6 +3,7 @@ package transcript
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/base64"
 	"encoding/xml"
 	"fmt"
@@ -10,7 +11,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -53,10 +53,8 @@ func NewAzureBlobClient(config AzureBlobClientConfig) (*AzureBlobSyncer, error) 
 	if client == nil {
 		client = &http.Client{}
 	}
+	// Empty keeps the account's default tier.
 	tier := strings.TrimSpace(config.AccessTier)
-	if tier == "" {
-		tier = "Cool"
-	}
 	syncer := &AzureBlobSyncer{
 		account:    account,
 		container:  container,
@@ -83,74 +81,110 @@ func (s *AzureBlobSyncer) segmentDestination() string {
 	return destination
 }
 
-// UploadSegment writes a compressed segment as a block blob and verifies the
-// stored length and MD5 before returning. Block blobs, unlike the append
-// blobs the raw spool used, can be tiered to Cool and Archive.
-func (s *AzureBlobSyncer) UploadSegment(ctx context.Context, localPath string, info SegmentInfo) error {
-	sum, size, err := fileMD5(localPath)
+// azureUploadError classifies a failed write: a refused credential or a
+// malformed request will not succeed on retry.
+func azureUploadError(resp *http.Response) error {
+	err := azureBlobResponseError(resp)
+	switch {
+	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+		return err
+	case resp.StatusCode >= 400:
+		return PermanentError{Err: err}
+	default:
+		return err
+	}
+}
+
+func (s *AzureBlobSyncer) put(ctx context.Context, name, query string, headers map[string]string, data []byte) error {
+	body := func() (io.Reader, error) { return bytes.NewReader(data), nil }
+	if err := s.pace.reserve(ctx, int64(len(data))); err != nil {
+		return err
+	}
+	reader, _ := body()
+	req, err := s.newRequest(ctx, http.MethodPut, name, query, headers, reader, int64(len(data)))
 	if err != nil {
 		return err
 	}
-	if size > azureSingleBlobMaxBytes {
-		return fmt.Errorf("segment %s is %d bytes, over the single-request blob limit", info.SegmentID, size)
+	resp, err := s.do(ctx, req, body, int64(len(data)))
+	if err != nil {
+		return err
 	}
-	md5Header := base64.StdEncoding.EncodeToString(sum)
-	name := s.blobName(SegmentBlobName(info))
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return azureUploadError(resp)
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	return nil
+}
+
+func contentMD5(data []byte) string {
+	sum := md5.Sum(data)
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+// PutBlock stages one block. The service checks the block against its
+// Content-MD5, so a block that arrives damaged is refused, not stored.
+func (s *AzureBlobSyncer) PutBlock(ctx context.Context, blob, blockID string, data []byte) error {
+	return s.put(ctx, s.blobName(blob), "comp=block&blockid="+url.QueryEscape(blockID), map[string]string{
+		"Content-MD5":  contentMD5(data),
+		"Content-Type": "application/octet-stream",
+	}, data)
+}
+
+// PutBlockList commits staged blocks, in order, as the blob's content.
+func (s *AzureBlobSyncer) PutBlockList(ctx context.Context, blob string, blockIDs []string, contentType string, metadata map[string]string) error {
+	var list bytes.Buffer
+	list.WriteString(`<?xml version="1.0" encoding="utf-8"?><BlockList>`)
+	for _, id := range blockIDs {
+		list.WriteString("<Latest>")
+		_ = xml.EscapeText(&list, []byte(id))
+		list.WriteString("</Latest>")
+	}
+	list.WriteString("</BlockList>")
 	headers := map[string]string{
-		"x-ms-blob-type":             "BlockBlob",
-		"Content-Type":               "application/zstd",
-		"Content-MD5":                md5Header,
-		"x-ms-meta-subrouter_format": SegmentFormat,
-		"x-ms-meta-segment_id":       safeMetaValue(info.SegmentID),
-		"x-ms-meta-host":             safeMetaValue(info.Host),
-		"x-ms-meta-raw_bytes":        strconv.FormatInt(info.RawBytes, 10),
-		"x-ms-meta-raw_sha256":       safeMetaValue(info.RawSHA256),
-		"x-ms-meta-compressed_bytes": strconv.FormatInt(size, 10),
+		"Content-Type":           "application/xml",
+		"Content-MD5":            contentMD5(list.Bytes()),
+		"x-ms-blob-content-type": contentType,
+	}
+	for key, value := range metadata {
+		headers["x-ms-meta-"+key] = safeMetaValue(value)
 	}
 	if s.accessTier != "" {
 		headers["x-ms-access-tier"] = s.accessTier
 	}
-	file, err := os.Open(localPath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	body := func() (io.Reader, error) {
-		if _, err := file.Seek(0, io.SeekStart); err != nil {
-			return nil, err
-		}
-		return file, nil
-	}
-	if err := s.pace.reserve(ctx, size); err != nil {
-		return err
-	}
-	reader, err := body()
-	if err != nil {
-		return err
-	}
-	req, err := s.newRequest(ctx, http.MethodPut, name, "", headers, reader, size)
-	if err != nil {
-		return err
-	}
-	resp, err := s.do(ctx, req, body, size)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		defer resp.Body.Close()
-		return azureBlobResponseError(resp)
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	_ = resp.Body.Close()
+	return s.put(ctx, s.blobName(blob), "comp=blocklist", headers, list.Bytes())
+}
 
-	stored, err := s.headBlob(ctx, name)
+// PutBlob writes a whole small blob in one request.
+func (s *AzureBlobSyncer) PutBlob(ctx context.Context, blob string, data []byte, contentType string) error {
+	headers := map[string]string{
+		"x-ms-blob-type": "BlockBlob",
+		"Content-Type":   contentType,
+		"Content-MD5":    contentMD5(data),
+	}
+	if s.accessTier != "" {
+		headers["x-ms-access-tier"] = s.accessTier
+	}
+	return s.put(ctx, s.blobName(blob), "", headers, data)
+}
+
+// ReadRange reads [offset, offset+length) of a container-relative blob.
+func (s *AzureBlobSyncer) ReadRange(ctx context.Context, name string, offset, length int64) ([]byte, error) {
+	req, err := s.newRequest(ctx, http.MethodGet, name, "", map[string]string{
+		"x-ms-range": fmt.Sprintf("bytes=%d-%d", offset, offset+length-1),
+	}, nil, 0)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if !stored.exists || stored.appendBlob || stored.size != size || stored.md5 != md5Header {
-		return fmt.Errorf("%w: %s stored size=%d md5=%q, local size=%d md5=%q", errSegmentVerify, name, stored.size, stored.md5, size, md5Header)
+	resp, err := s.do(ctx, req, func() (io.Reader, error) { return nil, nil }, 0)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, azureBlobResponseError(resp)
+	}
+	return io.ReadAll(resp.Body)
 }
 
 // azureSingleBlobMaxBytes is the Put Blob limit for one request.
@@ -305,29 +339,6 @@ func safeMetaValue(value string) string {
 func nowFunc() time.Time { return time.Now() }
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
-
-// PutSmallBlob writes a small block blob by its container-relative name.
-func (s *AzureBlobSyncer) PutSmallBlob(ctx context.Context, name string, data []byte, contentType string) error {
-	body := func() (io.Reader, error) { return bytes.NewReader(data), nil }
-	reader, _ := body()
-	req, err := s.newRequest(ctx, http.MethodPut, name, "", map[string]string{
-		"x-ms-blob-type": "BlockBlob",
-		"Content-Type":   contentType,
-	}, reader, int64(len(data)))
-	if err != nil {
-		return err
-	}
-	resp, err := s.do(ctx, req, body, int64(len(data)))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return azureBlobResponseError(resp)
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	return nil
-}
 
 // BlobExists reports whether a container-relative blob exists.
 func (s *AzureBlobSyncer) BlobExists(ctx context.Context, name string) (bool, error) {

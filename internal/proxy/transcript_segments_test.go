@@ -3,19 +3,20 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/klauspost/compress/zstd"
@@ -34,7 +35,7 @@ func TestSegmentTranscriptsRebuildEveryBodyExactly(t *testing.T) {
 	t.Parallel()
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	upstreamReply := func(n int) []byte {
-		return []byte(fmt.Sprintf("event: response.output_text.delta\ndata: {\"delta\":\"héllo %d ✓\"}\n\nevent: response.completed\ndata: {\"usage\":{\"output_tokens\":%d}}\n\n", n, n))
+		return []byte(fmt.Sprintf("event: response.output_text.delta\ndata: {\"delta\":\"héllo %d ✓\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-test\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":%d}}}\n\n", n, n+1))
 	}
 	var repliesMu sync.Mutex
 	var replies [][]byte
@@ -68,14 +69,23 @@ func TestSegmentTranscriptsRebuildEveryBodyExactly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	spool := t.TempDir()
+	store := newFakeBlobStore(t)
+	defer store.server.Close()
+	client, err := transcript.NewAzureBlobClient(transcript.AzureBlobClientConfig{
+		Destination: store.server.URL + "/calls", SASToken: "sv=test&sp=cw", MaxBytesPerSecond: -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	recorder, err := transcript.NewSegmentRecorder(transcript.SegmentConfig{
-		Dir:  spool,
-		Host: "test-router",
+		Uploader:   client,
+		Host:       "test-router",
+		FrameBytes: 64 << 10,
+		BlockBytes: 32 << 10,
 		WhoIs: func(_ context.Context, remoteAddr string) (string, string, bool) {
 			if strings.HasPrefix(remoteAddr, "127.0.0.1:") {
 				return "lawrences-macbook-pro-2", "lawrence@example.com", true
@@ -94,7 +104,7 @@ func TestSegmentTranscriptsRebuildEveryBodyExactly(t *testing.T) {
 			AuthMode: accounts.AuthModeOAuth,
 			Token:    "a-token",
 		}},
-		Sessions:     store,
+		Sessions:     sessions,
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 32 << 20,
 		Transcripts:  recorder,
@@ -160,49 +170,24 @@ func TestSegmentTranscriptsRebuildEveryBodyExactly(t *testing.T) {
 	_ = conn.Close()
 	_ = wsResponse.Body.Close()
 
-	// Seal, then wait for the store to compress the segment.
-	deadline := time.Now().Add(30 * time.Second)
-	var compressed []string
-	for {
-		recorder.SealSegment()
-		compressed, _ = filepath.Glob(filepath.Join(recorder.SegmentDir(), "upload", "*.jsonl.zst"))
-		if len(compressed) > 0 || time.Now().After(deadline) {
-			break
+	// Commit every segment and write the index, then rebuild each call
+	// from nothing but its index row and the byte ranges it names.
+	recorder.SealSegment()
+	var rows []transcript.IndexRow
+	for name, data := range store.blobs() {
+		if !strings.HasPrefix(name, "calls/index/v1/") {
+			continue
 		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if len(compressed) == 0 {
-		t.Fatal("no compressed segment appeared")
-	}
-
-	var records []transcript.ExportRecord
-	exporter := transcript.NewSegmentExporter(func(record transcript.ExportRecord) error {
-		records = append(records, record)
-		return nil
-	})
-	for _, path := range compressed {
-		file, err := os.Open(path)
-		if err != nil {
+		if err := transcript.ReadIndexRows(bytes.NewReader(data), func(row transcript.IndexRow) error {
+			rows = append(rows, row)
+			return nil
+		}); err != nil {
 			t.Fatal(err)
 		}
-		decoder, err := transcript.NewSegmentDecoder(file)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := exporter.ReadSegment(filepath.Base(path), decoder); err != nil {
-			t.Fatal(err)
-		}
-		decoder.Close()
-		_ = file.Close()
 	}
-	exporter.Finish()
-	if exporter.Stats.Failed() || exporter.Stats.Mismatched != 0 {
-		t.Fatalf("export stats = %+v", exporter.Stats)
+	read := func(blob string, offset, length int64) ([]byte, error) {
+		return client.ReadRange(context.Background(), blob, offset, length)
 	}
-	if exporter.Stats.DeltaBodies < 3 {
-		t.Fatalf("delta bodies = %d, want the later turns stored as deltas", exporter.Stats.DeltaBodies)
-	}
-
 	digest := func(body []byte) string {
 		sum := sha256.Sum256(body)
 		return hex.EncodeToString(sum[:])
@@ -211,44 +196,152 @@ func TestSegmentTranscriptsRebuildEveryBodyExactly(t *testing.T) {
 	for _, body := range append(append([][]byte(nil), sent...), streamed) {
 		wantRequests[digest(body)] = false
 	}
-	wantReplies := map[string]bool{}
 	repliesMu.Lock()
-	defer repliesMu.Unlock()
+	wantReplies := map[string]bool{}
 	for _, reply := range replies {
 		wantReplies[digest(reply)] = false
 	}
+	repliesMu.Unlock()
 	wantMessages := map[string]bool{digest(wsMessages[0]): false, digest(wsMessages[1]): false}
-	for _, record := range records {
-		switch record.Kind {
-		case "http":
-			if record.Client == nil || record.Client.Node != "lawrences-macbook-pro-2" || record.Client.User != "lawrence@example.com" || record.Client.IP != "127.0.0.1" {
-				t.Fatalf("request %s client = %+v", record.RequestID, record.Client)
+	for _, row := range rows {
+		call, err := transcript.ExportCall(row, read)
+		if err != nil {
+			t.Fatalf("export %s: %v", row.RequestID, err)
+		}
+		if !call.Verified {
+			raw, _ := read(row.RequestBlob, row.RequestOffset, row.RequestLength)
+			decoder, _ := transcript.NewSegmentDecoder(bytes.NewReader(raw))
+			text, _ := io.ReadAll(decoder)
+			t.Fatalf("call %s did not rebuild exactly: row=%+v\nrequest=%+v\nresponse=%+v\nframes:\n%.3000s", row.RequestID, row, call.Request, call.Response, text)
+		}
+		if row.ClientNode != "lawrences-macbook-pro-2" || row.ClientUser != "lawrence@example.com" || row.ClientIP != "127.0.0.1" {
+			t.Fatalf("call %s client = %s %s %s", row.RequestID, row.ClientNode, row.ClientUser, row.ClientIP)
+		}
+		wantRequests[call.Request.SHA256] = true
+		wantMessages[call.Request.SHA256] = true
+		if row.Kind == "http" {
+			if row.Status != http.StatusOK || !row.Complete {
+				t.Fatalf("call %s status %d complete %v", row.RequestID, row.Status, row.Complete)
 			}
-			if record.Request == nil || !record.Request.Verified || record.Response == nil || record.Response.Body == nil || !record.Response.Body.Verified {
-				t.Fatalf("request %s is not complete and verified: %+v", record.RequestID, record)
+			wantReplies[call.Response.SHA256] = true
+			if row.Path == "/v1/responses" && row.OutputTokens == 0 {
+				t.Fatalf("call %s has no output tokens", row.RequestID)
 			}
-			if _, ok := wantRequests[record.Request.SHA256]; !ok {
-				t.Fatalf("request %s body %s was never sent", record.RequestID, record.Request.SHA256)
-			}
-			wantRequests[record.Request.SHA256] = true
-			wantReplies[record.Response.Body.SHA256] = true
-			if record.Request.SHA256 == digest(sent[3]) && record.Request.ContentEncoding != "zstd" {
-				t.Fatalf("zstd request recorded with encoding %q", record.Request.ContentEncoding)
-			}
-		case "websocket_message":
-			if record.Direction == "client_to_upstream" {
-				if record.Message == nil || !record.Message.Verified {
-					t.Fatalf("websocket message not verified: %+v", record)
-				}
-				wantMessages[record.Message.SHA256] = true
-			}
+		}
+		if call.Request.SHA256 == digest(sent[3]) && row.RequestEncoding != "zstd" {
+			t.Fatalf("zstd request recorded with encoding %q", row.RequestEncoding)
 		}
 	}
 	for name, want := range map[string]map[string]bool{"request": wantRequests, "response": wantReplies, "websocket message": wantMessages} {
 		for sum, seen := range want {
 			if !seen {
-				t.Fatalf("%s %s missing from the exported transcript", name, sum)
+				t.Fatalf("%s %s missing from the index", name, sum)
 			}
 		}
 	}
+	// Segments decode whole too, with the seek table skipped.
+	exporter := transcript.NewSegmentExporter(nil)
+	for name, data := range store.blobs() {
+		if !strings.HasPrefix(name, "calls/bodies/v1/") {
+			continue
+		}
+		decoder, err := transcript.NewSegmentDecoder(bytes.NewReader(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := exporter.ReadSegment(name, decoder); err != nil {
+			t.Fatal(err)
+		}
+		decoder.Close()
+	}
+	exporter.Finish()
+	if exporter.Stats.Failed() || exporter.Stats.DeltaBodies < 3 || exporter.Stats.MissingFooters != 0 {
+		t.Fatalf("whole-segment stats = %+v", exporter.Stats)
+	}
+}
+
+// fakeBlobStore speaks the part of the Blob service REST API the recorder
+// and exporter use: Put Block (checking Content-MD5), Put Block List, Put
+// Blob, and ranged Get Blob.
+type fakeBlobStore struct {
+	server    *httptest.Server
+	mu        sync.Mutex
+	staged    map[string]map[string][]byte
+	committed map[string][]byte
+}
+
+func newFakeBlobStore(t *testing.T) *fakeBlobStore {
+	store := &fakeBlobStore{staged: map[string]map[string][]byte{}, committed: map[string][]byte{}}
+	store.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/")
+		body, _ := io.ReadAll(r.Body)
+		if sum := r.Header.Get("Content-MD5"); sum != "" {
+			got := md5.Sum(body)
+			if base64.StdEncoding.EncodeToString(got[:]) != sum {
+				http.Error(w, "Md5Mismatch", http.StatusBadRequest)
+				return
+			}
+		}
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		switch {
+		case r.Method == http.MethodPut && r.URL.Query().Get("comp") == "block":
+			if store.staged[name] == nil {
+				store.staged[name] = map[string][]byte{}
+			}
+			store.staged[name][r.URL.Query().Get("blockid")] = body
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPut && r.URL.Query().Get("comp") == "blocklist":
+			var list struct {
+				Latest []string `xml:"Latest"`
+			}
+			if err := xml.Unmarshal(body, &list); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			var content []byte
+			for _, id := range list.Latest {
+				block, ok := store.staged[name][id]
+				if !ok {
+					http.Error(w, "InvalidBlockList", http.StatusBadRequest)
+					return
+				}
+				content = append(content, block...)
+			}
+			store.committed[name] = content
+			delete(store.staged, name)
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPut:
+			store.committed[name] = body
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodGet:
+			content, ok := store.committed[name]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			var start, end int64 = 0, int64(len(content)) - 1
+			if spec := r.Header.Get("x-ms-range"); spec != "" {
+				if _, err := fmt.Sscanf(spec, "bytes=%d-%d", &start, &end); err != nil || end >= int64(len(content)) {
+					http.Error(w, "InvalidRange", http.StatusRequestedRangeNotSatisfiable)
+					return
+				}
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(content[start : end+1])
+		default:
+			http.Error(w, "unsupported", http.StatusMethodNotAllowed)
+		}
+	}))
+	return store
+}
+
+func (s *fakeBlobStore) blobs() map[string][]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string][]byte, len(s.committed))
+	for name, data := range s.committed {
+		out[name] = data
+	}
+	return out
 }

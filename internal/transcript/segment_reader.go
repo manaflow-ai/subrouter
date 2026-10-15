@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // ExportBody is one reconstructed body. JSON bodies are embedded as JSON,
@@ -529,4 +531,148 @@ func modelOf(body []byte) string {
 		return head.Model
 	}
 	return head.Response.Model
+}
+
+// NewSegmentDecoder reads a segment (any run of whole zstd frames; the seek
+// table is a skippable frame and is skipped).
+func NewSegmentDecoder(r io.Reader) (*zstd.Decoder, error) {
+	return zstd.NewReader(r, zstd.WithDecoderMaxWindow(1<<31), zstd.WithDecoderConcurrency(1))
+}
+
+// ReadIndexRows parses one index blob (zstd-compressed JSON lines).
+func ReadIndexRows(r io.Reader, visit func(IndexRow) error) error {
+	decoder, err := NewSegmentDecoder(r)
+	if err != nil {
+		return err
+	}
+	defer decoder.Close()
+	reader := bufio.NewReaderSize(decoder, 1<<20)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(bytes.TrimSpace(line)) > 0 {
+			var row IndexRow
+			if jsonErr := json.Unmarshal(line, &row); jsonErr == nil {
+				if visitErr := visit(row); visitErr != nil {
+					return visitErr
+				}
+			}
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// CallBodies is one call rebuilt from its index row and the byte ranges it
+// names.
+type CallBodies struct {
+	Row      IndexRow       `json:"row"`
+	Request  *ExportBody    `json:"request,omitempty"`
+	Response *ExportBody    `json:"response,omitempty"`
+	Messages []ExportRecord `json:"messages,omitempty"`
+	Verified bool           `json:"verified"`
+}
+
+// RangeReader fetches a byte range of a blob.
+type RangeReader func(blob string, offset, length int64) ([]byte, error)
+
+// ExportCall rebuilds one call by reading only the frames its row names:
+// from the first frame its request depends on to the end of its response.
+func ExportCall(row IndexRow, read RangeReader) (CallBodies, error) {
+	out := CallBodies{Row: row}
+	collect := func(blob string, offset, length int64) ([]ExportRecord, ExportStats, error) {
+		if blob == "" || length <= 0 {
+			return nil, ExportStats{}, nil
+		}
+		data, err := read(blob, offset, length)
+		if err != nil {
+			return nil, ExportStats{}, err
+		}
+		decoder, err := NewSegmentDecoder(bytes.NewReader(data))
+		if err != nil {
+			return nil, ExportStats{}, err
+		}
+		defer decoder.Close()
+		var records []ExportRecord
+		exporter := NewSegmentExporter(func(record ExportRecord) error {
+			records = append(records, record)
+			return nil
+		})
+		if err := exporter.ReadSegment(blob, decoder); err != nil {
+			return nil, exporter.Stats, err
+		}
+		exporter.Finish()
+		return records, exporter.Stats, nil
+	}
+	var records []ExportRecord
+	var failed bool
+	same := row.RequestBlob == row.ResponseBlob && row.ResponseBlob != ""
+	if same {
+		start := min(row.RequestOffset, row.ResponseOffset)
+		end := max(row.RequestOffset+row.RequestLength, row.ResponseOffset+row.ResponseLength)
+		got, stats, err := collect(row.RequestBlob, start, end-start)
+		if err != nil {
+			return out, err
+		}
+		records, failed = got, stats.Failed()
+	} else {
+		for _, part := range [][3]any{{row.RequestBlob, row.RequestOffset, row.RequestLength}, {row.ResponseBlob, row.ResponseOffset, row.ResponseLength}} {
+			got, stats, err := collect(part[0].(string), part[1].(int64), part[2].(int64))
+			if err != nil {
+				return out, err
+			}
+			records = append(records, got...)
+			failed = failed || stats.Failed()
+		}
+	}
+	connection, stream, websocket := row.RequestID, "", row.Kind == "websocket"
+	if websocket {
+		if index := strings.LastIndex(row.RequestID, "/"); index > 0 {
+			connection, stream = row.RequestID[:index], row.RequestID[index+1:]
+		}
+	}
+	inCall := false
+	for _, record := range records {
+		if websocket {
+			if record.Kind != "websocket_message" || record.RequestID != connection {
+				continue
+			}
+			if record.Direction == "client_to_upstream" {
+				inCall = record.StreamID == stream
+				if inCall {
+					out.Request = record.Message
+				}
+				continue
+			}
+			if inCall {
+				out.Messages = append(out.Messages, record)
+			}
+			continue
+		}
+		if record.RequestID != row.RequestID {
+			continue
+		}
+		switch {
+		case record.Request != nil:
+			out.Request = record.Request
+		case record.Body != nil && record.Direction == "client_to_upstream":
+			out.Request = record.Body
+		case record.Body != nil && record.Direction == "upstream_to_client":
+			out.Response = record.Body
+		}
+		if record.Response != nil && record.Response.Body != nil {
+			out.Response = record.Response.Body
+		}
+	}
+	// Other calls in the range may cite bases before it; only this call's
+	// bodies decide.
+	_ = failed
+	out.Verified = out.Request != nil && out.Request.Verified && out.Request.SHA256 == row.RequestSHA256
+	if !websocket && row.ResponseSHA256 != "" {
+		out.Verified = out.Verified && out.Response != nil && out.Response.Verified && out.Response.SHA256 == row.ResponseSHA256
+	}
+	return out, nil
 }

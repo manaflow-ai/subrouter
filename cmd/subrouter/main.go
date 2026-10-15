@@ -385,13 +385,11 @@ func serve(args []string) error {
 	transcriptLocalRetention := flags.Duration("transcript-local-retention", 0, "delete local transcript files older than this after successful GCS sync; 0 disables")
 	transcriptMaxLocalBytesRaw := flags.String("transcript-max-local-bytes", "0", "max bytes to keep in the local transcript spool after successful GCS sync; supports KiB/MiB/GiB suffixes; 0 disables")
 	transcriptAzureRate := flags.String("transcript-azure-max-bytes-per-second", "2MiB", "cap on Azure transcript upload throughput; supports KiB/MiB/GiB suffixes; 0 disables the cap")
-	transcriptFormat := flags.String("transcript-format", "", "transcript layout: segments (one delta-encoded, compressed stream per process, uploaded as block blobs; the single-tenant default) or jsonl (one raw file per session; the multi-tenant default)")
-	transcriptHost := flags.String("transcript-host", "", "host name recorded in transcript segments and their blob paths; default the machine host name")
-	transcriptSegmentBytesRaw := flags.String("transcript-segment-max-bytes", "256MiB", "seal a transcript segment at this raw size")
-	transcriptSegmentAge := flags.Duration("transcript-segment-max-age", time.Hour, "seal a transcript segment at this age")
-	transcriptSegmentIdle := flags.Duration("transcript-segment-idle", 10*time.Minute, "seal a transcript segment after this long without events")
-	transcriptConvertLegacy := flags.Bool("transcript-convert-legacy", true, "in segments format, convert raw per-session transcript files in --transcripts to segments, upload them, and delete each file after a verified upload")
-	transcriptAzureTier := flags.String("transcript-azure-tier", "Cool", "access tier for uploaded transcript segments (Hot or Cool)")
+	transcriptStoreURL := flags.String("transcript-azure-container-url", "", "stream transcripts straight to this Azure blob container (https://<account>.blob.core.windows.net/<container>), with no local files; credential from SUBROUTER_TRANSCRIPT_AZURE_SAS_FILE (create+write SAS) or SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE; defaults to SUBROUTER_TRANSCRIPT_AZURE_CONTAINER_URL")
+	transcriptHost := flags.String("transcript-host", "", "host name recorded in transcript blob names and index rows; default the machine host name")
+	transcriptSegmentAge := flags.Duration("transcript-segment-max-age", time.Hour, "commit a session's transcript segment at this age")
+	transcriptSegmentIdle := flags.Duration("transcript-segment-idle", 15*time.Minute, "commit a session's transcript segment after this long without events")
+	transcriptIndexFlush := flags.Duration("transcript-index-flush", 10*time.Minute, "write transcript index rows this often")
 	transcriptAzureURL := flags.String("transcript-azure-url", "", "optional Azure blob container URL (https://<account>.blob.core.windows.net/<container>[/<prefix>]) for background transcript sync; defaults to SUBROUTER_TRANSCRIPT_AZURE_URL")
 	srSwitchInterval := defaultSRSwitchInterval
 	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for refreshing OAuth usage scores used by routing; non-positive disables scheduled refresh")
@@ -886,16 +884,10 @@ func serve(args []string) error {
 		// operator has to say "no cap" in the syncer's own terms.
 		transcriptAzureMaxBytesPerSecond = -1
 	}
-	transcriptSegmentBytes, err := parseByteSize(*transcriptSegmentBytesRaw)
-	if err != nil {
-		return fmt.Errorf("transcript-segment-max-bytes: %w", err)
-	}
 	transcriptRecorder, transcriptSegmentMode, err := newServeTranscriptRecorder(serveTranscriptOptions{
-		dir: *transcriptDir, format: *transcriptFormat, multiTenant: *multiTenant, host: *transcriptHost,
-		maxSegmentBytes: transcriptSegmentBytes, maxSegmentAge: *transcriptSegmentAge, idleSeal: *transcriptSegmentIdle,
-		maxLocalBytes: transcriptMaxLocalBytes, azureDestination: transcriptAzureDestination, azureKey: transcriptAzureKey,
-		azureSAS: strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_SAS")), azureTier: *transcriptAzureTier,
-		azureRate: transcriptAzureMaxBytesPerSecond, whois: tokenUsageWhoIs, convertLegacy: *transcriptConvertLegacy,
+		dir: *transcriptDir, storeURL: *transcriptStoreURL, host: *transcriptHost,
+		maxSegmentAge: *transcriptSegmentAge, idleSeal: *transcriptSegmentIdle, indexFlush: *transcriptIndexFlush,
+		whois: tokenUsageWhoIs,
 	})
 	if err != nil {
 		return err

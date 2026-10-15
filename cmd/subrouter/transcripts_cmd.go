@@ -8,12 +8,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -25,113 +28,92 @@ import (
 // serveTranscriptOptions are the serve flags that decide how transcripts are
 // recorded.
 type serveTranscriptOptions struct {
-	dir              string
-	format           string
-	multiTenant      bool
-	host             string
-	maxSegmentBytes  int64
-	maxSegmentAge    time.Duration
-	idleSeal         time.Duration
-	maxLocalBytes    int64
-	azureDestination string
-	azureKey         string
-	azureSAS         string
-	azureTier        string
-	azureRate        int64
-	whois            proxy.TokenUsageWhoIs
-	convertLegacy    bool
+	dir           string
+	storeURL      string
+	host          string
+	maxSegmentAge time.Duration
+	idleSeal      time.Duration
+	indexFlush    time.Duration
+	whois         proxy.TokenUsageWhoIs
 }
 
-// newServeTranscriptRecorder returns the recorder serve installs, and whether
-// it writes segments. Segments are the default for a single-tenant server:
-// they hold every body losslessly at a fraction of the raw size, name the
-// client machine, and upload as tierable block blobs.
+// newServeTranscriptRecorder returns the recorder serve installs and whether
+// it streams to blob storage. A container URL selects streaming (nothing
+// touches local disk); otherwise --transcripts keeps the raw per-session
+// files it always wrote.
 func newServeTranscriptRecorder(options serveTranscriptOptions) (*transcript.Recorder, bool, error) {
-	if strings.TrimSpace(options.dir) == "" {
-		return nil, false, nil
+	storeURL := strings.TrimSpace(options.storeURL)
+	if storeURL == "" {
+		storeURL = strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_CONTAINER_URL"))
 	}
-	format := strings.ToLower(strings.TrimSpace(options.format))
-	if format == "" {
-		format = "segments"
-		if options.multiTenant {
-			format = "jsonl"
+	if storeURL == "" {
+		if strings.TrimSpace(options.dir) == "" {
+			return nil, false, nil
 		}
-	}
-	switch format {
-	case "jsonl":
 		return transcript.NewRecorder(options.dir), false, nil
-	case "segments":
-	default:
-		return nil, false, fmt.Errorf("--transcript-format must be segments or jsonl, got %q", options.format)
 	}
-	config := transcript.SegmentConfig{
-		Dir:             options.dir,
-		Host:            options.host,
-		MaxSegmentBytes: options.maxSegmentBytes,
-		MaxSegmentAge:   options.maxSegmentAge,
-		IdleSeal:        options.idleSeal,
-		MaxLocalBytes:   options.maxLocalBytes,
-		Logger:          slog.Default(),
-		Version:         buildversion.Get().String(),
+	if strings.TrimSpace(options.dir) != "" {
+		slog.Warn("--transcripts is ignored: transcripts stream to the blob container", "container", storeURL)
 	}
-	if options.whois != nil {
-		resolver := options.whois
-		config.WhoIs = func(ctx context.Context, remoteAddr string) (string, string, bool) {
-			identity, ok := resolver.Lookup(ctx, remoteAddr)
-			if !ok {
-				return "", "", false
-			}
-			node := strings.TrimSuffix(identity.NodeName, ".")
-			if index := strings.IndexByte(node, '.'); index > 0 {
-				node = node[:index]
-			}
-			login := identity.LoginName
-			if login == "" && len(identity.Tags) > 0 {
-				login = strings.Join(identity.Tags, ",")
-			}
-			return node, login, node != "" || login != ""
-		}
-	}
-	if options.azureDestination != "" {
-		client, err := transcript.NewAzureBlobClient(transcript.AzureBlobClientConfig{
-			Destination:       options.azureDestination,
-			AccountKey:        options.azureKey,
-			SASToken:          options.azureSAS,
-			AccessTier:        options.azureTier,
-			MaxBytesPerSecond: options.azureRate,
-		})
-		if err != nil {
-			// Recording continues into the spool; the operator sees why
-			// nothing is uploaded.
-			slog.Warn("transcript segment upload is configured but not usable; segments stay in the spool", "destination", options.azureDestination, "error", err)
-		} else {
-			config.Uploader = client
-			slog.Info("transcript segment upload enabled", "destination", client.Destination(), "tier", options.azureTier)
-		}
-	}
-	recorder, err := transcript.NewSegmentRecorder(config)
+	client, err := transcriptStoreClient(storeURL)
 	if err != nil {
-		return nil, false, fmt.Errorf("transcript segments: %w", err)
+		return nil, false, fmt.Errorf("transcript container: %w", err)
 	}
-	if config.Uploader != nil && options.convertLegacy {
-		// Raw per-session files left by a jsonl-format worker (an older
-		// generation, or this host before segments) are converted, uploaded
-		// and only then deleted, oldest first, in bounded passes.
-		backlog := config
-		backlog.Dir = filepath.Join(options.dir, "segments-backlog")
-		backlog.Uploader = config.Uploader
-		backlog.DeltaBaseBytes = 128 << 20
-		backlog.WhoIs = nil
-		go transcript.RunLegacySpoolConversion(context.Background(), transcript.LegacySpoolOptions{
-			Dir:      options.dir,
-			Quiet:    15 * time.Minute,
-			MaxBytes: 16 << 30,
-			Delete:   true,
-			Segment:  backlog,
-			Logger:   slog.Default(),
-		}, 2*time.Minute)
+	recorder, err := transcript.NewSegmentRecorder(transcript.SegmentConfig{
+		Uploader:      client,
+		Host:          options.host,
+		MaxSegmentAge: options.maxSegmentAge,
+		IdleSeal:      options.idleSeal,
+		IndexFlush:    options.indexFlush,
+		Logger:        slog.Default(),
+		Version:       buildversion.Get().String(),
+		WhoIs:         whoisFunc(options.whois),
+	})
+	if err != nil {
+		return nil, false, err
 	}
+	slog.Info("transcripts stream to blob storage", "container", client.Destination())
 	return recorder, true, nil
+}
+
+func whoisFunc(resolver proxy.TokenUsageWhoIs) transcript.WhoIsFunc {
+	if resolver == nil {
+		return nil
+	}
+	return func(ctx context.Context, remoteAddr string) (string, string, bool) {
+		identity, ok := resolver.Lookup(ctx, remoteAddr)
+		if !ok {
+			return "", "", false
+		}
+		node := strings.TrimSuffix(identity.NodeName, ".")
+		if index := strings.IndexByte(node, '.'); index > 0 {
+			node = node[:index]
+		}
+		login := identity.LoginName
+		if login == "" && len(identity.Tags) > 0 {
+			login = strings.Join(identity.Tags, ",")
+		}
+		return node, login, node != "" || login != ""
+	}
+}
+
+// transcriptStoreClient opens the container with the SAS or account key from
+// the environment. Secrets come from files, never argv.
+func transcriptStoreClient(containerURL string) (*transcript.AzureBlobSyncer, error) {
+	sas, err := secretFromEnvironment("SUBROUTER_TRANSCRIPT_AZURE_SAS", "SUBROUTER_TRANSCRIPT_AZURE_SAS_FILE")
+	if err != nil {
+		return nil, err
+	}
+	key, err := secretFromEnvironment("SUBROUTER_TRANSCRIPT_AZURE_KEY", "SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE")
+	if err != nil {
+		return nil, err
+	}
+	return transcript.NewAzureBlobClient(transcript.AzureBlobClientConfig{
+		Destination:       containerURL,
+		AccountKey:        key,
+		SASToken:          strings.TrimPrefix(sas, "?"),
+		MaxBytesPerSecond: -1,
+	})
 }
 
 func runTranscriptsCommand(args []string) error {
@@ -150,32 +132,20 @@ func runTranscriptsCommand(args []string) error {
 	}
 }
 
-func transcriptAzureClient(destination string) (*transcript.AzureBlobSyncer, error) {
-	key, err := secretFromEnvironment("SUBROUTER_TRANSCRIPT_AZURE_KEY", "SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE")
-	if err != nil {
-		return nil, err
-	}
-	return transcript.NewAzureBlobClient(transcript.AzureBlobClientConfig{
-		Destination:       destination,
-		AccountKey:        key,
-		SASToken:          strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_SAS")),
-		MaxBytesPerSecond: -1,
-	})
-}
-
-// transcriptsExport reads segments (local files, or a date range in Azure)
-// and writes one JSON line per request with its response, per websocket
-// message, and per body that has no request (legacy data). verify writes
-// nothing but the stats and fails when any body does not rebuild exactly.
+// transcriptsExport rebuilds calls. With segment files as arguments it
+// replays them whole. With --container it reads the index for a date range
+// and rebuilds each call from just the byte ranges its row names, writing one
+// JSON line per call (index row plus request and response bodies). verify
+// writes nothing but stats and fails when any body does not rebuild exactly.
 func transcriptsExport(args []string, verifyOnly bool) error {
 	flags := flag.NewFlagSet("transcripts export", flag.ContinueOnError)
-	azureURL := flags.String("azure", "", "container URL with prefix (https://<account>.blob.core.windows.net/<container>/<prefix>); defaults to SUBROUTER_TRANSCRIPT_AZURE_URL when no files are given")
-	from := flags.String("from", "", "first UTC date to read from Azure (YYYY-MM-DD); default today")
-	to := flags.String("to", "", "last UTC date to read from Azure (YYYY-MM-DD); default --from")
-	host := flags.String("host", "", "only segments recorded by this host")
-	blobPrefix := flags.String("blob-prefix", "", "read every segment under this container-relative prefix instead of a date range")
-	session := flags.String("session", "", "only records of this session id")
+	container := flags.String("container", "", "container URL; defaults to SUBROUTER_TRANSCRIPT_AZURE_CONTAINER_URL (read credential: SUBROUTER_TRANSCRIPT_AZURE_SAS_FILE with read+list, or SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE)")
+	from := flags.String("from", "", "first UTC date (YYYY-MM-DD); default today")
+	to := flags.String("to", "", "last UTC date (YYYY-MM-DD); default --from")
+	session := flags.String("session", "", "only calls of this session id")
+	call := flags.String("call", "", "only this request id")
 	output := flags.String("out", "-", "output file, - for stdout")
+	workers := flags.Int("workers", 8, "concurrent range reads")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -196,81 +166,116 @@ func transcriptsExport(args []string, verifyOnly bool) error {
 	defer buffered.Flush()
 	encoder := json.NewEncoder(buffered)
 	encoder.SetEscapeHTML(false)
-	exporter := transcript.NewSegmentExporter(func(record transcript.ExportRecord) error {
-		return encoder.Encode(record)
-	})
-	if *session != "" {
-		wanted := *session
-		exporter.Filter = func(record transcript.ExportRecord) bool {
-			return record.SessionID == wanted || transcript.BaseSessionID(record.SessionID) == wanted
-		}
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	files := flags.Args()
-	if len(files) > 0 {
+	if files := flags.Args(); len(files) > 0 {
+		exporter := transcript.NewSegmentExporter(func(record transcript.ExportRecord) error { return encoder.Encode(record) })
 		sort.Strings(files)
 		for _, path := range files {
 			if err := exportLocalSegment(exporter, path); err != nil {
 				return fmt.Errorf("%s: %w", path, err)
 			}
 		}
-	} else {
-		destination := strings.TrimSpace(*azureURL)
-		if destination == "" {
-			destination = strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_URL"))
+		exporter.Finish()
+		stats, _ := json.Marshal(exporter.Stats)
+		fmt.Fprintln(os.Stderr, string(stats))
+		if exporter.Stats.Failed() {
+			return fmt.Errorf("%d bodies did not match their sha256 and %d could not be decoded", exporter.Stats.Mismatched, exporter.Stats.DecodeErrors)
 		}
-		if destination == "" {
-			return errors.New("give segment files or --azure")
-		}
-		client, err := transcriptAzureClient(destination)
-		if err != nil {
+		return nil
+	}
+
+	containerURL := strings.TrimSpace(*container)
+	if containerURL == "" {
+		containerURL = strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_CONTAINER_URL"))
+	}
+	if containerURL == "" {
+		return errors.New("give segment files or --container")
+	}
+	client, err := transcriptStoreClient(containerURL)
+	if err != nil {
+		return err
+	}
+	prefixes, err := datePrefixes("index/v1/", *from, *to)
+	if err != nil {
+		return err
+	}
+	var rows []transcript.IndexRow
+	for _, prefix := range prefixes {
+		var parts []string
+		if err := client.ListBlobs(ctx, prefix, func(entry transcript.AzureBlobEntry) error {
+			parts = append(parts, entry.Name)
+			return nil
+		}); err != nil {
 			return err
 		}
-		prefixes, err := exportPrefixes(client.Prefix(), *blobPrefix, *from, *to)
-		if err != nil {
-			return err
-		}
-		var names []string
-		for _, prefix := range prefixes {
-			err := client.ListBlobs(ctx, prefix, func(entry transcript.AzureBlobEntry) error {
-				if !strings.HasSuffix(entry.Name, ".jsonl.zst") {
-					return nil
-				}
-				if *host != "" && !strings.Contains(entry.Name, "/"+*host+"/") {
-					return nil
-				}
-				names = append(names, entry.Name)
-				return nil
-			})
+		for _, part := range parts {
+			body, _, err := client.OpenBlob(ctx, part)
 			if err != nil {
 				return err
 			}
-		}
-		sort.Slice(names, func(i, j int) bool { return filepath.Base(names[i]) < filepath.Base(names[j]) })
-		for _, name := range names {
-			if err := exportAzureSegment(ctx, exporter, client, name); err != nil {
-				return fmt.Errorf("%s: %w", name, err)
+			err = transcript.ReadIndexRows(body, func(row transcript.IndexRow) error {
+				if (*session == "" || row.SessionID == *session || transcript.BaseSessionID(row.SessionID) == *session) && (*call == "" || row.RequestID == *call) {
+					rows = append(rows, row)
+				}
+				return nil
+			})
+			_ = body.Close()
+			if err != nil {
+				return fmt.Errorf("%s: %w", part, err)
 			}
 		}
 	}
-	exporter.Finish()
-	if err := buffered.Flush(); err != nil {
-		return err
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Timestamp < rows[j].Timestamp })
+	read := func(blob string, offset, length int64) ([]byte, error) {
+		return client.ReadRange(ctx, blob, offset, length)
 	}
-	stats, _ := json.Marshal(exporter.Stats)
-	fmt.Fprintln(os.Stderr, string(stats))
-	if exporter.Stats.Failed() {
-		return fmt.Errorf("%d bodies did not match their sha256 and %d could not be decoded", exporter.Stats.Mismatched, exporter.Stats.DecodeErrors)
+	results := make([]transcript.CallBodies, len(rows))
+	errs := make([]error, len(rows))
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < max(1, *workers); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				index := int(next.Add(1) - 1)
+				if index >= len(rows) || ctx.Err() != nil {
+					return
+				}
+				results[index], errs[index] = transcript.ExportCall(rows[index], read)
+			}
+		}()
+	}
+	wg.Wait()
+	var verified, failed, lost int
+	for index, result := range results {
+		switch {
+		case errs[index] != nil:
+			failed++
+			fmt.Fprintf(os.Stderr, "%s: %v\n", rows[index].RequestID, errs[index])
+			continue
+		case rows[index].BodyLost:
+			lost++
+		case result.Verified:
+			verified++
+		default:
+			failed++
+		}
+		if err := encoder.Encode(result); err != nil {
+			return err
+		}
+	}
+	summary, _ := json.Marshal(map[string]int{"calls": len(rows), "verified": verified, "failed": failed, "body_lost": lost})
+	fmt.Fprintln(os.Stderr, string(summary))
+	if failed > 0 {
+		return fmt.Errorf("%d calls did not rebuild exactly", failed)
 	}
 	return nil
 }
 
-func exportPrefixes(clientPrefix, blobPrefix, from, to string) ([]string, error) {
-	if blobPrefix != "" {
-		return []string{blobPrefix}, nil
-	}
+func datePrefixes(base, from, to string) ([]string, error) {
 	start := time.Now().UTC()
 	if from != "" {
 		parsed, err := time.Parse("2006-01-02", from)
@@ -286,10 +291,6 @@ func exportPrefixes(clientPrefix, blobPrefix, from, to string) ([]string, error)
 			return nil, fmt.Errorf("--to: %w", err)
 		}
 		end = parsed
-	}
-	base := "segments/v1/"
-	if clientPrefix != "" {
-		base = clientPrefix + "/" + base
 	}
 	var prefixes []string
 	for day := start; !day.After(end); day = day.AddDate(0, 0, 1) {
@@ -315,176 +316,216 @@ func exportLocalSegment(exporter *transcript.SegmentExporter, path string) error
 	return exporter.ReadSegment(filepath.Base(path), file)
 }
 
-func exportAzureSegment(ctx context.Context, exporter *transcript.SegmentExporter, client *transcript.AzureBlobSyncer, name string) error {
-	body, _, err := client.OpenBlob(ctx, name)
-	if err != nil {
-		return err
-	}
-	defer body.Close()
-	decoder, err := transcript.NewSegmentDecoder(body)
-	if err != nil {
-		return err
-	}
-	defer decoder.Close()
-	return exporter.ReadSegment(filepath.Base(name), decoder)
+// countingUploader discards what it is given and counts it (dry runs and
+// level measurements).
+type countingUploader struct {
+	blocks, bytes, blobs, blobBytes atomic.Int64
 }
 
-// transcriptsRecompress converts raw per-session transcript blobs (the
-// append blobs the old syncer wrote) into compressed segment block blobs.
-// It never deletes or modifies a source blob. Each converted source gets a
-// marker blob, so a rerun skips it.
-func transcriptsRecompress(args []string) error {
-	flags := flag.NewFlagSet("transcripts recompress", flag.ContinueOnError)
-	sourceURL := flags.String("source", "", "container URL with the raw transcript prefix, e.g. https://<account>.blob.core.windows.net/transcripts/cmux-lawrence/by-agent")
-	destURL := flags.String("dest", "", "container URL with prefix for the segments, e.g. https://<account>.blob.core.windows.net/transcripts/cmux-lawrence; default: the source container and the first path element of the source prefix")
-	spool := flags.String("spool", "", "local working directory for segments before upload (required)")
-	maxBlobs := flags.Int("max-blobs", 1, "convert at most this many source blobs; 0 means no limit")
-	maxBytes := flags.String("max-bytes", "1GiB", "stop after reading this many source bytes; 0 means no limit")
-	match := flags.String("match", "", "only source blobs whose name contains this text")
-	dryRun := flags.Bool("dry-run", false, "write segments locally and do not upload or mark anything")
-	level := flags.Int("level", 4, "zstd level 1-4 (4 is the best ratio)")
-	segmentBytes := flags.String("segment-bytes", "256MiB", "roll output segments at this raw size")
-	localDir := flags.String("local-dir", "", "convert a local raw transcript spool (the directory holding by-agent/) instead of Azure blobs")
-	deleteLocal := flags.Bool("delete", false, "with --local-dir: delete each source file after the segment holding it is uploaded and verified")
-	quiet := flags.Duration("quiet", 15*time.Minute, "with --local-dir: skip files written to more recently than this")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if *localDir != "" {
-		return recompressLocalSpool(*localDir, *spool, *dryRun, *deleteLocal, *quiet, *maxBytes, *destURL, *level)
-	}
-	if *sourceURL == "" || *spool == "" {
-		return errors.New("--source and --spool are required")
-	}
-	byteLimit, err := parseByteSize(*maxBytes)
-	if err != nil {
-		return err
-	}
-	rollBytes, err := parseByteSize(*segmentBytes)
-	if err != nil {
-		return err
-	}
-	source, err := transcriptAzureClient(*sourceURL)
-	if err != nil {
-		return err
-	}
-	destination := strings.TrimSpace(*destURL)
-	if destination == "" {
-		first := strings.SplitN(source.Prefix(), "/", 2)[0]
-		destination = strings.TrimSuffix(strings.TrimSuffix(*sourceURL, "/"), strings.TrimPrefix(source.Prefix(), first))
-	}
-	dest, err := transcriptAzureClient(destination)
-	if err != nil {
-		return err
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-
-	markerPrefix := "segments/v1/legacy/converted/"
-	config := transcript.SegmentConfig{
-		Dir:             *spool,
-		Host:            "legacy",
-		MaxSegmentBytes: rollBytes,
-		CompressLevel:   zstd.EncoderLevelFromZstd(map[int]int{1: 1, 2: 3, 3: 7, 4: 19}[*level]),
-		BlobPrefix:      "segments/v1/legacy/" + time.Now().UTC().Format("2006/01/02"),
-		Logger:          slog.Default(),
-	}
-	if !*dryRun {
-		config.Uploader = dest
-	}
-	converter, err := transcript.NewLegacyConverter(ctx, config)
-	if err != nil {
-		return err
-	}
-	var sourceSizes = map[string]int64{}
-	converter.OnSealed = func(info transcript.SegmentInfo, completed []string) error {
-		fmt.Fprintf(os.Stderr, "segment %s raw=%d compressed=%d sources_completed=%d\n", info.SegmentID, info.RawBytes, info.CompressedBytes, len(completed))
-		if *dryRun {
-			return nil
-		}
-		for _, name := range completed {
-			marker, _ := json.Marshal(map[string]any{"source": name, "source_bytes": sourceSizes[name], "completed_in": transcript.SegmentBlobName(info), "at": time.Now().UTC().Format(time.RFC3339)})
-			if err := dest.PutSmallBlob(ctx, markerName(dest.Prefix(), markerPrefix, name), marker, "application/json"); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
-	var names []transcript.AzureBlobEntry
-	err = source.ListBlobs(ctx, source.Prefix()+"/", func(entry transcript.AzureBlobEntry) error {
-		if !strings.HasSuffix(entry.Name, ".jsonl") || (*match != "" && !strings.Contains(entry.Name, *match)) {
-			return nil
-		}
-		names = append(names, entry)
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	var readBytes int64
-	converted := 0
-	started := time.Now()
-	for _, entry := range names {
-		if *maxBlobs > 0 && converted >= *maxBlobs {
-			break
-		}
-		if byteLimit > 0 && readBytes >= byteLimit {
-			break
-		}
-		if !*dryRun {
-			if exists, err := dest.BlobExists(ctx, markerName(dest.Prefix(), markerPrefix, entry.Name)); err != nil {
-				return err
-			} else if exists {
-				continue
-			}
-		}
-		body, _, err := source.OpenBlob(ctx, entry.Name)
-		if err != nil {
-			return err
-		}
-		sourceSizes[entry.Name] = entry.Size
-		err = converter.Convert(entry.Name, body)
-		_ = body.Close()
-		if err != nil {
-			return fmt.Errorf("%s: %w", entry.Name, err)
-		}
-		readBytes += entry.Size
-		converted++
-		fmt.Fprintf(os.Stderr, "converted %s (%d bytes)\n", entry.Name, entry.Size)
-	}
-	if err := converter.Close(); err != nil {
-		return err
-	}
-	var compressed, raw int64
-	for _, info := range converter.Segments() {
-		compressed += info.CompressedBytes
-		raw += info.RawBytes
-	}
-	summary, _ := json.Marshal(map[string]any{
-		"sources": converter.Sources, "source_bytes": converter.SourceBytes, "segment_raw_bytes": raw,
-		"compressed_bytes": compressed, "segments": len(converter.Segments()),
-		"ratio_source_to_compressed": ratio(converter.SourceBytes, compressed),
-		"mismatched_bodies":          converter.Mismatched, "incomplete_streams": converter.Incomplete,
-		"elapsed_seconds": time.Since(started).Seconds(), "uploaded": !*dryRun,
-	})
-	fmt.Println(string(summary))
+func (u *countingUploader) PutBlock(_ context.Context, _, _ string, data []byte) error {
+	u.blocks.Add(1)
+	u.bytes.Add(int64(len(data)))
 	return nil
 }
 
-func markerName(clientPrefix, markerPrefix, source string) string {
-	name := markerPrefix + strings.ReplaceAll(source, "/", "__") + ".json"
-	if clientPrefix != "" {
-		return clientPrefix + "/" + name
-	}
-	return name
+func (u *countingUploader) PutBlockList(context.Context, string, []string, string, map[string]string) error {
+	return nil
 }
 
-func ratio(a, b int64) float64 {
-	if b == 0 {
-		return 0
+func (u *countingUploader) PutBlob(_ context.Context, _ string, data []byte, _ string) error {
+	u.blobs.Add(1)
+	u.blobBytes.Add(int64(len(data)))
+	return nil
+}
+
+func (u *countingUploader) Destination() string { return "dry-run" }
+
+// transcriptsRecompress converts raw per-session transcripts into the
+// segment format: a local spool (--local-dir, deleting each file once its
+// segments are committed) or the old account's append blobs (--source,
+// never deleting anything).
+func transcriptsRecompress(args []string) error {
+	flags := flag.NewFlagSet("transcripts recompress", flag.ContinueOnError)
+	localDir := flags.String("local-dir", "", "raw transcript spool (the directory holding by-agent/)")
+	sourceURL := flags.String("source", "", "container URL with a raw transcript prefix in the old account, e.g. https://<old-account>.blob.core.windows.net/transcripts/cmux-lawrence/by-agent (read credential: SUBROUTER_TRANSCRIPT_SOURCE_KEY_FILE)")
+	container := flags.String("container", "", "destination container URL; defaults to SUBROUTER_TRANSCRIPT_AZURE_CONTAINER_URL")
+	deleteSources := flags.Bool("delete", false, "with --local-dir: delete each source file after its segments are committed")
+	dryRun := flags.Bool("dry-run", false, "compress and count, upload nothing, delete nothing")
+	quiet := flags.Duration("quiet", 15*time.Minute, "with --local-dir: skip files written to more recently than this")
+	maxBlobs := flags.Int("max-blobs", 0, "with --source: convert at most this many blobs (0: no limit)")
+	match := flags.String("match", "", "only sources whose name contains this text")
+	level := flags.Int("level", 4, "zstd level 1-4 (fastest, default, better, best)")
+	frameBytes := flags.String("frame-bytes", "16MiB", "raw bytes per independent zstd frame")
+	host := flags.String("host", "", "recording host label; default the machine host name")
+	if err := flags.Parse(args); err != nil {
+		return err
 	}
-	return float64(a) / float64(b)
+	frame, err := parseByteSize(*frameBytes)
+	if err != nil {
+		return err
+	}
+	if *deleteSources && *dryRun {
+		return errors.New("--delete cannot be combined with --dry-run")
+	}
+	var uploader transcript.BlockUploader
+	counting := &countingUploader{}
+	if *dryRun {
+		uploader = counting
+	} else {
+		containerURL := strings.TrimSpace(*container)
+		if containerURL == "" {
+			containerURL = strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_CONTAINER_URL"))
+		}
+		if containerURL == "" {
+			return errors.New("--container is required unless --dry-run")
+		}
+		client, err := transcriptStoreClient(containerURL)
+		if err != nil {
+			return err
+		}
+		uploader = client
+	}
+	levels := map[int]zstd.EncoderLevel{1: zstd.SpeedFastest, 2: zstd.SpeedDefault, 3: zstd.SpeedBetterCompression, 4: zstd.SpeedBestCompression}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	converter, err := transcript.NewLegacyConverter(ctx, transcript.SegmentConfig{
+		Uploader:      uploader,
+		Host:          *host,
+		FrameBytes:    int(frame),
+		CompressLevel: levels[*level],
+		Logger:        slog.Default(),
+		Version:       buildversion.Get().String(),
+		CloseTimeout:  30 * time.Minute,
+	})
+	if err != nil {
+		return err
+	}
+	var deleted, kept atomic.Int64
+	started := time.Now()
+	switch {
+	case *localDir != "":
+		sources := map[string]legacyFile{}
+		var mu sync.Mutex
+		converter.OnSourceStored = func(source string, ok bool) {
+			mu.Lock()
+			file, found := sources[source]
+			mu.Unlock()
+			if !found || !*deleteSources || !ok {
+				kept.Add(1)
+				return
+			}
+			info, err := os.Stat(file.path)
+			if err != nil || info.Size() != file.size || !info.ModTime().Equal(file.modTime) {
+				// Appended to after it was read: keep it for the next run.
+				kept.Add(1)
+				return
+			}
+			if os.Remove(file.path) == nil {
+				deleted.Add(1)
+			}
+		}
+		files, err := quietLegacyFiles(filepath.Join(*localDir, "by-agent"), *quiet, *match)
+		if err != nil {
+			return err
+		}
+		for _, file := range files {
+			rel, _ := filepath.Rel(*localDir, file.path)
+			mu.Lock()
+			sources[rel] = file
+			mu.Unlock()
+			handle, err := os.Open(file.path)
+			if err != nil {
+				continue
+			}
+			err = converter.Convert(rel, handle)
+			_ = handle.Close()
+			if err != nil {
+				return err
+			}
+		}
+	case *sourceURL != "":
+		key, err := secretFromEnvironment("SUBROUTER_TRANSCRIPT_SOURCE_KEY", "SUBROUTER_TRANSCRIPT_SOURCE_KEY_FILE")
+		if err != nil {
+			return err
+		}
+		source, err := transcript.NewAzureBlobClient(transcript.AzureBlobClientConfig{Destination: *sourceURL, AccountKey: key, MaxBytesPerSecond: -1})
+		if err != nil {
+			return err
+		}
+		var names []string
+		if err := source.ListBlobs(ctx, source.Prefix()+"/", func(entry transcript.AzureBlobEntry) error {
+			if strings.HasSuffix(entry.Name, ".jsonl") && (*match == "" || strings.Contains(entry.Name, *match)) {
+				names = append(names, entry.Name)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for index, name := range names {
+			if *maxBlobs > 0 && index >= *maxBlobs {
+				break
+			}
+			body, _, err := source.OpenBlob(ctx, name)
+			if err != nil {
+				return err
+			}
+			err = converter.Convert(name, body)
+			_ = body.Close()
+			if err != nil {
+				return fmt.Errorf("%s: %w", name, err)
+			}
+		}
+	default:
+		return errors.New("give --local-dir or --source")
+	}
+	closeErr := converter.Close()
+	stats := converter.Stats()
+	summary, _ := json.Marshal(map[string]any{
+		"sources": converter.Sources, "source_bytes": converter.SourceBytes,
+		"segment_raw_bytes": stats.CommittedRawBytes, "body_bytes": stats.CommittedBodyBytes,
+		"stored_bytes": stats.CommittedBytes, "index_bytes_dry_run": counting.blobBytes.Load(),
+		"segments": stats.CommittedSegments, "lost_segments": stats.LostSegments, "index_rows": stats.IndexRows,
+		"mismatched_bodies": converter.Mismatched, "incomplete_streams": converter.Incomplete,
+		"deleted": deleted.Load(), "kept": kept.Load(), "elapsed_seconds": time.Since(started).Seconds(), "dry_run": *dryRun,
+	})
+	fmt.Println(string(summary))
+	return closeErr
+}
+
+type legacyFile struct {
+	path    string
+	size    int64
+	modTime time.Time
+}
+
+// quietLegacyFiles lists raw transcript files not written to for quiet,
+// oldest first.
+func quietLegacyFiles(root string, quiet time.Duration, match string) ([]legacyFile, error) {
+	var files []legacyFile
+	now := time.Now()
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		// "._" files are macOS AppleDouble metadata on non-Apple volumes.
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") || strings.HasPrefix(entry.Name(), "._") {
+			return nil
+		}
+		if match != "" && !strings.Contains(path, match) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil || now.Sub(info.ModTime()) < quiet {
+			return nil
+		}
+		files = append(files, legacyFile{path: path, size: info.Size(), modTime: info.ModTime()})
+		return nil
+	})
+	sort.Slice(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
+	return files, err
 }
 
 type legacyTranscriptSyncOptions struct {
@@ -493,7 +534,7 @@ type legacyTranscriptSyncOptions struct {
 	maxLocalBytes, azureRate                int64
 }
 
-// startLegacyTranscriptSync runs the raw-file syncers of the jsonl format.
+// startLegacyTranscriptSync runs the raw-file syncers of the local format.
 func startLegacyTranscriptSync(options legacyTranscriptSyncOptions) error {
 	gcs := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
 		SourceDir:      options.dir,
@@ -531,44 +572,4 @@ func startLegacyTranscriptSync(options legacyTranscriptSyncOptions) error {
 			"fix", "set SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE (or SUBROUTER_TRANSCRIPT_AZURE_SAS) and check the container URL")
 	}
 	return nil
-}
-
-func recompressLocalSpool(dir, spool string, dryRun, deleteSources bool, quiet time.Duration, maxBytesRaw, destination string, level int) error {
-	if spool == "" {
-		return errors.New("--spool is required")
-	}
-	maxBytes, err := parseByteSize(maxBytesRaw)
-	if err != nil {
-		return err
-	}
-	if deleteSources && dryRun {
-		return errors.New("--delete cannot be combined with --dry-run")
-	}
-	config := transcript.SegmentConfig{
-		Dir:           spool,
-		CompressLevel: zstd.EncoderLevelFromZstd(map[int]int{1: 1, 2: 3, 3: 7, 4: 19}[level]),
-		Logger:        slog.Default(),
-	}
-	if !dryRun {
-		if destination == "" {
-			destination = strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_URL"))
-		}
-		if destination == "" {
-			return errors.New("--dest (or SUBROUTER_TRANSCRIPT_AZURE_URL) is required unless --dry-run")
-		}
-		client, err := transcriptAzureClient(destination)
-		if err != nil {
-			return err
-		}
-		config.Uploader = client
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-	started := time.Now()
-	result, err := transcript.ConvertLegacySpool(ctx, transcript.LegacySpoolOptions{
-		Dir: dir, Quiet: quiet, MaxBytes: maxBytes, Delete: deleteSources, Segment: config, KeepWork: dryRun,
-	})
-	summary, _ := json.Marshal(map[string]any{"result": result, "ratio_source_to_compressed": ratio(result.SourceBytes, result.CompressedBytes), "elapsed_seconds": time.Since(started).Seconds()})
-	fmt.Println(string(summary))
-	return err
 }

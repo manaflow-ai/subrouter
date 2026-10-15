@@ -9,83 +9,89 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
-	"strings"
+	"sync"
 	"time"
 )
 
 // LegacyConverter rewrites raw per-session transcript JSONL (base64 body
-// chunks, as the append-blob spool holds) into the segment format: bodies
-// reassembled, request bodies delta-encoded, text stored as text, sealed
-// segments compressed and uploaded like live ones.
+// chunks, as the old local spool and the append blobs hold) into segments:
+// bodies reassembled, request bodies delta-encoded, text stored as text,
+// uploaded like live segments, with index rows for every call that can be
+// paired without guessing.
 type LegacyConverter struct {
 	w   *segmentWriter
 	ctx context.Context
 
-	// SealedSources lists, per sealed segment, the sources that ended in it.
-	// A source is safe to mark converted once the segment holding its last
-	// event is stored.
-	OnSealed func(info SegmentInfo, completedSources []string) error
+	// OnSourceStored runs once every segment holding a source's events is
+	// committed (ok) or one of them failed (not ok). It may run on an upload
+	// goroutine.
+	OnSourceStored func(source string, ok bool)
 
-	completed []string
-	failed    bool
-	// SourceBytes and Sources count what was read.
+	mu       sync.Mutex
+	pending  map[string]int
+	failed   map[string]bool
+	finished map[string]bool
+
+	// pairing state per session: calls waiting for a request body, and
+	// calls waiting for a response.
+	needBody map[string][]string
+	needResp map[string][]string
+	serial   int
+
 	SourceBytes int64
 	Sources     int
 	Mismatched  int64
 	Incomplete  int64
-	seg         SegmentConfig
-	sealedInfos []SegmentInfo
+	mismatchBy  map[string]bool
 }
 
-// NewLegacyConverter writes segments under cfg.Dir; cfg.Uploader may be nil
-// to keep them local. Segment roll limits apply as in live recording.
+// NewLegacyConverter writes through cfg.Uploader. Convert runs in the
+// caller's goroutine; uploads run in the background.
 func NewLegacyConverter(ctx context.Context, cfg SegmentConfig) (*LegacyConverter, error) {
-	w, err := newOfflineSegmentWriter(cfg)
+	w, err := newSegmentWriter(cfg, true)
 	if err != nil {
 		return nil, err
 	}
-	converter := &LegacyConverter{w: w, ctx: ctx, seg: cfg}
-	w.onSealed = converter.sealed
-	return converter, nil
+	c := &LegacyConverter{
+		w: w, ctx: ctx,
+		pending: map[string]int{}, failed: map[string]bool{}, finished: map[string]bool{},
+		needBody: map[string][]string{}, needResp: map[string][]string{}, mismatchBy: map[string]bool{},
+	}
+	w.onSeal = c.sealed
+	return c, nil
 }
 
-// Segments reports what was produced so far.
-func (c *LegacyConverter) Segments() []SegmentInfo { return c.sealedInfos }
+// Stats reports what the upload side has done.
+func (c *LegacyConverter) Stats() SegmentStats { return c.w.stats() }
 
-func (c *LegacyConverter) sealed(path string) error {
-	if c.failed {
-		// A segment already failed: sources that ended in it are not stored,
-		// so no later segment may report them (or anything) as completed.
-		return errLegacyConversionFailed
+func (c *LegacyConverter) sealed(seg *sessionSegment) {
+	for source := range seg.sources {
+		c.mu.Lock()
+		c.pending[source]++
+		c.mu.Unlock()
+		source := source
+		c.w.up.onSettled(seg, func(ok bool) { c.settle(source, ok) })
 	}
-	info, compressedPath, err := c.w.store.compressSync(c.ctx, path)
-	if err != nil {
-		c.failed = true
-		return err
+}
+
+func (c *LegacyConverter) settle(source string, ok bool) {
+	c.mu.Lock()
+	c.pending[source]--
+	if !ok {
+		c.failed[source] = true
 	}
-	if c.w.cfg.Uploader != nil {
-		uploadCtx, cancel := context.WithTimeout(c.ctx, segmentUploadTimeout)
-		err := c.w.cfg.Uploader.UploadSegment(uploadCtx, compressedPath, info)
-		cancel()
-		if err != nil {
-			c.failed = true
-			return err
-		}
-		_ = os.Remove(compressedPath)
-		_ = os.Remove(compressedPath + ".json")
+	ready := c.finished[source] && c.pending[source] == 0
+	stored := !c.failed[source] && !c.mismatchBy[source]
+	if ready {
+		delete(c.pending, source)
+		delete(c.finished, source)
 	}
-	c.sealedInfos = append(c.sealedInfos, info)
-	completed := c.completed
-	c.completed = nil
-	if c.OnSealed != nil {
-		return c.OnSealed(info, completed)
+	c.mu.Unlock()
+	if ready && c.OnSourceStored != nil {
+		c.OnSourceStored(source, stored)
 	}
-	return nil
 }
 
 type legacyStream struct {
@@ -95,27 +101,24 @@ type legacyStream struct {
 	at        time.Time
 }
 
-// Convert reads one legacy JSONL source to its end.
+// Convert reads one legacy JSONL source to its end and seals the segments
+// that hold it.
 func (c *LegacyConverter) Convert(source string, r io.Reader) error {
-	if c.failed || c.w.lastErr != nil {
-		return errors.Join(errLegacyConversionFailed, c.w.lastErr)
-	}
 	c.Sources++
+	c.w.source = source
+	defer func() { c.w.source = "" }()
 	streams := map[string]*legacyStream{}
 	var order []string
-	c.w.process(&segmentItem{kind: itemEvent, at: time.Now(), eventType: "legacy_source", payload: map[string]any{"source": source}})
 	reader := bufio.NewReaderSize(r, 4<<20)
 	for {
 		if err := c.ctx.Err(); err != nil {
 			return err
 		}
-		if c.w.lastErr != nil {
-			return c.w.lastErr
-		}
+		c.w.up.waitRoom(c.ctx)
 		line, readErr := reader.ReadBytes('\n')
 		c.SourceBytes += int64(len(line))
 		if len(bytes.TrimSpace(line)) > 0 {
-			c.convertLine(line, streams, &order)
+			c.convertLine(source, line, streams, &order)
 		}
 		if readErr == io.EOF {
 			break
@@ -137,24 +140,57 @@ func (c *LegacyConverter) Convert(source string, r io.Reader) error {
 		summary["body_chunked"] = true
 		summary["bytes"] = len(stream.data)
 		summary["sha256"] = hex.EncodeToString(sum[:])
-		c.emitStream(id, stream, summary)
+		c.emitStream(id, stream, summary, stream.at)
 	}
-	c.completed = append(c.completed, source)
-	c.w.flushBuffer()
-	c.w.maybeRollSize()
-	return c.w.lastErr
+	c.mu.Lock()
+	c.finished[source] = true
+	c.mu.Unlock()
+	for _, seg := range c.w.sessions {
+		if seg.sources[source] {
+			c.w.sealSession(seg, "source")
+		}
+	}
+	for id, call := range c.w.calls {
+		if call.row.LegacySource == source {
+			c.w.closeCall(call, false)
+			delete(c.w.calls, id)
+		}
+	}
+	c.needBody, c.needResp = map[string][]string{}, map[string][]string{}
+	// A source with no events has nothing pending.
+	c.mu.Lock()
+	ready := c.pending[source] == 0
+	stored := !c.failed[source] && !c.mismatchBy[source]
+	if ready {
+		delete(c.finished, source)
+	}
+	c.mu.Unlock()
+	if ready && c.OnSourceStored != nil {
+		c.OnSourceStored(source, stored)
+	}
+	return nil
 }
 
-var errLegacyConversionFailed = errors.New("an earlier segment of this conversion failed")
+// Close commits what is left, writes the index, and waits for the uploads.
+func (c *LegacyConverter) Close() error { return c.w.close() }
 
-// Close seals the last segment.
-func (c *LegacyConverter) Close() error {
-	if c.failed || c.w.lastErr != nil {
-		return errors.Join(errLegacyConversionFailed, c.w.lastErr)
+func (c *LegacyConverter) nextID() string {
+	c.serial++
+	return fmt.Sprintf("legacy-%d-%d", time.Now().UnixNano(), c.serial)
+}
+
+// pair takes the one call waiting in queue, or nothing when several are
+// waiting: interleaved calls cannot be paired without guessing.
+func pair(queues map[string][]string, key string) string {
+	queue := queues[key]
+	if len(queue) != 1 {
+		if len(queue) > 1 {
+			queues[key] = nil
+		}
+		return ""
 	}
-	c.w.seal("close")
-	c.w.flushBuffer()
-	return c.w.lastErr
+	queues[key] = nil
+	return queue[0]
 }
 
 var legacyBodyFields = []string{"body_base64", "body_text", "chunk_sha256", "chunk_index", "chunk_bytes", "body_chunk", "offset"}
@@ -167,7 +203,7 @@ func copyPayload(payload map[string]any) map[string]any {
 	return out
 }
 
-func (c *LegacyConverter) convertLine(line []byte, streams map[string]*legacyStream, order *[]string) {
+func (c *LegacyConverter) convertLine(source string, line []byte, streams map[string]*legacyStream, order *[]string) {
 	var event Event
 	if err := json.Unmarshal(line, &event); err != nil {
 		// Keep an unparseable line verbatim rather than lose it.
@@ -212,8 +248,9 @@ func (c *LegacyConverter) convertLine(line []byte, streams map[string]*legacyStr
 		sum := sha256.Sum256(stream.data)
 		if hex.EncodeToString(sum[:]) != str(payload["sha256"]) {
 			c.Mismatched++
+			c.mismatchBy[source] = true
 		}
-		c.emitStream(streamID, stream, copyPayload(payload))
+		c.emitStream(streamID, stream, copyPayload(payload), at)
 	case payload["body_base64"] != nil:
 		encoded, _ := payload["body_base64"].(string)
 		body, err := base64.StdEncoding.DecodeString(encoded)
@@ -227,7 +264,16 @@ func (c *LegacyConverter) convertLine(line []byte, streams map[string]*legacyStr
 		}
 		delete(base, "bytes")
 		delete(base, "sha256")
+		if event.Type == "http_body" {
+			c.assignRequestID(base)
+		}
 		c.w.process(&segmentItem{kind: itemBody, at: at, eventType: event.Type, payload: base, body: body, delta: str(payload["direction"]) == "client_to_upstream"})
+	case event.Type == "subrouter_meta" && str(payload["request_id"]) == "" && str(payload["transport"]) != "websocket":
+		key, _, _ := sessionKey(payload)
+		id := c.nextID()
+		payload["request_id"] = id
+		c.needBody[key] = append(c.needBody[key], id)
+		c.w.process(&segmentItem{kind: itemMeta, at: at, eventType: event.Type, payload: payload})
 	default:
 		c.w.process(&segmentItem{kind: itemEvent, at: at, eventType: event.Type, payload: payload})
 	}
@@ -235,7 +281,33 @@ func (c *LegacyConverter) convertLine(line []byte, streams map[string]*legacyStr
 
 // emitStream writes a reassembled stream: a request body whole (so it can be
 // delta-encoded), anything else as chunks plus its summary.
-func (c *LegacyConverter) emitStream(streamID string, stream *legacyStream, summary map[string]any) {
+// assignRequestID pairs a legacy body with its call when exactly one call
+// is waiting for it.
+func (c *LegacyConverter) assignRequestID(payload map[string]any) {
+	if str(payload["request_id"]) != "" {
+		return
+	}
+	key, _, _ := sessionKey(payload)
+	switch str(payload["direction"]) {
+	case "client_to_upstream":
+		if id := pair(c.needBody, key); id != "" {
+			payload["request_id"] = id
+			c.needResp[key] = append(c.needResp[key], id)
+		}
+	case "upstream_to_client":
+		if id := pair(c.needResp, key); id != "" {
+			payload["request_id"] = id
+		}
+	}
+}
+
+func (c *LegacyConverter) emitStream(streamID string, stream *legacyStream, summary map[string]any, end time.Time) {
+	if stream.eventType == "http_body" {
+		c.assignRequestID(stream.payload)
+		if id := str(stream.payload["request_id"]); id != "" {
+			summary["request_id"] = id
+		}
+	}
 	if str(stream.payload["direction"]) == "client_to_upstream" && !boolField(summary, "incomplete") {
 		payload := copyPayload(stream.payload)
 		payload["stream_id"] = streamID
@@ -264,7 +336,7 @@ func (c *LegacyConverter) emitStream(streamID string, stream *legacyStream, summ
 		c.w.process(&segmentItem{kind: itemChunk, at: stream.at, eventType: stream.eventType, payload: payload, body: stream.data, streamID: streamID})
 	}
 	summary["stream_id"] = streamID
-	c.w.process(&segmentItem{kind: itemSummary, at: stream.at, eventType: stream.eventType, payload: summary, streamID: streamID})
+	c.w.process(&segmentItem{kind: itemSummary, at: end, eventType: stream.eventType, payload: summary, streamID: streamID})
 }
 
 func trimChunkSuffix(eventType string) string {
@@ -273,52 +345,6 @@ func trimChunkSuffix(eventType string) string {
 		return eventType[:len(eventType)-len(suffix)]
 	}
 	return eventType
-}
-
-// newOfflineSegmentWriter is a writer driven synchronously by its caller,
-// without the queue and background goroutines of live recording.
-func newOfflineSegmentWriter(cfg SegmentConfig) (*segmentWriter, error) {
-	if cfg.Dir == "" {
-		return nil, errors.New("segment directory is empty")
-	}
-	cfg = withSegmentDefaults(cfg)
-	root := filepath.Join(cfg.Dir, "segments")
-	live := filepath.Join(root, "live", fmt.Sprintf("offline-%d-%d", os.Getpid(), cfg.Now().UnixNano()))
-	for _, dir := range []string{live, filepath.Join(root, "sealed"), filepath.Join(root, "upload")} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return nil, err
-		}
-	}
-	w := &segmentWriter{
-		cfg: cfg, root: root, live: live, offline: true,
-		kick: make(chan struct{}, 1), stopped: make(chan struct{}),
-		deltas: map[string]*deltaChain{}, pending: map[string]*pendingStream{}, whois: map[string]whoisEntry{},
-	}
-	w.store = newSegmentStore(w)
-	return w, nil
-}
-
-// compressSync compresses one sealed file in the caller's goroutine.
-func (s *segmentStore) compressSync(ctx context.Context, sealedPath string) (SegmentInfo, string, error) {
-	segID := filepath.Base(sealedPath)
-	segID = strings.TrimSuffix(segID, rawSegmentExt)
-	target := filepath.Join(s.w.root, "upload", segID+".jsonl.zst")
-	info, err := compressSegmentFile(ctx, sealedPath, target, s.w.cfg.CompressLevel, s.w.cfg.WindowSize)
-	if err != nil {
-		return SegmentInfo{}, "", err
-	}
-	info.SegmentID = segID
-	info.Host = s.w.cfg.Host
-	if s.w.cfg.BlobPrefix != "" {
-		info.BlobName = s.w.cfg.BlobPrefix + "/" + segID + ".jsonl.zst"
-	}
-	if err := writeSidecar(target, info); err != nil {
-		return SegmentInfo{}, "", err
-	}
-	if err := os.Remove(sealedPath); err != nil {
-		return SegmentInfo{}, "", err
-	}
-	return info, target, nil
 }
 
 // gunzipComplete decodes data when it is a complete gzip stream.

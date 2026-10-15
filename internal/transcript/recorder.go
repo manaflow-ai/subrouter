@@ -163,36 +163,27 @@ func newRecorder(dir string, opts recorderOptions) *Recorder {
 	}
 }
 
-// NewSegmentRecorder returns a recorder that writes sealed, compressed,
-// delta-encoded segments under cfg.Dir/segments and uploads them through
-// cfg.Uploader.
+// NewSegmentRecorder returns a recorder that streams delta-encoded,
+// compressed per-session segments and a call index to cfg.Uploader. It
+// writes nothing to local disk.
 func NewSegmentRecorder(cfg SegmentConfig) (*Recorder, error) {
-	writer, err := newSegmentWriter(cfg)
+	writer, err := newSegmentWriter(cfg, false)
 	if err != nil {
 		return nil, err
 	}
-	return &Recorder{dir: cfg.Dir, opts: defaultRecorderOptions, seg: writer}, nil
+	return &Recorder{opts: defaultRecorderOptions, seg: writer}, nil
 }
 
 func (r *Recorder) Enabled() bool {
-	return r != nil && r.dir != ""
+	return r != nil && (r.dir != "" || r.seg != nil)
 }
 
-// SealSegment writes out everything recorded so far and seals the live
-// segment, so it is compressed and uploaded without waiting for its size,
-// age or idle limit.
+// SealSegment commits every open segment and writes the index now, and
+// waits for the uploads.
 func (r *Recorder) SealSegment() {
 	if r.SegmentMode() {
 		r.seg.sync(true)
 	}
-}
-
-// SegmentDir is where a segment-mode recorder keeps its spool.
-func (r *Recorder) SegmentDir() string {
-	if !r.SegmentMode() {
-		return ""
-	}
-	return r.seg.root
 }
 
 // SegmentMode reports whether the recorder writes segments.
@@ -454,7 +445,7 @@ func (r *Recorder) DroppedEvents() int64 {
 		return 0
 	}
 	if r.seg != nil {
-		return r.seg.droppedQueue.Load() + r.seg.droppedSpool.Load()
+		return r.seg.droppedQueue.Load() + r.seg.droppedBacklog.Load()
 	}
 	return r.dropped.Load()
 }

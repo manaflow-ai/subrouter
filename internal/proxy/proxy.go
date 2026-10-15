@@ -7486,7 +7486,7 @@ func (o *webSocketMessageObserver) finish() ([]byte, func()) {
 }
 
 func (o *webSocketMessageObserver) transcriptPayload() map[string]any {
-	payload := map[string]any{"opcode": websocketMessageType(o.messageType)}
+	payload := map[string]any{"opcode": websocketMessageType(o.messageType), "stream_id": o.streamID}
 	if o.requestID != "" {
 		payload["request_id"] = o.requestID
 	}
