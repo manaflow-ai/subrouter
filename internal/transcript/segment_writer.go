@@ -187,8 +187,10 @@ type segmentWriter struct {
 	liveBytes     int64
 	serial        int
 	lastIndexTick time.Time
-	wsMeta        map[string]*callRow
-	index         indexBuffer
+	// lastHousekeeping is when time-based work last ran.
+	lastHousekeeping time.Time
+	wsMeta           map[string]*callRow
+	index            indexBuffer
 	// source names the legacy file being converted (offline only).
 	source  string
 	offline bool
@@ -474,15 +476,26 @@ func (w *segmentWriter) run() {
 			for _, item := range batch {
 				w.process(item)
 			}
+			// Under steady traffic the queue never drains, so time-based
+			// work (checkpoints, idle and age commits, the index) runs
+			// between batches too, not only when the writer goes quiet.
+			if w.cfg.Now().Sub(w.lastHousekeeping) >= housekeepingInterval {
+				w.housekeeping()
+			}
 		}
 		w.housekeeping()
 	}
 }
 
+// housekeepingInterval is the longest the writer goes between time-based
+// checks while it is busy.
+const housekeepingInterval = 5 * time.Second
+
 // housekeeping seals idle and old segments, closes abandoned calls, and
 // writes the index on schedule.
 func (w *segmentWriter) housekeeping() {
 	now := w.cfg.Now()
+	w.lastHousekeeping = now
 	for _, seg := range w.sessions {
 		switch {
 		case now.Sub(seg.lastWrite) >= w.cfg.IdleSeal:
