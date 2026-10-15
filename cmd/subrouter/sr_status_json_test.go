@@ -114,8 +114,8 @@ func TestSRStatusClaudeCreditCooldownIsTemporary(t *testing.T) {
 	}
 
 	row.creditsExhaustedUntil = time.Now().Add(-time.Second)
-	if got := usageGridState(row); got != "auth ok" {
-		t.Fatalf("expired cooldown state = %q, want auth ok", got)
+	if got := usageGridState(row); got != "API key fallback" {
+		t.Fatalf("expired cooldown state = %q, want API key fallback", got)
 	}
 }
 
