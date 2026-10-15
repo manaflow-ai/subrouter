@@ -3864,6 +3864,55 @@ func TestSRRankRowsKeepsAPIKeyAsFallback(t *testing.T) {
 	}
 }
 
+func TestSRRankRowsKeepsAvailableClaudeRowsFirst(t *testing.T) {
+	rows := []srUsageRow{
+		{
+			email:    "waiting",
+			provider: accounts.ProviderClaude,
+			score:    selectacct.Score{AccountID: "waiting", Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 3600, WeeklyHeadroom: 0.5, WeeklyHeadroomKnown: true},
+		},
+		{
+			email:    "available",
+			provider: accounts.ProviderClaude,
+			score:    selectacct.Score{AccountID: "available", Headroom: 0.4, ShortHeadroom: 0.4},
+		},
+	}
+
+	rankUsageRows(rows)
+
+	if rows[0].email != "available" {
+		t.Fatalf("first Claude row = %s, want available", rows[0].email)
+	}
+}
+
+func TestSRRankRowsUsesSoonestSessionResetWhenWeeklyCapacityRemains(t *testing.T) {
+	rows := []srUsageRow{
+		{email: "later", provider: accounts.ProviderClaude, cooked: true,
+			score: selectacct.Score{AccountID: "later", Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 3 * 3600, WeeklyHeadroom: 0.2, WeeklyHeadroomKnown: true}},
+		{email: "sooner", provider: accounts.ProviderClaude, cooked: true,
+			score: selectacct.Score{AccountID: "sooner", Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 1 * 3600, WeeklyHeadroom: 0.2, WeeklyHeadroomKnown: true}},
+	}
+	rankUsageRows(rows)
+	if rows[0].email != "sooner" {
+		t.Fatalf("first Claude row = %s, want sooner", rows[0].email)
+	}
+}
+
+func TestSRRankRowsUsesSoonestWeeklyResetWhenWeeklyCapacityIsGone(t *testing.T) {
+	rows := []srUsageRow{
+		{email: "later", provider: accounts.ProviderClaude, cooked: true,
+			score:   selectacct.Score{AccountID: "later", Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 3600, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true},
+			windows: []accounts.UsageWindow{{Name: "5h", LimitWindowSeconds: int64(5 * time.Hour / time.Second), ResetAfterSeconds: 3600}, {Name: "7d", UsedPercent: 100, LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second), ResetAfterSeconds: 5 * 24 * 3600}}},
+		{email: "sooner", provider: accounts.ProviderClaude, cooked: true,
+			score:   selectacct.Score{AccountID: "sooner", Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 3 * 3600, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true},
+			windows: []accounts.UsageWindow{{Name: "5h", LimitWindowSeconds: int64(5 * time.Hour / time.Second), ResetAfterSeconds: 3 * 3600}, {Name: "7d", UsedPercent: 100, LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second), ResetAfterSeconds: 2 * 24 * 3600}}},
+	}
+	rankUsageRows(rows)
+	if rows[0].email != "sooner" {
+		t.Fatalf("first Claude row = %s, want sooner weekly reset", rows[0].email)
+	}
+}
+
 func TestSRRankRowsFallsBackToAPIKeyBeforeExhaustedOAuth(t *testing.T) {
 	rows := []srUsageRow{
 		{

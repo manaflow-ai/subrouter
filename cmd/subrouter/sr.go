@@ -2885,6 +2885,15 @@ func claudeUsageRowLess(a, b srUsageRow) bool {
 	if au != bu {
 		return au
 	}
+	if !au && !bu {
+		if ar, aok := claudeAvailabilityReset(a); aok {
+			if br, bok := claudeAvailabilityReset(b); !bok || ar != br {
+				return !bok || ar < br
+			}
+		} else if _, bok := claudeAvailabilityReset(b); bok {
+			return false
+		}
+	}
 	if a.score.Headroom != b.score.Headroom {
 		return a.score.Headroom > b.score.Headroom
 	}
@@ -2898,6 +2907,47 @@ func claudeUsageRowLess(a, b srUsageRow) bool {
 		return a.score.ShortResetAfterSeconds < b.score.ShortResetAfterSeconds
 	}
 	return a.email < b.email
+}
+
+// claudeAvailabilityReset returns the reset that can make an unavailable row
+// usable. A remaining weekly quota means the session window is the relevant
+// bottleneck; once weekly quota is exhausted, every account-wide weekly window
+// must reset, so the latest such reset is the earliest time the account can
+// actually become usable.
+func claudeAvailabilityReset(row srUsageRow) (int64, bool) {
+	if claudeWeeklyCapacityRemaining(row) {
+		if row.score.ShortResetAfterSeconds > 0 {
+			return row.score.ShortResetAfterSeconds, true
+		}
+		return 0, false
+	}
+	var reset int64
+	found := false
+	for _, window := range row.windows {
+		if !accountWideWindow(isLongQuotaWindow)(window) || window.ResetAfterSeconds <= 0 {
+			continue
+		}
+		if window.ResetAfterSeconds > reset {
+			reset = window.ResetAfterSeconds
+		}
+		found = true
+	}
+	return reset, found
+}
+
+func claudeWeeklyCapacityRemaining(row srUsageRow) bool {
+	if row.score.WeeklyHeadroomKnown {
+		return row.score.WeeklyHeadroom > 0
+	}
+	for _, window := range row.windows {
+		if !accountWideWindow(isLongQuotaWindow)(window) {
+			continue
+		}
+		if window.UsedPercent >= 100 {
+			return false
+		}
+	}
+	return true
 }
 
 func usageProvider(row srUsageRow) accounts.Provider {
