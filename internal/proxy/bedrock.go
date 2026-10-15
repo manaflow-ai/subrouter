@@ -211,6 +211,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	// ("context_management: Extra inputs are not permitted"), which used to
 	// push every context-editing Claude Code request straight to the API key.
 	body = stripClaudeUnsupportedFields(body)
+	body = stripBedrockUnsupportedFields(body)
 	var strippedTools int
 	body, strippedTools = stripBedrockUnsupportedTools(body)
 	if strippedTools > 0 && s.Logger != nil {

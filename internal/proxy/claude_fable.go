@@ -150,7 +150,7 @@ func (s Server) claudeFableFallbackResponse(r *http.Request, body []byte) (*http
 	if s.Bedrock != nil && s.Bedrock.configured() {
 		resp, err := s.claudeFableBedrockResponse(r.Context(), body)
 		if err == nil {
-			if !claudeFableBedrockUnusable(resp.StatusCode) || s.ClaudeFableAPIKey == "" {
+			if !claudeFableBedrockUnusable(resp.StatusCode) || s.ClaudeFableAPIKey == "" || !claudeFableModel(bodyModel(body)) {
 				return resp, true
 			}
 			if s.Logger != nil {
@@ -166,7 +166,9 @@ func (s Server) claudeFableFallbackResponse(r *http.Request, body []byte) (*http
 			}
 		}
 	}
-	if s.ClaudeFableAPIKey != "" {
+	// The API key is Fable's alone and has no cap; other models that reach
+	// the chain through ClaudeBedrockModelID stop at Bedrock.
+	if s.ClaudeFableAPIKey != "" && claudeFableModel(bodyModel(body)) {
 		resp, err := s.claudeFableAPIKeyResponse(r, body)
 		if err != nil {
 			if s.Logger != nil && r.Context().Err() == nil {
@@ -254,9 +256,33 @@ func stripClaudeUnsupportedFields(body []byte) []byte {
 		return body
 	}
 	changed := false
+	for _, field := range []string{"context_management"} {
+		if _, ok := payload[field]; ok {
+			delete(payload, field)
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	if rebuilt, err := json.Marshal(payload); err == nil {
+		return rebuilt
+	}
+	return body
+}
+
+// stripBedrockUnsupportedFields removes what Anthropic-mode Claude Code sends
+// and Bedrock's schema refuses with a 400 for the whole request. The direct
+// Messages API accepts these, so only the Bedrock stage strips them.
+func stripBedrockUnsupportedFields(body []byte) []byte {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil {
+		return body
+	}
+	changed := false
 	// Claude Code in Anthropic mode sends these; Bedrock's schema has none of
 	// them and refuses the whole request.
-	for _, field := range []string{"context_management", "output_config", "safeguards"} {
+	for _, field := range []string{"output_config", "safeguards"} {
 		if _, ok := payload[field]; ok {
 			delete(payload, field)
 			changed = true
@@ -286,4 +312,13 @@ func stripClaudeUnsupportedFields(body []byte) []byte {
 		return rebuilt
 	}
 	return body
+}
+
+// bodyModel is the model a Messages request body names.
+func bodyModel(body []byte) string {
+	var payload struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	return payload.Model
 }
