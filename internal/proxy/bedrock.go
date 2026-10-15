@@ -91,6 +91,7 @@ func (s Server) bedrockHandler() http.Handler {
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
 			return
 		}
+		transcriptAgent, transcriptSession, transcriptRequestID := s.recordBedrockGatewayRequest(r, upstreamPath, body)
 		upstreamPath, body = rewriteClaudeCodeAutoClassifierRequest(upstreamPath, body)
 
 		headers := http.Header{}
@@ -104,6 +105,7 @@ func (s Server) bedrockHandler() http.Handler {
 			http.Error(w, "bedrock upstream request failed", http.StatusBadGateway)
 			return
 		}
+		s.recordBedrockGatewayResponse(resp, transcriptAgent, transcriptSession, transcriptRequestID, sourceName, region)
 		defer resp.Body.Close()
 
 		for key, values := range resp.Header {
