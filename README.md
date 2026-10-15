@@ -21,7 +21,7 @@ A shared server autoupdates its worker. A laptop does not, so clients drift behi
 curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/deploy/macos/install-cli-autoupdate.sh | bash
 ```
 
-It installs a LaunchAgent that checks daily, compares the release tag against `~/.subrouter/cli-version`, and exits without downloading when they match. Updates go through `install.sh`, so the release checksum is verified, and a missing binary forces a reinstall even when the marker looks current. Logs land in `~/Library/Logs/subrouter-cli-autoupdate.log`. Remove it with `launchctl bootout gui/$(id -u)/ai.manaflow.subrouter-cli-autoupdate`.
+It installs a LaunchAgent that checks daily, compares the release tag against `~/.subrouter/cli-version`, and exits without downloading when they match. Updates go through `install.sh`, so the release checksum is verified, and a missing binary forces a reinstall even when the marker looks current. Once the installed `sr` has `sr update --auto`, the LaunchAgent hands each run to it instead (same checksum, plus a backup, an idle check, a health check and automatic restore; details in `~/.subrouter/logs/auto-update.log`); install.sh remains the path for older CLIs and for a daemon LaunchAgent that runs a different binary than `~/bin/subrouter`. A Mac that installed the LaunchAgent before this runs its own copy of the updater; rerun the command above to pick up the hand-over. Logs land in `~/Library/Logs/subrouter-cli-autoupdate.log`. Remove it with `launchctl bootout gui/$(id -u)/ai.manaflow.subrouter-cli-autoupdate`.
 
 ### GCP setup prompt
 
