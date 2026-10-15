@@ -104,6 +104,16 @@ func (u *updater) autoUpdate(ctx context.Context) error {
 		return nil
 	}
 	now := u.now()
+	// One automatic update at a time, from the due check through the final
+	// stamp: a second one waits for the next trigger instead.
+	if err := os.MkdirAll(filepath.Dir(u.autoStampPath), 0o755); err != nil {
+		return nil
+	}
+	release, err := tryLockUpdateLease(u.autoStampPath + ".lock")
+	if err != nil {
+		return nil
+	}
+	defer release()
 	if stamp, ok := readAutoUpdateStamp(u.autoStampPath); ok && now.Before(stamp.NextCheck) {
 		return nil
 	}
@@ -139,6 +149,14 @@ func (u *updater) autoUpdate(ctx context.Context) error {
 	// The caller is a detached background process; the log and the stamp
 	// carry the outcome.
 	return nil
+}
+
+// autoRestartBusy reports whether an automatic update must not restart the
+// daemon now. It probes right before each step that would restart it, which
+// narrows the window a new request can open to the restart itself; draining
+// first would close it, but would turn every request in that moment away.
+func (u *updater) autoRestartBusy(ctx context.Context, opts updateOptions, target installTarget) bool {
+	return opts.auto && target.hasDaemon() && target.controlSocket == "" && !u.daemonIdle(ctx)
 }
 
 // daemonIdle reports whether the local daemon has no proxy requests in

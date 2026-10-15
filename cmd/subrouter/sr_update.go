@@ -1396,7 +1396,7 @@ func (u *updater) update(ctx context.Context, opts updateOptions) error {
 	// A supervised daemon swaps workers behind its open listener; any other
 	// restart drops whatever the daemon is serving, so the unattended update
 	// waits for a moment it serves nothing, before it changes anything.
-	if opts.auto && target.hasDaemon() && target.controlSocket == "" && !u.daemonIdle(ctx) {
+	if u.autoRestartBusy(ctx, opts, target) {
 		return errAutoUpdateBusy
 	}
 	if binaryCurrent {
@@ -1418,6 +1418,16 @@ func (u *updater) update(ctx context.Context, opts updateOptions) error {
 		return err
 	}
 	defer unlock()
+	// Another update may have replaced the binary between the version read
+	// above and the lock; its backup is labelled with what it replaced, and
+	// this one must not overwrite that with a stale label.
+	if current := u.binaryVersion(ctx, target.binary); current != installed {
+		err := fmt.Errorf("%s changed from %s to %s while this update started; run it again", target.binary, displayVersion(installed), displayVersion(current))
+		if opts.auto {
+			return autoUpdateRefusal{err}
+		}
+		return err
+	}
 	staged, err := u.download(ctx, tag, filepath.Dir(target.binary))
 	if err != nil {
 		return err
@@ -1438,6 +1448,11 @@ func (u *updater) update(ctx context.Context, opts updateOptions) error {
 	want := ""
 	if stagedVersion != "" {
 		want = tag
+	}
+	// The download took a while; a request that started meanwhile still
+	// holds the restart back.
+	if u.autoRestartBusy(ctx, opts, target) {
+		return errAutoUpdateBusy
 	}
 	if err := u.replaceAndVerify(ctx, target, staged, want, backup, installed); err != nil {
 		return fmt.Errorf("update to %s failed: %w", tag, err)

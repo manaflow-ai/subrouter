@@ -208,3 +208,40 @@ func TestAutoUpdateTriggerOnlyForInteractiveCommandsWhenDue(t *testing.T) {
 		})
 	}
 }
+
+// A request that starts while the release downloads still holds the restart
+// back: the daemon is probed again right before the binary is replaced.
+func TestAutoUpdateDefersWhenARequestStartsDuringTheDownload(t *testing.T) {
+	f := newUpdateFixture(t, "v1.0.0").withUserUnit()
+	f.busyAfterProbes = f.u.idleSamples
+	if err := f.u.runUpdateArgs(context.Background(), []string{"--auto"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.installedVersion(); got != "v1.0.0" || f.restarts != 0 {
+		t.Fatalf("version=%s restarts=%d, want nothing replaced once a request is in flight", got, f.restarts)
+	}
+	within(t, f.nextAutoCheck(), time.Now().Add(autoUpdateBusyRetry), time.Minute)
+}
+
+// Only one automatic update runs at a time; another one started meanwhile
+// leaves everything, including the stamp, to the first.
+func TestAutoUpdateLeavesARunningOneAlone(t *testing.T) {
+	f := newUpdateFixture(t, "v1.0.0").withUserUnit()
+	if err := os.MkdirAll(filepath.Dir(f.u.autoStampPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	release, err := tryLockUpdateLease(f.u.autoStampPath + ".lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if err := f.u.runUpdateArgs(context.Background(), []string{"--auto"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.installedVersion(); got != "v1.0.0" || f.restarts != 0 {
+		t.Fatalf("version=%s restarts=%d, want the second automatic update to do nothing", got, f.restarts)
+	}
+	if _, ok := readAutoUpdateStamp(f.u.autoStampPath); ok {
+		t.Fatal("the second automatic update wrote the stamp")
+	}
+}

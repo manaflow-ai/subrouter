@@ -42,6 +42,10 @@ type updateFixture struct {
 	upgrades   []string
 	// active is what the fake daemon's drain-status reports in flight.
 	active int
+	// busyAfterProbes, when set, makes every drain-status probe after that
+	// many report a request in flight.
+	busyAfterProbes int
+	probes          int
 }
 
 type fakeUpdateController struct{ f *updateFixture }
@@ -141,7 +145,11 @@ func newUpdateFixture(t *testing.T, installed string) *updateFixture {
 	})
 	mux.HandleFunc("/_subrouter/drain-status", func(w http.ResponseWriter, _ *http.Request) {
 		f.mu.Lock()
+		f.probes++
 		active := f.active
+		if f.busyAfterProbes > 0 && f.probes > f.busyAfterProbes {
+			active = 1
+		}
 		f.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "active_proxy_requests": active})
 	})
