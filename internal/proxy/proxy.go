@@ -11100,10 +11100,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 		}
 		// Every account the request could move to is paused after a rate
-		// limit too. Nothing reached an upstream, so the fallback chain can
-		// serve it. A full queue is a burst on accounts that still have quota:
-		// it keeps its 503 so the client retries onto the subscriptions.
-		if errors.Is(err, errAdmissionPaused) && a.replayable() && req.Context().Err() == nil {
+		// limit too, or has a full queue. Nothing reached an upstream, so the
+		// fallback chain can serve it. A full queue used to keep its 503 on the
+		// theory that it was a burst on accounts with quota left, but once the
+		// pool is at its cap every account still standing is full: the
+		// client's retry lands on the same queues (1,052 requests in one hour
+		// gave up at attempt 1 of 6 while the fallback chain sat idle).
+		if admissionRejected(err) && a.replayable() && req.Context().Err() == nil {
 			if fallback, ok := t.fableFallbackResponse(response, accountID, "admission_rejected"); ok {
 				return fallback, nil
 			}
