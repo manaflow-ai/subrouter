@@ -2977,6 +2977,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
 	mux.HandleFunc("/_subrouter/transcripts", s.requireAdmin(s.handleTranscriptList))
 	mux.HandleFunc("/_subrouter/transcripts/", s.requireAdmin(s.handleTranscriptDetail))
+	mux.HandleFunc("/_subrouter/transcript-stats", s.requireAdmin(s.handleTranscriptStats))
 	mux.HandleFunc("/_subrouter/bedrock-cost", s.requireAdmin(s.handleBedrockCost))
 	mux.HandleFunc("/_subrouter/azure-codex-cost", s.requireAdmin(s.handleAzureCodexCost))
 	mux.HandleFunc("/_subrouter/codex-capacity", s.requireAdmin(s.handleCodexCapacity))
@@ -5642,7 +5643,7 @@ func (s Server) proxyHandler() http.Handler {
 		// the body and falls through to the normal pool path (which still carries
 		// its own Bedrock/API-key fallback), so this never hard-fails Fable.
 		if preferredAccountID == "" && s.FableBedrockPrimary && fableFallbackConfigured && s.Bedrock != nil && s.Bedrock.configured() {
-			if s.serveClaudeFableBedrockPrimary(w, r) {
+			if s.serveRecorded(w, r, agentTypeForProviderSession(agentType, requestProvider), sessionID, "fable-bedrock-primary", s.serveClaudeFableBedrockPrimary) {
 				return
 			}
 		}
@@ -5672,7 +5673,9 @@ func (s Server) proxyHandler() http.Handler {
 				http.Error(w, azureCodexForceUnavailableMessage(s, boundLease != nil, r), http.StatusServiceUnavailable)
 				return
 			}
-			if s.serveAzureCodex(w, r, azureCodexSessionKeyFor(sessionAgentType, sessionID), -1, "forced", false) {
+			if s.serveRecorded(w, r, sessionAgentType, sessionID, "azure-codex", func(w http.ResponseWriter, r *http.Request) bool {
+				return s.serveAzureCodex(w, r, azureCodexSessionKeyFor(sessionAgentType, sessionID), -1, "forced", false)
+			}) {
 				return
 			}
 			http.Error(w, forcedCodexProvider(r)+" codex route could not serve this request; configure an API-key endpoint for this provider and check the daemon log", http.StatusBadGateway)
@@ -5682,7 +5685,9 @@ func (s Server) proxyHandler() http.Handler {
 			azureCodexSessionKey = azureCodexSessionKeyFor(sessionAgentType, sessionID)
 			if !noRetry {
 				if pinned, found := s.azureCodexSessions.lookup(azureCodexSessionKey); found {
-					if s.serveAzureCodex(w, r, azureCodexSessionKey, pinned, "sticky_session", true) {
+					if s.serveRecorded(w, r, sessionAgentType, sessionID, "azure-codex", func(w http.ResponseWriter, r *http.Request) bool {
+						return s.serveAzureCodex(w, r, azureCodexSessionKey, pinned, "sticky_session", true)
+					}) {
 						return
 					}
 				}
@@ -5761,10 +5766,12 @@ func (s Server) proxyHandler() http.Handler {
 				// that is stopping work (see codexPoolLooksBlocked).
 				s.SchedulerRef.NoteUnserved(schedulerAccountProvider(requestProvider))
 			}
-			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
+			if fableFallbackConfigured && s.serveRecorded(w, r, sessionAgentType, sessionID, "fable-fallback", s.serveClaudeFableFallback) {
 				return
 			}
-			if !noRetry && !autonomousRetry && azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_account", true) {
+			if !noRetry && !autonomousRetry && azureCodexConfigured && s.serveRecorded(w, r, sessionAgentType, sessionID, "azure-codex", func(w http.ResponseWriter, r *http.Request) bool {
+				return s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_account", true)
+			}) {
 				return
 			}
 			if !autonomousRetry && !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
@@ -5808,10 +5815,12 @@ func (s Server) proxyHandler() http.Handler {
 
 		auth := account.AuthorizationHeader()
 		if auth == "" {
-			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
+			if fableFallbackConfigured && s.serveRecorded(w, r, sessionAgentType, sessionID, "fable-fallback", s.serveClaudeFableFallback) {
 				return
 			}
-			if !noRetry && !autonomousRetry && azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_credential", true) {
+			if !noRetry && !autonomousRetry && azureCodexConfigured && s.serveRecorded(w, r, sessionAgentType, sessionID, "azure-codex", func(w http.ResponseWriter, r *http.Request) bool {
+				return s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_credential", true)
+			}) {
 				return
 			}
 			if !autonomousRetry && !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
@@ -5906,11 +5915,12 @@ func (s Server) proxyHandler() http.Handler {
 				s.Logger.Warn("retryable request body exceeds retry buffer", "agent", sessionAgentType, "session", sessionID, "account", account.ID, "method", r.Method, "path", proxyRequest.URL.Path, "content_length", r.ContentLength, "max_bytes", replayablePostMaxBodyBytes)
 			}
 		}
-		s.recordHTTPMeta(proxyRequest, sessionAgentType, sessionID, userEmail, account, upstream)
+		transcriptRequestID := nextTranscriptRequestID()
+		s.recordHTTPMeta(proxyRequest, transcriptRequestID, transcriptClientName(r), sessionAgentType, sessionID, userEmail, account, upstream)
 		if retryPost && postReplayable {
-			s.recordReplayableRequestBody(proxyRequest, sessionAgentType, sessionID)
+			s.recordReplayableRequestBody(proxyRequest, transcriptRequestID, sessionAgentType, sessionID)
 		} else {
-			s.captureRequestBody(proxyRequest, sessionAgentType, sessionID)
+			s.captureRequestBody(proxyRequest, transcriptRequestID, sessionAgentType, sessionID)
 		}
 
 		rp := &httputil.ReverseProxy{
@@ -6105,7 +6115,7 @@ func (s Server) proxyHandler() http.Handler {
 					s.mergeClaudeResponseQuotaScore(responseAccount, observed, generation, responseAccount.CredentialIdentity(), orderAt)
 				}
 			}
-			s.captureResponseBodyForAccount(response, r.Context(), sessionAgentType, sessionID, responseAccount, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
+			s.captureResponseBodyForRequest(response, r.Context(), transcriptRequestID, sessionAgentType, sessionID, responseAccount, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
 			usageSessionKey := ""
 			if tokenUsageTrackedSession(r, sessionID) {
 				usageSessionKey = tokenUsageSessionKey(requestProvider, sessionAgentType, sessionID)
@@ -6516,7 +6526,9 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	s.setDelegatedSessionHeaders(headers, agentType, sessionID)
 	stripOutboundForwardingHeaders(headers)
 	setAccountAuthHeaders(headers, account, compatibilityModel)
-	s.recordWebSocketMeta(r, upstreamURL, headers, agentType, sessionID, userEmail, account, upstream)
+	transcriptRequestID := nextTranscriptRequestID()
+	r = r.WithContext(withTranscriptRequestID(r.Context(), transcriptRequestID))
+	s.recordWebSocketMeta(r, transcriptRequestID, upstreamURL, headers, agentType, sessionID, userEmail, account, upstream)
 
 	upstreamConn, response, err := outboundWebSocketDialer().Dial(upstreamURL.String(), headers)
 	if err != nil {
@@ -7185,6 +7197,7 @@ func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionI
 		return err
 	}
 	observer := newWebSocketMessageObserver(s.Transcripts, agentType, sessionID, direction, messageType)
+	observer.requestID = transcriptRequestIDFrom(ctx)
 	_, release, err := streamWebSocketMessage(ctx, reader, func() (io.WriteCloser, error) {
 		return openWriter(messageType)
 	}, observer, webSocketForwardBuffers, func(body []byte) error {
@@ -7395,6 +7408,7 @@ type webSocketMessageObserver struct {
 	direction   string
 	messageType int
 	streamID    string
+	requestID   string
 	hasher      hash.Hash
 	capture     []byte
 	reserved    int64
@@ -7435,7 +7449,7 @@ func (o *webSocketMessageObserver) recordChunks(body []byte, offset int64) {
 	if o.recorder == nil || !o.recorder.Enabled() {
 		return
 	}
-	payload := map[string]any{"opcode": websocketMessageType(o.messageType)}
+	payload := o.transcriptPayload()
 	for len(body) > 0 {
 		chunk := body
 		if len(chunk) > transcriptHTTPChunkBytes {
@@ -7449,7 +7463,7 @@ func (o *webSocketMessageObserver) recordChunks(body []byte, offset int64) {
 }
 
 func (o *webSocketMessageObserver) finish() ([]byte, func()) {
-	payload := map[string]any{"opcode": websocketMessageType(o.messageType)}
+	payload := o.transcriptPayload()
 	if o.chunked {
 		if o.recorder != nil && o.recorder.Enabled() {
 			o.recorder.RecordPayloadSummary(o.agentType, o.sessionID, "websocket_message", o.direction, o.streamID, o.bytesRead, hex.EncodeToString(o.hasher.Sum(nil)), o.chunks, payload)
@@ -7469,6 +7483,14 @@ func (o *webSocketMessageObserver) finish() ([]byte, func()) {
 			o.capture = nil
 		})
 	}
+}
+
+func (o *webSocketMessageObserver) transcriptPayload() map[string]any {
+	payload := map[string]any{"opcode": websocketMessageType(o.messageType), "stream_id": o.streamID}
+	if o.requestID != "" {
+		payload["request_id"] = o.requestID
+	}
+	return payload
 }
 
 func (o *webSocketMessageObserver) abort() {
@@ -8123,30 +8145,32 @@ func transcriptWorthRecording(sessionID string) bool {
 	return sessionID != codexModelCatalogSessionID && !strings.HasPrefix(sessionID, codexPinnedModelCatalogSessionPrefix)
 }
 
-func (s Server) recordHTTPMeta(r *http.Request, agentType, sessionID, userEmail string, account accounts.Account, upstream *url.URL) {
+func (s Server) recordHTTPMeta(r *http.Request, requestID, clientName, agentType, sessionID, userEmail string, account accounts.Account, upstream *url.URL) {
 	if s.Transcripts == nil || !transcriptWorthRecording(sessionID) {
 		return
 	}
 	metadata := map[string]any{
-		"transport": "http",
-		"account":   account.ID,
-		"method":    r.Method,
-		"path":      r.URL.Path,
-		"upstream":  redactedTranscriptURL(upstream),
-		"headers":   transcript.RedactedHeaders(r.Header),
+		"transport":  "http",
+		"request_id": requestID,
+		"account":    account.ID,
+		"provider":   string(account.Provider),
+		"method":     r.Method,
+		"path":       r.URL.Path,
+		"upstream":   redactedTranscriptURL(upstream),
+		"headers":    transcript.RedactedHeaders(r.Header),
 	}
-	if hash := userEmailHash(userEmail); hash != "" {
-		metadata["user_hash"] = hash
-	}
-	s.Transcripts.RecordMeta(agentType, sessionID, metadata)
+	addTranscriptClient(metadata, clientName, userEmail)
+	s.Transcripts.RecordRequestMeta(agentType, sessionID, r.RemoteAddr, metadata)
 }
 
-func (s Server) recordWebSocketMeta(r *http.Request, upstreamURL *url.URL, headers http.Header, agentType, sessionID, userEmail string, account accounts.Account, upstream *url.URL) {
+func (s Server) recordWebSocketMeta(r *http.Request, requestID string, upstreamURL *url.URL, headers http.Header, agentType, sessionID, userEmail string, account accounts.Account, upstream *url.URL) {
 	if s.Transcripts == nil || !transcriptWorthRecording(sessionID) {
 		return
 	}
 	metadata := map[string]any{
 		"transport":    "websocket",
+		"request_id":   requestID,
+		"provider":     string(account.Provider),
 		"account":      account.ID,
 		"method":       r.Method,
 		"path":         r.URL.Path,
@@ -8154,10 +8178,8 @@ func (s Server) recordWebSocketMeta(r *http.Request, upstreamURL *url.URL, heade
 		"upstream_url": redactedTranscriptURL(upstreamURL),
 		"headers":      transcript.RedactedHeaders(headers),
 	}
-	if hash := userEmailHash(userEmail); hash != "" {
-		metadata["user_hash"] = hash
-	}
-	s.Transcripts.RecordMeta(agentType, sessionID, metadata)
+	addTranscriptClient(metadata, transcriptClientName(r), userEmail)
+	s.Transcripts.RecordRequestMeta(agentType, sessionID, r.RemoteAddr, metadata)
 }
 
 // transcriptURL retains enough location data to identify an upstream without
@@ -8174,8 +8196,12 @@ func redactedTranscriptURL(upstream *url.URL) string {
 	return redacted.Redacted()
 }
 
-func (s Server) captureRequestBody(r *http.Request, agentType, sessionID string) {
+func (s Server) captureRequestBody(r *http.Request, requestID, agentType, sessionID string) {
 	if s.Transcripts == nil || r.Body == nil || !transcriptWorthRecording(sessionID) {
+		return
+	}
+	if s.Transcripts.SegmentMode() {
+		r.Body = newRequestBodyCapture(r.Body, s.Transcripts, requestID, agentType, sessionID, r.Header.Get("Content-Encoding"))
 		return
 	}
 	r.Body = newStreamingTranscriptReadCloser(streamingTranscriptConfig{
@@ -8186,10 +8212,11 @@ func (s Server) captureRequestBody(r *http.Request, agentType, sessionID string)
 		EventType:  "http_body",
 		Direction:  "client_to_upstream",
 		StreamID:   nextTranscriptStreamID(),
+		Payload:    map[string]any{"request_id": requestID},
 	})
 }
 
-func (s Server) recordReplayableRequestBody(r *http.Request, agentType, sessionID string) {
+func (s Server) recordReplayableRequestBody(r *http.Request, requestID, agentType, sessionID string) {
 	if s.Transcripts == nil || r.GetBody == nil || !s.Transcripts.Enabled() || !transcriptWorthRecording(sessionID) {
 		return
 	}
@@ -8198,28 +8225,11 @@ func (s Server) recordReplayableRequestBody(r *http.Request, agentType, sessionI
 		return
 	}
 	defer body.Close()
-	streamID := nextTranscriptStreamID()
-	hasher := sha256.New()
-	buffer := make([]byte, transcriptHTTPChunkBytes)
-	var bytesRead int64
-	chunks := 0
-	for {
-		n, readErr := body.Read(buffer)
-		if n > 0 {
-			chunk := buffer[:n]
-			_, _ = hasher.Write(chunk)
-			s.Transcripts.RecordPayloadChunk(agentType, sessionID, "http_body", "client_to_upstream", streamID, chunks, bytesRead, chunk, nil)
-			bytesRead += int64(n)
-			chunks++
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return
-		}
+	captured, err := io.ReadAll(body)
+	if err != nil {
+		return
 	}
-	s.Transcripts.RecordPayloadSummary(agentType, sessionID, "http_body", "client_to_upstream", streamID, bytesRead, hex.EncodeToString(hasher.Sum(nil)), chunks, nil)
+	s.Transcripts.RecordRequestBody(agentType, sessionID, "http_body", "client_to_upstream", nextTranscriptStreamID(), captured, r.Header.Get("Content-Encoding"), map[string]any{"request_id": requestID})
 }
 
 // streamCancelAttribution reports which side ended a response stream. A read
@@ -8250,6 +8260,10 @@ func (s Server) captureResponseBody(response *http.Response, clientCtx context.C
 }
 
 func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx context.Context, agentType, sessionID string, account accounts.Account, poolModel, compatibilityModel, path string) {
+	s.captureResponseBodyForRequest(response, clientCtx, "", agentType, sessionID, account, poolModel, compatibilityModel, path)
+}
+
+func (s Server) captureResponseBodyForRequest(response *http.Response, clientCtx context.Context, requestID, agentType, sessionID string, account accounts.Account, poolModel, compatibilityModel, path string) {
 	accountID := account.ID
 	provider := account.Provider
 	if provider == "" {
@@ -8329,6 +8343,17 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 		return
 	}
 	payload := map[string]any{"status": response.StatusCode}
+	if s.Transcripts != nil && s.Transcripts.SegmentMode() {
+		// Which account and provider actually answered, after any failover
+		// or fallback, and the response headers (Bedrock and Azure fallbacks
+		// are visible there).
+		if requestID != "" {
+			payload["request_id"] = requestID
+		}
+		payload["account"] = accountID
+		payload["provider"] = string(provider)
+		payload["response_headers"] = transcript.RedactedHeaders(response.Header)
+	}
 	responseCtx := context.Background()
 	if response.Request != nil {
 		responseCtx = response.Request.Context()
@@ -8424,6 +8449,7 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 		Direction:  "upstream_to_client",
 		StreamID:   nextTranscriptStreamID(),
 		Payload:    payload,
+		Started:    streamStarted,
 		InspectMax: usageLimitInspectMaxBytes,
 		OnInspect:  inspect,
 		onReadError: func(err error, bytesRead int) {
@@ -8455,7 +8481,7 @@ const usageLimitInspectMaxBytes = 1 << 20
 var transcriptStreamCounter atomic.Uint64
 
 func nextTranscriptStreamID() string {
-	return fmt.Sprintf("body-%d", transcriptStreamCounter.Add(1))
+	return fmt.Sprintf("body-%s-%d", transcriptProcessToken, transcriptStreamCounter.Add(1))
 }
 
 type streamingTranscriptConfig struct {
@@ -8467,6 +8493,7 @@ type streamingTranscriptConfig struct {
 	Direction   string
 	StreamID    string
 	Payload     map[string]any
+	Started     time.Time
 	InspectMax  int64
 	OnInspect   func([]byte)
 	onReadError func(error, int)
@@ -8482,6 +8509,7 @@ func newStreamingTranscriptReadCloser(config streamingTranscriptConfig) io.ReadC
 		direction:   config.Direction,
 		streamID:    config.StreamID,
 		payload:     config.Payload,
+		started:     config.Started,
 		inspectMax:  config.InspectMax,
 		onInspect:   config.OnInspect,
 		onReadError: config.onReadError,
@@ -8498,6 +8526,7 @@ type streamingTranscriptReadCloser struct {
 	direction   string
 	streamID    string
 	payload     map[string]any
+	started     time.Time
 	inspect     []byte
 	inspectMax  int64
 	onInspect   func([]byte)
@@ -8560,6 +8589,14 @@ func (r *streamingTranscriptReadCloser) Close() error {
 	r.closeOnce.Do(func() {
 		sum := hex.EncodeToString(r.hasher.Sum(nil))
 		if r.recorder != nil && r.recorder.Enabled() {
+			if !r.started.IsZero() && r.recorder.SegmentMode() {
+				summary := make(map[string]any, len(r.payload)+1)
+				for key, value := range r.payload {
+					summary[key] = value
+				}
+				summary["duration_ms"] = time.Since(r.started).Milliseconds()
+				r.payload = summary
+			}
 			r.recorder.RecordPayloadSummary(r.agentType, r.sessionID, r.eventType, r.direction, r.streamID, int64(r.bytesRead), sum, r.chunks, r.payload)
 		}
 		if r.onInspect != nil {
