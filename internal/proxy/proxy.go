@@ -11131,6 +11131,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				}
 			}
 		}
+		// Every account the request could move to is paused or full too.
+		// Nothing reached an upstream, so the fallback chain can serve it.
+		if admissionRejected(err) && a.replayable() && req.Context().Err() == nil {
+			if fallback, ok := t.fableFallbackResponse(response, accountID, "admission_rejected"); ok {
+				return fallback, nil
+			}
+		}
 		if err != nil || !a.replayable() || req.Context().Err() != nil {
 			return response, tagRoutedAttemptError(err, attemptReq, addressed)
 		}
