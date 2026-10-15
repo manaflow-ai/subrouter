@@ -1,0 +1,10 @@
+[
+  {"id":"primary.codex.account@example.test","email":"primary.codex.account@example.test","provider":"codex","auth_mode":"oauth","source":"server","auth_valid":true,"active":true,"plan_type":"pro",
+   "windows":[{"Name":"primary","UsedPercent":0,"LimitWindowSeconds":18000,"ResetAfterSeconds":14640},{"Name":"secondary","UsedPercent":100,"LimitWindowSeconds":604800,"ResetAfterSeconds":478800}]},
+  {"id":"primary.subscription.account@example.test","provider":"claude","auth_mode":"oauth","source":"server","auth_valid":true,"active":true,"cost_tier":"plan","cost_tier_rank":1,
+   "windows":[{"Name":"5h","UsedPercent":0,"LimitWindowSeconds":18000,"ResetAfterSeconds":14640},{"Name":"7d","UsedPercent":100,"LimitWindowSeconds":604800,"ResetAfterSeconds":478800},{"Name":"oauth-apps-weekly","UsedPercent":20,"ResetAfterSeconds":86400},{"Name":"opus-weekly","UsedPercent":20,"ResetAfterSeconds":86400},{"Name":"sonnet-weekly","UsedPercent":20,"ResetAfterSeconds":86400}],
+   "extra_usage":{"is_enabled":true,"monthly_limit":5000,"used_credits":1250,"auto_reload":false}},
+  {"id":"revoked.subscription@example.test","provider":"claude","auth_mode":"oauth","source":"server","cost_tier":"plan","cost_tier_rank":1,"revoked_since":"2026-10-09T01:00:00Z"},
+  {"id":"credit-key","provider":"claude","auth_mode":"apikey","source":"server","auth_valid":true,"cost_tier":"api-credits","cost_tier_rank":2,
+   "credit":{"grant_usd":200,"spent_usd":12.80,"remaining_usd":187.20,"expires_at":"2026-10-24T00:00:00Z","pace":"behind","promoted":true}}
+]

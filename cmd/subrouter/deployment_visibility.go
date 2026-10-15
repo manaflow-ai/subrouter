@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -26,6 +27,41 @@ type recoveryCountersView struct {
 	Exhausted            int64 `json:"exhausted"`
 }
 
+var buildCommitPattern = regexp.MustCompile(`(?i)[0-9a-f]{7,40}`)
+
+// buildCommits extracts hexadecimal revision identifiers from a build string.
+func buildCommits(value string) []string {
+	return buildCommitPattern.FindAllString(strings.ToLower(value), -1)
+}
+
+// sameBuildCommit accepts full and abbreviated forms of the same revision.
+func sameBuildCommit(left, right string) bool {
+	for _, a := range buildCommits(left) {
+		for _, b := range buildCommits(right) {
+			if strings.HasPrefix(a, b) || strings.HasPrefix(b, a) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sameBuildIdentity compares semantic versions first, then stamped revisions.
+func sameBuildIdentity(client buildversion.Info, serverVersion, serverCommit string) bool {
+	if sameVersion(client.Version, serverVersion) {
+		return true
+	}
+	for _, clientValue := range []string{client.Commit, client.Version} {
+		for _, serverValue := range []string{serverCommit, serverVersion} {
+			if sameBuildCommit(clientValue, serverValue) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// printDeploymentVisibilityStatus prints server rollout and build identity details.
 func (r srRunner) printDeploymentVisibilityStatus(ctx context.Context, server srServerConfig) {
 	baseURL, err := serverControlBaseURL(server)
 	if err != nil {
@@ -84,7 +120,7 @@ func (r srRunner) printDeploymentVisibilityStatus(ctx context.Context, server sr
 	}
 	serverLocal := func(p string) bool { return p == "unknown" || strings.Contains(p, "local") }
 	switch {
-	case !sameVersion(clientInfo.Version, serverVersion):
+	case !sameBuildIdentity(clientInfo, serverVersion, health.Build.Commit):
 		fmt.Fprintf(r.out, "Warning                client is behind or differs from server; run '%s update'\n", r.programBase())
 	case serverLocal(health.Build.Mainline):
 		fmt.Fprintln(r.out, "Warning                server is a local or unpushed build; deploy a stamped release before promoting it")

@@ -2,6 +2,9 @@ package proxy
 
 import (
 	"bufio"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net"
@@ -272,6 +275,37 @@ func TestTrafficCountsHandlerGeneratedFailuresAsProxy(t *testing.T) {
 	}
 }
 
+// TestTrafficFailureReportIncludesRouteAccountAndRetryPath verifies the
+// supervisor-facing failure sample at the HTTP traffic boundary.
+func TestTrafficFailureReportIncludesRouteAccountAndRetryPath(t *testing.T) {
+	stats := NewTrafficStats(time.Now())
+	handler := stats.trafficCounted(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		markTrafficAccount(r.Context(), "claude-account@example.com")
+		markTrafficRetryPath(r.Context(), "account_failover")
+		markTrafficUpstreamStatus(r.Context(), http.StatusBadGateway)
+		markTrafficErrorClass(r.Context(), "proxy_error")
+		http.Error(w, "upstream request failed", http.StatusBadGateway)
+	}))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", nil))
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", recorder.Code)
+	}
+	snapshot := stats.Snapshot(nil, time.Now())
+	if len(snapshot.Failures) != 1 {
+		t.Fatalf("failures = %+v, want one sample", snapshot.Failures)
+	}
+	failure := snapshot.Failures[0]
+	digest := sha256.Sum256([]byte("claude-account@example.com"))
+	wantAccountHash := "sha256:" + hex.EncodeToString(digest[:8])
+	if failure.Status != http.StatusBadGateway || failure.UpstreamStatus != http.StatusBadGateway ||
+		failure.Method != http.MethodPost || failure.Path != "/v1/messages" ||
+		failure.AccountHash != wantAccountHash || failure.RetryPath != "account_failover" ||
+		failure.ErrorClass != "proxy_error" {
+		t.Fatalf("failure = %+v, want route/account/retry classification", failure)
+	}
+}
+
 func TestTrafficCountsAPanickingHandlerAsProxy5xx(t *testing.T) {
 	stats := NewTrafficStats(time.Now())
 	handler := stats.trafficCounted(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -337,5 +371,40 @@ func TestHealthReportsReleaseStateOnlyWhenConfigured(t *testing.T) {
 	}
 	if _, ok := health(Server{ReleaseStatePath: path + ".missing"})["release"]; ok {
 		t.Fatal("a missing release file must be omitted")
+	}
+}
+
+// A client that hangs up mid-request leaves the proxy writing a 502 to
+// nobody. That is the client's doing, not a proxy failure: counting it as
+// proxy_5xx aborted canaries on cancellation noise (v0.1.151, v0.1.173). It
+// is counted as a client abort instead. A 5xx while the client is still
+// there, or one passed through from upstream, still counts.
+func TestTrafficCountsClientAbortsApartFromProxy5xx(t *testing.T) {
+	stats := NewTrafficStats(time.Now())
+	handler := stats.trafficCounted(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/upstream" {
+			markUpstreamResponse(r.Context(), true)
+		}
+		http.Error(w, "upstream request failed", http.StatusBadGateway)
+	}))
+	for _, c := range []struct {
+		path     string
+		canceled bool
+	}{{"/aborted", true}, {"/aborted", true}, {"/upstream", true}, {"/failed", false}} {
+		req := httptest.NewRequest(http.MethodPost, c.path, nil)
+		if c.canceled {
+			ctx, cancel := context.WithCancel(req.Context())
+			cancel()
+			req = req.WithContext(ctx)
+		}
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	got := stats.Snapshot(nil, time.Now())
+	if got.Requests != 4 || got.ClientAborts != 2 || got.Proxy5xx != 1 || got.Upstream5xx != 1 || got.Responses.Class5xx != 2 {
+		t.Fatalf("requests=%d client_aborts=%d proxy_5xx=%d upstream_5xx=%d 5xx=%d, want 4/2/1/1/2",
+			got.Requests, got.ClientAborts, got.Proxy5xx, got.Upstream5xx, got.Responses.Class5xx)
+	}
+	if len(got.Failures) != 2 {
+		t.Fatalf("failure samples = %+v, want only the two real 5xx", got.Failures)
 	}
 }

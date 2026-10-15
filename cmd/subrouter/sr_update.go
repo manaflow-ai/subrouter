@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -50,6 +51,7 @@ var releaseTagPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Z
 
 const srUpdateHelp = `Usage:
   sr update [--version vX.Y.Z] [--check] [--yes]
+  sr update --auto
   sr rollback [--to vX.Y.Z] [--list] [--yes]
 
 update    Install the latest release (or --version) over this machine's
@@ -59,6 +61,11 @@ update    Install the latest release (or --version) over this machine's
           --check only compares the installed, running and available versions.
           Without --version it never replaces a newer build (such as one
           built from main) or a development build with an older release.
+          --auto is the unattended form every sr command starts in the
+          background at most once a day: it logs to
+          ~/.subrouter/logs/auto-update.log, skips what a manual update would
+          refuse, and defers while an unsupervised daemon is serving
+          requests. SUBROUTER_NO_AUTO_UPDATE=1 turns the background start off.
 rollback  Put the newest kept backup (or --to) back the same way. The last
           three replaced binaries are kept next to the installed binary in
           .subrouter-backups/. --list prints them.
@@ -84,14 +91,28 @@ type installTarget struct {
 	binary        string
 	controller    serviceController
 	controlSocket string
+	// skipService is set when a local LaunchAgent is intentionally disabled or
+	// no longer loaded. The binary is still owned by that plist, but update and
+	// rollback must not try to bootstrap a service that a tunnel owns instead.
+	skipService bool
 	// leasePath is the supervisor mutation lease the LaunchAgent migration
 	// and rollback scripts hold; empty when nothing else mutates the binary.
 	leasePath string
 }
 
+// hasDaemon reports whether update owns a service that it should restart.
 func (t installTarget) hasDaemon() bool {
-	return t.controller != nil || t.controlSocket != ""
+	return !t.skipService && (t.controller != nil || t.controlSocket != "")
 }
+
+type launchAgentState uint8
+
+const (
+	launchAgentUnknown launchAgentState = iota
+	launchAgentLoaded
+	launchAgentDisabledState
+	launchAgentNotLoaded
+)
 
 // updater carries every host dependency so tests can point it at temp dirs,
 // httptest servers and fake service controllers.
@@ -118,6 +139,7 @@ type updater struct {
 	systemUnitPath string
 
 	controllerFor  func(kind installKind) serviceController
+	launchdProbe   func(label string) (launchAgentState, error)
 	runBinary      func(ctx context.Context, path string, args ...string) (string, error)
 	upgradeWorker  func(ctx context.Context, socket string) error
 	now            func() time.Time
@@ -126,6 +148,15 @@ type updater struct {
 	out            io.Writer
 	programName    string
 	cliVersionPath string
+
+	// autoStampPath and autoLogPath are `update --auto`'s schedule and log;
+	// idleSamples probes of the daemon's drain-status, idleInterval apart,
+	// must all report nothing in flight before it restarts an unsupervised
+	// daemon.
+	autoStampPath string
+	autoLogPath   string
+	idleSamples   int
+	idleInterval  time.Duration
 }
 
 func newDefaultUpdater(in io.Reader, out io.Writer) *updater {
@@ -164,7 +195,11 @@ func newDefaultUpdater(in io.Reader, out io.Writer) *updater {
 	}
 	if home != "" {
 		u.cliVersionPath = filepath.Join(home, ".subrouter", "cli-version")
+		u.autoStampPath = autoUpdateStampPath(home)
+		u.autoLogPath = autoUpdateLogPath(home)
 	}
+	u.idleSamples = autoUpdateIdleSamples
+	u.idleInterval = autoUpdateIdleInterval
 	u.controllerFor = u.defaultController
 	return u
 }
@@ -197,6 +232,48 @@ func (u *updater) defaultController(kind installKind) serviceController {
 	return nil
 }
 
+// probeLaunchAgent reports whether launchd has disabled or unloaded an agent.
+func probeLaunchAgent(label string) (launchAgentState, error) {
+	domain := "gui/" + strconv.Itoa(os.Getuid())
+	disabled, disabledErr := (commandRunner{}).Output("launchctl", "print-disabled", domain)
+	if disabledErr == nil && launchAgentDisabled(disabled, label) {
+		return launchAgentDisabledState, nil
+	}
+	_, printErr := (commandRunner{}).Output("launchctl", "print", domain+"/"+label)
+	if printErr == nil {
+		return launchAgentLoaded, nil
+	}
+	// A missing launchctl is not evidence that the service is inactive. On a
+	// real Darwin host launchctl is present; preserving the old behavior here
+	// keeps cross-platform and restricted environments safe.
+	if errors.Is(printErr, exec.ErrNotFound) || errors.Is(disabledErr, exec.ErrNotFound) {
+		return launchAgentUnknown, printErr
+	}
+	return launchAgentNotLoaded, nil
+}
+
+// launchAgentDisabled reports whether launchctl marked label as disabled.
+func launchAgentDisabled(output []byte, label string) bool {
+	quoted := `"` + label + `"`
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if (strings.Contains(line, quoted) || strings.HasPrefix(line, label+" ")) && strings.Contains(line, "=> true") {
+			return true
+		}
+	}
+	return false
+}
+
+// launchAgentInactive returns true only when launchd conclusively says the agent is inactive.
+func (u *updater) launchAgentInactive(label string) bool {
+	probe := u.launchdProbe
+	if probe == nil {
+		probe = probeLaunchAgent
+	}
+	state, err := probe(label)
+	return err == nil && (state == launchAgentDisabledState || state == launchAgentNotLoaded)
+}
+
 func runUpdateCommand(program string, args []string) error {
 	u := newDefaultUpdater(os.Stdin, os.Stdout)
 	u.programName = program
@@ -213,6 +290,9 @@ type updateOptions struct {
 	version string
 	check   bool
 	yes     bool
+	// auto is `update --auto` (autoUpdate): refusals become
+	// autoUpdateRefusal and a busy unsupervised daemon errAutoUpdateBusy.
+	auto bool
 }
 
 type rollbackOptions struct {
@@ -229,6 +309,7 @@ func (u *updater) runUpdateArgs(ctx context.Context, args []string) error {
 	flags.BoolVar(&opts.check, "check", false, "only report installed, running and available versions")
 	flags.BoolVar(&opts.yes, "yes", false, "do not ask for confirmation")
 	flags.BoolVar(&opts.yes, "y", false, "do not ask for confirmation")
+	flags.BoolVar(&opts.auto, "auto", false, "unattended daily update (see help)")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			fmt.Fprint(u.out, srUpdateHelp)
@@ -238,6 +319,12 @@ func (u *updater) runUpdateArgs(ctx context.Context, args []string) error {
 	}
 	if flags.NArg() > 0 {
 		return fmt.Errorf("unexpected argument %q\n%s", flags.Arg(0), srUpdateHelp)
+	}
+	if opts.auto {
+		if opts.version != "" || opts.check {
+			return fmt.Errorf("--auto takes no other flags\n%s", srUpdateHelp)
+		}
+		return u.autoUpdate(ctx)
 	}
 	return u.update(ctx, opts)
 }
@@ -291,6 +378,7 @@ func (u *updater) detect() (installTarget, error) {
 	return target, nil
 }
 
+// detectService finds a local supervisor definition and its worker binary.
 func (u *updater) detectService() (installTarget, bool, error) {
 	switch u.goos {
 	case "darwin":
@@ -311,15 +399,23 @@ func (u *updater) detectService() (installTarget, bool, error) {
 			if worker == "" {
 				return installTarget{}, false, fmt.Errorf("%s runs a supervisor without --worker-bin", plist)
 			}
-			return installTarget{
+			target := installTarget{
 				kind:          installKindLaunchAgentSupervised,
 				binary:        resolvePath(worker),
 				controller:    u.controllerFor(installKindLaunchAgentSupervised),
 				controlSocket: argumentValue(arguments, "--control-socket"),
 				leasePath:     plist + ".supervisor-mutation.lock",
-			}, true, nil
+			}
+			if u.launchAgentInactive(defaultDaemonLabel) {
+				target.skipService = true
+			}
+			return target, true, nil
 		}
-		return installTarget{kind: installKindLaunchAgent, binary: resolvePath(arguments[0]), controller: u.controllerFor(installKindLaunchAgent)}, true, nil
+		target := installTarget{kind: installKindLaunchAgent, binary: resolvePath(arguments[0]), controller: u.controllerFor(installKindLaunchAgent)}
+		if u.launchAgentInactive(defaultDaemonLabel) {
+			target.skipService = true
+		}
+		return target, true, nil
 	case "linux":
 		for _, candidate := range []struct {
 			kind installKind
@@ -565,12 +661,20 @@ func systemdExecStartBinary(unit string) string {
 // ---------------------------------------------------------------------------
 // Versions
 
+// normalizeVersion removes surrounding whitespace and a leading v prefix.
 func normalizeVersion(version string) string {
 	return strings.TrimPrefix(strings.TrimSpace(version), "v")
 }
 
+// sameVersion compares release identities while ignoring semver build metadata.
 func sameVersion(left, right string) bool {
-	return left != "" && right != "" && normalizeVersion(left) == normalizeVersion(right)
+	if left == "" || right == "" {
+		return false
+	}
+	if cmp, ok := compareReleaseVersions(left, right); ok {
+		return cmp == 0
+	}
+	return normalizeVersion(left) == normalizeVersion(right)
 }
 
 // compareReleaseVersions orders two versions with semver precedence, the
@@ -1230,6 +1334,9 @@ func (u *updater) confirm(prompt string, yes bool) error {
 func (u *updater) update(ctx context.Context, opts updateOptions) error {
 	target, err := u.detect()
 	if err != nil {
+		if opts.auto {
+			return autoUpdateRefusal{err}
+		}
 		return err
 	}
 	installed := u.binaryVersion(ctx, target.binary)
@@ -1261,6 +1368,9 @@ func (u *updater) update(ctx context.Context, opts updateOptions) error {
 	// cannot be ordered at all (a plain "devel" build) stays put; --version
 	// is how an intentional downgrade or replacement is asked for.
 	if refusal := latestWouldNotAdvance(installed, tag); opts.version == "" && !binaryCurrent && refusal != "" {
+		if opts.auto {
+			return autoUpdateRefusal{errors.New(refusal)}
+		}
 		if opts.check {
 			fmt.Fprintf(u.out, "%s; '%s update' will not replace it (use '%s update --version %s' to install that release on purpose)\n", refusal, u.programName, u.programName, tag)
 			return nil
@@ -1279,11 +1389,17 @@ func (u *updater) update(ctx context.Context, opts updateOptions) error {
 		return nil
 	}
 
+	if binaryCurrent && daemonCurrent {
+		fmt.Fprintf(u.out, "already at %s\n", tag)
+		return nil
+	}
+	// A supervised daemon swaps workers behind its open listener; any other
+	// restart drops whatever the daemon is serving, so the unattended update
+	// waits for a moment it serves nothing, before it changes anything.
+	if u.autoRestartBusy(ctx, opts, target) {
+		return errAutoUpdateBusy
+	}
 	if binaryCurrent {
-		if daemonCurrent {
-			fmt.Fprintf(u.out, "already at %s\n", tag)
-			return nil
-		}
 		if err := u.confirm(fmt.Sprintf("%s is installed but the daemon runs %s; restart it.", tag, displayVersion(daemonVersion)), opts.yes); err != nil {
 			return err
 		}
@@ -1302,6 +1418,16 @@ func (u *updater) update(ctx context.Context, opts updateOptions) error {
 		return err
 	}
 	defer unlock()
+	// Another update may have replaced the binary between the version read
+	// above and the lock; its backup is labelled with what it replaced, and
+	// this one must not overwrite that with a stale label.
+	if current := u.binaryVersion(ctx, target.binary); current != installed {
+		err := fmt.Errorf("%s changed from %s to %s while this update started; run it again", target.binary, displayVersion(installed), displayVersion(current))
+		if opts.auto {
+			return autoUpdateRefusal{err}
+		}
+		return err
+	}
 	staged, err := u.download(ctx, tag, filepath.Dir(target.binary))
 	if err != nil {
 		return err
@@ -1322,6 +1448,11 @@ func (u *updater) update(ctx context.Context, opts updateOptions) error {
 	want := ""
 	if stagedVersion != "" {
 		want = tag
+	}
+	// The download took a while; a request that started meanwhile still
+	// holds the restart back.
+	if u.autoRestartBusy(ctx, opts, target) {
+		return errAutoUpdateBusy
 	}
 	if err := u.replaceAndVerify(ctx, target, staged, want, backup, installed); err != nil {
 		return fmt.Errorf("update to %s failed: %w", tag, err)

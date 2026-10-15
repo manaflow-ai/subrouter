@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -787,6 +788,7 @@ func isSubrouterOwnedCodexConfig(assignment string) bool {
 		"openai_base_url",
 		"chatgpt_base_url",
 		"experimental_realtime_ws_base_url",
+		"experimental_realtime_webrtc_call_base_url",
 		"model_providers.subrouter":
 		return true
 	default:
@@ -853,10 +855,7 @@ func codexConfigArgs(
 	model string,
 	forceAuthenticatedProvider bool,
 ) []string {
-	authConfig := `model_providers.subrouter.experimental_bearer_token="subrouter"`
-	if forceAuthenticatedProvider {
-		authConfig = `model_providers.subrouter.env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`
-	}
+	authConfig := "model_providers.subrouter." + codexSubrouterProviderAuth(baseURL, accountID, forceAuthenticatedProvider)
 	return []string{
 		"-c", `model_provider="subrouter"`,
 		"-c", `model_providers.subrouter.name="Subrouter"`,
@@ -865,17 +864,88 @@ func codexConfigArgs(
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
 		"-c", `model_providers.subrouter.http_headers=` + codexSubrouterHeaders(userEmail, accountID, model),
+		// Codex voice dials its sideband WebSocket from the realtime ws base, not
+		// the provider base_url, so without these it bypasses sr entirely.
+		"-c", "experimental_realtime_ws_base_url=" + strconv.Quote(codexRealtimeWSBaseURL(baseURL)),
+		"-c", "experimental_realtime_webrtc_call_base_url=" + strconv.Quote(codexRealtimeCallBaseURL(baseURL)),
 		// A final whole-table override removes unknown leaves inherited through a
 		// parent model_providers table; leaf overrides alone do not replace them.
 		"-c", `model_providers.subrouter=` + codexSubrouterProviderTable(baseURL, userEmail, accountID, model, forceAuthenticatedProvider),
 	}
 }
 
-func codexSubrouterProviderTable(baseURL, userEmail, accountID, model string, forceAuthenticatedProvider bool) string {
-	auth := `experimental_bearer_token="subrouter"`
+// codexRealtimeWSBaseURL is the base Codex appends /<call-id> to for the voice
+// sideband. Codex rewrites only a bare "/v1" path to "/v1/live" and keeps any
+// other path as is, so a tenant root (/t/<key>/v1) needs the explicit /live.
+func codexRealtimeWSBaseURL(baseURL string) string {
+	return codexProxyRootURL(baseURL) + "/v1/live"
+}
+
+// codexRealtimeCallBaseURL is the base Codex POSTs <base>/live to for voice
+// setup. It must be set alongside the ws base, which otherwise doubles as the
+// setup base and would yield /v1/live/live.
+func codexRealtimeCallBaseURL(baseURL string) string {
+	return codexProxyRootURL(baseURL) + "/v1"
+}
+
+// codexSubrouterProviderAuth picks how the Codex child authenticates to the
+// Subrouter provider. A pinned launch with a ChatGPT login uses that login
+// (requires_openai_auth): only then does Codex fetch the provider's model
+// catalog, which the router serves from the pinned account, so tiers that
+// only some plans have (Ultrafast) are offered and sent instead of being
+// dropped against the bundled catalog. The router replaces the client
+// credential with the pool account's, as it already does for plain Codex
+// clients that point openai_base_url at it.
+//
+// The login's access token then reaches the router, so this applies only to a
+// loopback or tailnet router, and only to a login refreshed within the last
+// week: an older one may need a refresh that a revoked token would fail after
+// launch, where bearer mode needed no login. SUBROUTER_CODEX_CHATGPT_AUTH=0
+// turns it off, for example when the pool holds this same login's refresh
+// chain and two refreshers would invalidate each other.
+func codexSubrouterProviderAuth(baseURL, accountID string, forceAuthenticatedProvider bool) string {
 	if forceAuthenticatedProvider {
-		auth = `env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`
+		return `env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`
 	}
+	if accountID != "" && strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_CHATGPT_AUTH")) != "0" &&
+		codexChatGPTAuthTrustedHost(baseURL) && codexHasFreshChatGPTLogin(time.Now()) {
+		return `requires_openai_auth=true`
+	}
+	return `experimental_bearer_token="subrouter"`
+}
+
+const codexChatGPTLoginMaxAge = 7 * 24 * time.Hour
+
+func codexHasFreshChatGPTLogin(now time.Time) bool {
+	auth, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil || !ok || auth.Tokens == nil || auth.RefreshFailure != nil ||
+		strings.TrimSpace(auth.Tokens.AccessToken) == "" || strings.TrimSpace(auth.Tokens.RefreshToken) == "" {
+		return false
+	}
+	refreshed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(auth.LastRefresh))
+	return err == nil && now.Sub(refreshed) < codexChatGPTLoginMaxAge
+}
+
+// codexChatGPTAuthTrustedHost accepts loopback, tailnet (100.64.0.0/10,
+// *.ts.net) and single-label MagicDNS hosts.
+func codexChatGPTAuthTrustedHost(baseURL string) bool {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		_, tailnet, _ := net.ParseCIDR("100.64.0.0/10")
+		return ip.IsLoopback() || tailnet.Contains(ip)
+	}
+	return host == "localhost" || strings.HasSuffix(host, ".ts.net") || !strings.Contains(host, ".")
+}
+
+func codexSubrouterProviderTable(baseURL, userEmail, accountID, model string, forceAuthenticatedProvider bool) string {
+	auth := codexSubrouterProviderAuth(baseURL, accountID, forceAuthenticatedProvider)
 	return `{name="Subrouter",base_url=` + strconv.Quote(baseURL) + `,` + auth + `,wire_api="responses",supports_websockets=true,http_headers=` + codexSubrouterHeaders(userEmail, accountID, model) + `}`
 }
 
@@ -886,6 +956,9 @@ func codexSubrouterHeaders(userEmail, accountID, model string) string {
 	}
 	if client := srClientName(); client != "" {
 		headers = append(headers, `"`+clientNameHeader+`"=`+strconv.Quote(client))
+	}
+	if version := srClientVersion(); version != "" {
+		headers = append(headers, `"`+clientVersionHeader+`"=`+strconv.Quote(version))
 	}
 	if userEmail != "" {
 		headers = append(headers, `"X-Subrouter-User-Email"=`+strconv.Quote(userEmail))

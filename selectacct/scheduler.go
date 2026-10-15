@@ -106,10 +106,12 @@ type Scheduler struct {
 	capacity map[string]int
 }
 
-const (
-	MinNewSessionHeadroom     = 0.40
-	InflightPenaltyPerRequest = 0.15
-)
+// MinNewSessionHeadroom is the headroom an account needs to take a new
+// session. The worker's --min-new-session-headroom flag sets it once at
+// startup, before any routing; nothing changes it afterwards.
+var MinNewSessionHeadroom = 0.40
+
+const InflightPenaltyPerRequest = 0.15
 
 // MinStickyRetentionHeadroom is the headroom an account must still have for an
 // idle session to stay on it. It sits far below MinNewSessionHeadroom on
@@ -346,39 +348,33 @@ func (s Scheduler) sortCandidates(candidates []account.Account) []account.Accoun
 }
 
 // spreadPool returns the leading candidates a new session may be spread
-// across: the usable OAuth accounts tied at the sort's top ExpiryPressure
-// (the leading equal-pressure band).
+// across: every usable OAuth plan account at the sort's top capacity-failure
+// count.
 //
-// Between accounts with DIFFERENT pressure, the drain-soonest ordering is a
-// deliberate, simulation-tuned policy (see gto_sim_test.go) and stays
-// deterministic: distinct pressures form singleton bands and no spreading
-// happens. WITHIN a band the pressure signal says nothing, and the remaining
-// ordering input is headroom from a usage snapshot that lags consumption
-// (integer-only and hours late for Codex). A deterministic argmax over that
-// snapshot sends EVERY placement to the same account until the snapshot
-// catches up; sessions are long-lived and sticky, so the pool drains one
-// account at a time and a cap hit reroutes the whole herd at once
-// (2026-08-18: one account served 100% of Codex traffic for five hours while
-// six healthy accounts sat idle). Sampling within the band removes the herd
-// without touching retention or the pressure policy.
+// A deterministic argmax over the usage snapshot herds. The snapshot lags
+// consumption, sessions are long-lived and sticky, and the proxy's own live
+// debit is wiped by every refresh, so an argmax sends EVERY placement to one
+// account until that account is drained, and a cap hit then reroutes the
+// whole herd at once. Codex showed it first (2026-08-18: one account served
+// 100% of Codex traffic for five hours while six healthy accounts sat idle).
+// Claude showed it again (2026-10-13: sessions moved from an account at 99%
+// of its weekly cap straight to one at 100%, and the one hot account filled
+// its upstream admission queue, while eleven accounts had quota left).
 //
-// This is provider-agnostic by construction: Codex accounts report only a
-// weekly window, so their pressure is always 0 and the band is the whole
-// usable pool; scored Claude accounts carry distinct reset-time pressures,
-// so their bands are singletons; an unscored pool of any provider (all
-// optimistic defaults, pressure 0) spreads instead of herding. A future
-// provider gets the right behaviour from whatever pressure signal its usage
-// windows produce, with no per-provider case here.
+// Claude scores used to form singleton bands here, because each account's
+// drain-soonest ExpiryPressure is a distinct float. Pressure is now a weight
+// inside the band instead of a band boundary (spreadIndex): the account whose
+// 5h window resets soonest still gets the largest share, but no account with
+// room for a new session is starved, and concurrent sessions spread across
+// accounts instead of piling onto one account's concurrent-stream limit.
 func (s Scheduler) spreadPool(sorted []account.Account) []account.Account {
-	topScore := s.score(sorted[0].Provider, sorted[0].ID)
 	if s.tier(sorted[0]) != SelectionTierPlan {
 		return nil
 	}
 	topCapacity := s.CapacityFailures(sorted[0].Provider, sorted[0].ID)
 	end := 1
 	for end < len(sorted) {
-		score := s.score(sorted[end].Provider, sorted[end].ID)
-		if s.tier(sorted[end]) != SelectionTierPlan || score.ExpiryPressure != topScore.ExpiryPressure ||
+		if s.tier(sorted[end]) != SelectionTierPlan ||
 			s.CapacityFailures(sorted[end].Provider, sorted[end].ID) != topCapacity {
 			break
 		}
@@ -393,24 +389,31 @@ func (s Scheduler) spreadPool(sorted []account.Account) []account.Account {
 // roomy accounts.
 const spreadWeightFloor = 0.01
 
-// spreadIndex samples one account from the pool, weighted by headroom
-// surplus above the new-session threshold and damped by the number of
-// sessions already assigned there. Surplus weighting drains roomy accounts
-// faster, so the pool converges toward even headroom instead of even request
-// counts; live in-flight pressure adds a direct short-horizon signal while
-// the existing assignment damping remains unchanged.
+// spreadPressureGain is how much more weight the band's highest drain
+// pressure earns over an account with none: weight scales by up to
+// 1+spreadPressureGain in proportion to pressure / the band's top pressure.
+// It keeps the drain-soonest preference (quota in a 5h window that resets
+// soon is lost if unused) as a lean, not an exclusive claim. A gain of 3
+// concentrated load on the soonest-resetting account; 1 kept the lean and
+// queued less (TestWaterfillPolicyExperiment).
+var spreadPressureGain = 1.0
+
+// spreadIndex samples one account from the pool by spreadWeight: headroom
+// surplus above the new-session threshold, leaned toward drain pressure, and
+// damped by the square of the sessions active there. Surplus weighting sends
+// more new sessions to the fullest accounts, so the pool converges toward
+// even headroom; the squared load damping spreads concurrent sessions so no
+// account's admission slots fill while others idle.
 func (s Scheduler) spreadIndex(pool []account.Account) int {
 	weights := make([]float64, len(pool))
+	topPressure := 0.0
+	for _, candidate := range pool {
+		topPressure = math.Max(topPressure, s.score(candidate.Provider, candidate.ID).ExpiryPressure)
+	}
 	total := 0.0
 	for i, candidate := range pool {
-		score := s.score(candidate.Provider, candidate.ID)
-		surplus := math.Min(score.Headroom, score.ShortHeadroom) - MinNewSessionHeadroom
-		if surplus < spreadWeightFloor {
-			surplus = spreadWeightFloor
-		}
-		weight := (surplus + weeklySurplusSpreadGain*score.WeeklySurplus) / float64(1+score.Sessions)
-		weights[i] = weight
-		total += weight
+		weights[i] = s.spreadWeight(candidate, topPressure)
+		total += weights[i]
 	}
 	target := spreadRandFloat() * total
 	for i, weight := range weights {
@@ -421,6 +424,30 @@ func (s Scheduler) spreadIndex(pool []account.Account) int {
 	}
 	return len(pool) - 1
 }
+
+// spreadWeight is water-filling over live load: quota surplus divided by the
+// square of (1 + sessions active on the account). Squaring is what spreads
+// concurrent load: with linear damping an account holding 6 active sessions
+// still took 1/7 of a fresh account's share and kept collecting sessions
+// while its admission slots were full. In-flight requests stay a headroom
+// penalty (score), which the simulation found stronger than counting them
+// in the denominator. Tuned by TestWaterfillPolicyExperiment.
+func (s Scheduler) spreadWeight(candidate account.Account, topPressure float64) float64 {
+	score := s.score(candidate.Provider, candidate.ID)
+	surplus := math.Min(score.Headroom, score.ShortHeadroom) - MinNewSessionHeadroom
+	if surplus < spreadWeightFloor {
+		surplus = spreadWeightFloor
+	}
+	weight := (surplus + weeklySurplusSpreadGain*score.WeeklySurplus) / math.Pow(1+float64(score.Sessions), spreadLoadExponent)
+	if topPressure > 0 {
+		weight *= 1 + spreadPressureGain*score.ExpiryPressure/topPressure
+	}
+	return weight
+}
+
+// spreadLoadExponent is the power of (1 + active sessions) that divides a
+// spread weight.
+var spreadLoadExponent = 2.0
 
 // Expiring weekly quota. An account's weekly surplus (Score.WeeklySurplus)
 // is quota that is lost at reset unless the account is used faster than its
@@ -600,6 +627,14 @@ func applyPlacementPenalty(score Score, penalty float64) Score {
 		score.WeeklySurplus = 0
 	}
 	return score
+}
+
+// KnownScore returns the measured score and whether a usage refresh or an
+// exhaustion mark produced one. An unknown account reads as fully healthy,
+// which status views must not mistake for measured quota.
+func (s Scheduler) KnownScore(provider account.Provider, accountID string) (Score, bool) {
+	_, ok := s.scores[ScoreKey(provider, accountID)]
+	return s.measuredScore(provider, accountID), ok
 }
 
 // measuredScore is the score from the last usage refresh, with no live debit

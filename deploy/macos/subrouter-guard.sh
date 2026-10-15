@@ -89,6 +89,10 @@ emit() { # level msg...
   echo "guard $line" >>"$ALERTS" 2>/dev/null || true
 }
 
+if [ "$BAKE_GATE" -eq 1 ] && ! bake_prepare_release_state; then
+  emit ALERT "could not prepare $RELEASE_STATE_FILE for the service user"
+fi
+
 canary_log() { emit "$1" "canary: $2"; }
 
 probe_health() { curl -fsS --max-time "$PROBE_TIMEOUT_SECS" "$HEALTH" >/dev/null 2>&1; }

@@ -134,7 +134,7 @@ func TestUsageThrottleKeepsProviderResetWindowsAcrossFailureCache(t *testing.T) 
 	}
 }
 
-func TestUsageThrottleCacheIsCredentialScopedAndExpires(t *testing.T) {
+func TestUsageThrottleSurvivesTokenRefreshUntilReLogin(t *testing.T) {
 	transport := &countingTransport{responses: claudeUsage429}
 	ref := &AccountRef{}
 	client := &http.Client{Transport: transport}
@@ -145,24 +145,33 @@ func TestUsageThrottleCacheIsCredentialScopedAndExpires(t *testing.T) {
 		t.Fatal("expected initial fetch")
 	}
 
-	repaired := account
-	repaired.Token = "new-token"
-	_, _, _ = ref.FetchUsageWindowsCached(context.Background(), client, repaired)
+	refreshed := account
+	refreshed.Token = "new-token"
+	ref.replace(refreshed)
+	_, _, _ = ref.FetchUsageWindowsCached(context.Background(), client, refreshed)
+	if transport.calls != first {
+		t.Fatalf("ordinary token refresh bypassed the active account throttle: calls=%d, want %d", transport.calls, first)
+	}
+
+	// A full account reload marks a true re-login. It clears the account-wide
+	// throttle so the new owner gets one fresh provider observation.
+	ref.invalidateReplacedAccountUsage([]accounts.Account{account}, []accounts.Account{refreshed})
+	_, _, _ = ref.FetchUsageWindowsCached(context.Background(), client, refreshed)
 	if transport.calls <= first {
-		t.Fatal("repaired credential must bypass old throttle cache")
+		t.Fatal("true re-login did not clear the prior account throttle")
 	}
 	second := transport.calls
 
 	// Simulate expiry without sleeping: the next read can retry the upstream.
 	key := account.ID + "\x00" + string(account.Provider)
-	cacheKey := usageWindowsFailureKey(key, repaired.Token)
+	cacheKey := usageWindowsFailureKey(key, refreshed.Token)
 	ref.usageWindowsMu.Lock()
 	failure := ref.usageWindowsFailures[cacheKey]
 	failure.at = time.Now().Add(-usageWindowsThrottleTTL - time.Second)
 	failure.retryAt = time.Now().Add(-time.Second)
 	ref.usageWindowsFailures[cacheKey] = failure
 	ref.usageWindowsMu.Unlock()
-	_, _, _ = ref.FetchUsageWindowsCached(context.Background(), client, repaired)
+	_, _, _ = ref.FetchUsageWindowsCached(context.Background(), client, refreshed)
 	if transport.calls <= second {
 		t.Fatalf("expired failure cache must allow a new fetch: %d after %d", transport.calls, second)
 	}

@@ -203,3 +203,17 @@ func TestCapacityStickyEvictionNeedsRepeatedFailures(t *testing.T) {
 		t.Fatalf("capacity mark after a refresh: failures=%d ok=%v", failures, ok)
 	}
 }
+
+// A mark keeps the reason of its latest failure for diagnostics.
+func TestCapacityMarkKeepsLastReason(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler(nil))
+	until := time.Now().Add(time.Minute)
+	ref.MarkCapacityReasonUntil(account.ProviderCodex, "acct-0", "m", "", "http_503", until)
+	if n := ref.MarkCapacityReasonUntil(account.ProviderCodex, "acct-0", "m", "", "server_is_overloaded", until); n != 2 {
+		t.Fatalf("failures=%d, want 2", n)
+	}
+	marks := ref.CapacityMarkList()
+	if len(marks) != 1 || marks[0].Reason != "server_is_overloaded" || marks[0].Failures != 2 {
+		t.Fatalf("marks=%+v", marks)
+	}
+}

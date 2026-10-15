@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -220,4 +221,59 @@ func TestBrokerRetryAfterReachesBodyToken(t *testing.T) {
 		t.Fatalf("status = %d, want 503", response.Code)
 	}
 	requireRetryAfter(t, response, 30*time.Minute)
+}
+
+func TestExhaustedPoolIsClassifiedInTrafficAndReasonHeader(t *testing.T) {
+	now := time.Now()
+	id := "a@example.com"
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		scoreFromUsageWindows(accounts.ProviderClaude, id, []accounts.UsageWindow{
+			fiveHour(100, now.Add(47*time.Minute)), sevenDay(40, now.Add(72*time.Hour)),
+		}),
+	}))
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("exhausted pool reached upstream")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(upstream.Close)
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Sessions:       store,
+		ClaudeUpstream: mustParseURL(t, upstream.URL),
+		Accounts: []accounts.Account{{
+			ID: id, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-" + id,
+		}},
+		SchedulerRef: schedulerRef,
+		MaxBodyBytes: 1 << 20,
+		Traffic:      NewTrafficStats(now.Add(-time.Minute)),
+	}.Handler()
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-exhausted-class")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get(subrouterReasonHeader); got != "pool_exhausted" {
+		t.Fatalf("%s = %q, want pool_exhausted", subrouterReasonHeader, got)
+	}
+	snapshot := trafficSnapshotFrom(t, handler)
+	if len(snapshot.Failures) != 1 || snapshot.Failures[0].Status != http.StatusServiceUnavailable ||
+		snapshot.Failures[0].ErrorClass != "pool_exhausted" {
+		t.Fatalf("failures = %+v, want one 503 classed pool_exhausted", snapshot.Failures)
+	}
+}
+
+func TestAccountSelectionFailureReasonSeparatesExhaustionFromOtherErrors(t *testing.T) {
+	if got := accountSelectionFailureReason(fmt.Errorf("pick: %w", &poolExhaustedError{provider: accounts.ProviderClaude})); got != "pool_exhausted" {
+		t.Fatalf("wrapped exhaustion = %q", got)
+	}
+	if got := accountSelectionFailureReason(errors.New("refresh selected account: token refresh failed")); got != "account_selection" {
+		t.Fatalf("refresh failure = %q", got)
+	}
 }

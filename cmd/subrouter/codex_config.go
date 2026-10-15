@@ -16,6 +16,7 @@ var codexRoutingConfigKeys = []string{
 	"openai_base_url",
 	"chatgpt_base_url",
 	"experimental_realtime_ws_base_url",
+	"experimental_realtime_webrtc_call_base_url",
 }
 
 func defaultCodexConfigPath() (string, error) {
@@ -69,9 +70,10 @@ func writeCodexConfigForBaseURL(baseURL string) (string, error) {
 	}
 	root := codexProxyRootURL(baseURL)
 	values := map[string]string{
-		"openai_base_url":                   root + "/v1",
-		"chatgpt_base_url":                  root + "/backend-api",
-		"experimental_realtime_ws_base_url": root + "/v1",
+		"openai_base_url":                            root + "/v1",
+		"chatgpt_base_url":                           root + "/backend-api",
+		"experimental_realtime_ws_base_url":          codexRealtimeWSBaseURL(root),
+		"experimental_realtime_webrtc_call_base_url": codexRealtimeCallBaseURL(root),
 	}
 	if err := writeCodexConfigValues(path, values); err != nil {
 		return "", err

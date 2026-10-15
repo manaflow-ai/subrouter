@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -130,15 +131,95 @@ func TestClaude429FailoverEndToEndAndCaptured(t *testing.T) {
 	}
 
 	logs := logBuf.String()
-	// The genuine upstream message must be captured so operators can see it.
-	if !strings.Contains(logs, "This request would exceed your account") {
-		t.Fatalf("expected the 429 body to be logged; logs=\n%s", logs)
+	// Response bodies stay out of logs; bounded headers carry the actionable
+	// reset evidence without risking provider error payloads or credentials.
+	if strings.Contains(logs, "This request would exceed your account") {
+		t.Fatalf("429 response body must not be logged; logs=\n%s", logs)
 	}
 	// The rate-limit headers must be captured too.
 	for _, want := range []string{"retry-after", "anthropic-ratelimit-unified-reset"} {
 		if !strings.Contains(logs, want) {
 			t.Fatalf("expected rate-limit header %q in logs; logs=\n%s", want, logs)
 		}
+	}
+}
+
+func TestClaudeRequestReverifiesWeeklyCookedAccountAfterTelemetryThrottle(t *testing.T) {
+	account := accounts.Account{ID: "claude@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok"}
+	var usageCalls, probeCalls int
+	ref := cacheTestAccountRef(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/api/oauth/usage":
+			usageCalls++
+			return usage429Response(), nil
+		case "/v1/messages":
+			probeCalls++
+			header := http.Header{}
+			header.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
+			header.Set("Anthropic-Ratelimit-Unified-5h-Utilization", "0.01")
+			header.Set("Anthropic-Ratelimit-Unified-5h-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+			header.Set("Anthropic-Ratelimit-Unified-7d-Status", "allowed")
+			header.Set("Anthropic-Ratelimit-Unified-7d-Utilization", "0.01")
+			header.Set("Anthropic-Ratelimit-Unified-7d-Reset", strconv.FormatInt(time.Now().Add(5*time.Hour).Unix(), 10))
+			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: header, Body: io.NopCloser(strings.NewReader(`{"type":"message"}`))}, nil
+		default:
+			return nil, fmt.Errorf("unexpected probe path %s", req.URL.Path)
+		}
+	}))
+	ref.accounts = []accounts.Account{account}
+	cacheKey := account.ID + "\x00" + string(account.Provider)
+	failureKey := usageWindowsFailureKey(cacheKey, account.CredentialIdentity())
+	ref.usageWindowsMu.Lock()
+	ref.usageWindowsFailures = map[string]usageWindowsFailure{
+		failureKey: {err: errors.New("usage fetch failed: 429 Too Many Requests"), retryAt: time.Now().Add(time.Hour)},
+	}
+	ref.usageWindowsMu.Unlock()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/messages" {
+			t.Fatalf("unexpected Claude request %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"id":"msg-reverified"}`)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reset := time.Now().Add(5 * time.Hour)
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: account.ID, Provider: account.Provider, Headroom: 0, ShortHeadroom: 0,
+		WeeklyHeadroom: 0, WeeklyHeadroomKnown: true, ExhaustedResetAt: reset, Fresh: true,
+	}}))
+	schedulerRef.SetUpdatedAt(time.Time{})
+	handler := Server{
+		AccountRef:     ref,
+		SchedulerRef:   schedulerRef,
+		ClaudeUpstream: upstreamURL,
+		Sessions:       sessions,
+		UsageScoreTTL:  time.Minute,
+		MaxBodyBytes:   1 << 20,
+	}.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after quota re-verification; body=%s", response.Code, response.Body.String())
+	}
+	if usageCalls != 0 {
+		t.Fatalf("throttled telemetry endpoint was retried %d time(s)", usageCalls)
+	}
+	if probeCalls != 1 {
+		t.Fatalf("Fable re-verification probes = %d, want 1", probeCalls)
 	}
 }
 
@@ -588,9 +669,14 @@ func TestClaude429FailoverUsesPoolSizedQuotaBudget(t *testing.T) {
 		}
 		accountsList = append(accountsList, accounts.Account{ID: id, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-" + id})
 		headroom := 0.90 - float64(i)*0.01
-		// Distinct ExpiryPressure values (descending with i) make each
-		// account its own pressure band, so the failover walk order is
-		// deterministic: cooked-0 .. cooked-6, then fresh-7.
+		// New-session placement spreads across every roomy account, so the
+		// cooked accounts are walked in random order. The healthy account
+		// sits below the new-session floor, which ranks it after every
+		// roomy account: it is reached only once all seven cooked accounts
+		// were tried, which is what proves the budget is pool-sized.
+		if i == 7 {
+			headroom = 0.30
+		}
 		reset := int64((i + 1) * 3600)
 		scores = append(scores, selectacct.Score{
 			AccountID: id, Provider: accounts.ProviderClaude,
@@ -958,16 +1044,27 @@ func TestClaudeTransient429FailsOverWithoutPoisoningScore(t *testing.T) {
 	}
 }
 
+// TestClaudeHeaderless429FailsOverWithoutPoisoningScore proves a transient
+// headerless 429 retries the sticky account before any account switch.
 func TestClaudeHeaderless429FailsOverWithoutPoisoningScore(t *testing.T) {
 	server, store := claudeFailoverServer(t)
 	if _, err := store.Put("claude", "session-plain-429", "cooked@example.com", ""); err != nil {
 		t.Fatal(err)
 	}
+	var cookedHits, freshHits int
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
 		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
-			return &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(realisticAnthropic429Body))}
+			cookedHits++
+			if cookedHits == 1 {
+				return &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(realisticAnthropic429Body))}
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_ok"}`))}
 		}
-		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_ok"}`))}
+		freshHits++
+		if strings.Contains(req.Header.Get("Authorization"), "tok-fresh") {
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_ok"}`))}
+		}
+		return &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"error":"unexpected account"}`))}
 	}}
 	transport := usageLimitRetryTransport{
 		base: stub, server: &server, provider: accounts.ProviderClaude,
@@ -985,7 +1082,13 @@ func TestClaudeHeaderless429FailsOverWithoutPoisoningScore(t *testing.T) {
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200 after transient failover", response.StatusCode)
+		t.Fatalf("status = %d, want 200 after same-account retry", response.StatusCode)
+	}
+	if cookedHits != 2 {
+		t.Fatalf("cooked upstream hits = %d, want 2 (429 then same-account retry)", cookedHits)
+	}
+	if freshHits != 0 {
+		t.Fatalf("fresh upstream hits = %d, want 0 (transient 429 must not fail over)", freshHits)
 	}
 	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("a headerless 429 must not mark the account exhausted")
@@ -1375,22 +1478,21 @@ func TestClaudeFailoverSkipsDeadTokenAccount(t *testing.T) {
 			{ID: "fresh@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"},
 		},
 		Sessions: store,
-		// Seed the ref with the same pressure-ordered scores as the stub:
-		// UsageScoreTTL is 0 here, so the retry path never refreshes and
-		// picks straight from this snapshot. Distinct pressures make the
-		// failover order deterministic (dead before fresh) despite placement
-		// spreading within equal-pressure bands.
+		// Seed the ref with the same scores as the stub: UsageScoreTTL is 0
+		// here, so the retry path never refreshes and picks straight from
+		// this snapshot. fresh sits below the new-session floor, which ranks
+		// it after dead whatever placement spreading samples, so failover
+		// must meet the dead token first.
 		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
 			{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
 			{AccountID: "dead@example.com", Provider: accounts.ProviderClaude, Headroom: 1.0, ShortHeadroom: 1.0, ShortResetAfterSeconds: 3600, ExpiryPressure: 1.0 / 3600},
-			{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0.9, ShortHeadroom: 0.9, ShortResetAfterSeconds: 4 * 3600, ExpiryPressure: 0.9 / (4 * 3600)},
+			{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0.3, ShortHeadroom: 0.3, ShortResetAfterSeconds: 4 * 3600, ExpiryPressure: 0.3 / (4 * 3600)},
 		})),
-		// Pick order among untried candidates: dead strictly before fresh
-		// (distinct ExpiryPressure values form singleton bands, so the order
-		// is deterministic despite placement spreading), so failover tries
-		// the dead-token account first and must skip it.
+		// Pick order among untried candidates: dead (room for a new session)
+		// strictly before fresh (below the floor), so failover tries the
+		// dead-token account first and must skip it.
 		ScoreAccounts: func(ctx context.Context, available []accounts.Account) ([]selectacct.Score, int) {
-			h := map[string]float64{"cooked@example.com": 0, "dead@example.com": 1.0, "fresh@example.com": 0.9}
+			h := map[string]float64{"cooked@example.com": 0, "dead@example.com": 1.0, "fresh@example.com": 0.3}
 			reset := map[string]int64{"dead@example.com": 3600, "fresh@example.com": 4 * 3600}
 			scores := make([]selectacct.Score, 0, len(available))
 			for _, a := range available {

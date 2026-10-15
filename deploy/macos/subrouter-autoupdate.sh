@@ -46,6 +46,9 @@ if [ -f "$BAKE_LIB" ]; then
   . "$BAKE_LIB"
   BAKE_GATE=1
 fi
+if [ "$BAKE_GATE" -eq 1 ]; then
+  bake_prepare_release_state || log "could not prepare $RELEASE_STATE_FILE for the service user"
+fi
 # The same library carries canary rollouts (RFC #444 step C): when the
 # supervisor supports them, a release goes out as a canary instead of a plain
 # upgrade, and this run returns once the canary has started.

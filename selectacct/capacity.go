@@ -54,6 +54,8 @@ type capacityMarkKey struct {
 type capacityMark struct {
 	until    time.Time
 	failures int
+	// reason is the latest failure's label, for diagnostics only.
+	reason string
 }
 
 // CapacityMarkInfo is one live capacity mark, for diagnostics.
@@ -64,12 +66,21 @@ type CapacityMarkInfo struct {
 	Tier      string
 	Failures  int
 	Until     time.Time
+	// Reason labels the latest failure (e.g. server_is_overloaded); empty
+	// when the caller gave none.
+	Reason string
 }
 
 // MarkCapacityUntil records a capacity failure for the account in the
 // (model, tier) pool until the given time and returns the consecutive
 // failure count, which restarts at 1 once a previous mark expired.
 func (r *SchedulerRef) MarkCapacityUntil(provider account.Provider, accountID, model, tier string, until time.Time) int {
+	return r.MarkCapacityReasonUntil(provider, accountID, model, tier, "", until)
+}
+
+// MarkCapacityReasonUntil is MarkCapacityUntil that also labels the mark with
+// the failure's reason; the latest non-empty reason wins.
+func (r *SchedulerRef) MarkCapacityReasonUntil(provider account.Provider, accountID, model, tier, reason string, until time.Time) int {
 	if r == nil || accountID == "" {
 		return 0
 	}
@@ -88,6 +99,9 @@ func (r *SchedulerRef) MarkCapacityUntil(provider account.Provider, accountID, m
 	}
 	mark := r.capacityUntil[key]
 	mark.failures++
+	if reason != "" {
+		mark.reason = reason
+	}
 	if until.After(mark.until) {
 		mark.until = until
 	}
@@ -214,7 +228,7 @@ func (r *SchedulerRef) CapacityMarkList() []CapacityMarkInfo {
 		provider, accountID, _ := strings.Cut(key.scoreKey, "\x00")
 		out = append(out, CapacityMarkInfo{
 			Provider: account.Provider(provider), AccountID: accountID,
-			Model: key.model, Tier: key.tier, Failures: mark.failures, Until: mark.until,
+			Model: key.model, Tier: key.tier, Failures: mark.failures, Until: mark.until, Reason: mark.reason,
 		})
 	}
 	return out

@@ -396,7 +396,7 @@ func pickTenantCredentialLeaseAccount(
 	model := tenantCredentialLeasePoolModel(provider, input.Model, baseScheduler)
 	scheduler := baseScheduler.ForModel(model)
 	if server.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(server.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(server.Sessions))
 	}
 	// Forced, sticky, and preferred routing never grant permission to reuse a
 	// cooled credential. Filtering must happen first; if every candidate is

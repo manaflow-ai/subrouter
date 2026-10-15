@@ -1442,6 +1442,7 @@ type remoteServerUsageStatus struct {
 	CreditsExhaustedUntil time.Time                 `json:"credits_exhausted_until,omitzero"`
 	Credit                *proxy.ClaudeCreditStatus `json:"credit,omitempty"`
 	RevokedSince          time.Time                 `json:"revoked_since,omitzero"`
+	RevokedKind           string                    `json:"revoked_kind,omitempty"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
@@ -1659,6 +1660,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			creditsExhaustedUntil: status.CreditsExhaustedUntil,
 			credit:                status.Credit,
 			revokedSince:          status.RevokedSince,
+			revokedKind:           status.RevokedKind,
 			provider:              status.Provider,
 			usageThrottled:        status.UsageThrottled || status.QuotaStatus == "throttled" || serverUsageThrottleError(status.Error),
 			providerHealth:        status.ProviderHealth,
@@ -1737,7 +1739,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			// The server excludes a revoked credential from routing; the
 			// last usage reading it still carries is not capacity.
 			row.cooked = true
-			row.cookedReason = "OAuth credential revoked"
+			row.cookedReason = "OAuth credential " + revokedLabel(row)
 		}
 		rows = append(rows, row)
 	}

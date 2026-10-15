@@ -238,6 +238,99 @@ func TestUsageStatusRefreshChecksProviderAfterCachedThrottle(t *testing.T) {
 		t.Fatalf("snapshot unexpectedly fetched upstream, calls=%d", transport.calls)
 	}
 }
+
+func TestUsageStatusThrottleSurvivesOAuthRefreshAndClearsOnReLogin(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{
+		{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429 Too Many Requests",
+			Header:     http.Header{"Retry-After": []string{"1800"}},
+			Body:       io.NopCloser(strings.NewReader("{}")),
+		},
+		claudeFullUsageResponse(22),
+	}}
+	ref := cacheTestAccountRef(t, transport)
+	handler := Server{AccountRef: ref}.Handler()
+	read := func(path string) AccountUsageStatus {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET %s: %d %s", path, response.Code, response.Body.String())
+		}
+		var statuses []AccountUsageStatus
+		if err := json.Unmarshal(response.Body.Bytes(), &statuses); err != nil {
+			t.Fatal(err)
+		}
+		if len(statuses) != 1 {
+			t.Fatalf("GET %s returned %d statuses", path, len(statuses))
+		}
+		return statuses[0]
+	}
+
+	first := read("/_subrouter/usage-status")
+	if !first.UsageThrottled || transport.calls != 1 {
+		t.Fatalf("initial throttle: status=%+v calls=%d", first, transport.calls)
+	}
+	old := ref.All()[0]
+	refreshed := old
+	refreshed.Token = "tok-after-refresh"
+	refreshed.CredentialVersion = "refresh-chain"
+	ref.replace(refreshed)
+	second := read("/_subrouter/usage-status?refresh=1")
+	if !second.UsageThrottled || transport.calls != 1 {
+		t.Fatalf("OAuth refresh bypassed account throttle: status=%+v calls=%d", second, transport.calls)
+	}
+
+	ref.invalidateReplacedAccountUsage([]accounts.Account{old}, []accounts.Account{refreshed})
+	third := read("/_subrouter/usage-status?refresh=1")
+	if third.UsageThrottled || len(third.Windows) == 0 || transport.calls != 2 {
+		t.Fatalf("re-login did not clear account throttle: status=%+v calls=%d", third, transport.calls)
+	}
+}
+
+func TestUsageThrottleStateIsSharedAcrossWorkerRestart(t *testing.T) {
+	firstTransport := &usageRoundTripper{responses: []*http.Response{{
+		StatusCode: http.StatusTooManyRequests,
+		Status:     "429 Too Many Requests",
+		Header:     http.Header{"Retry-After": []string{"1800"}},
+		Body:       io.NopCloser(strings.NewReader("{}")),
+	}}}
+	first := cacheTestAccountRef(t, firstTransport)
+	firstHandler := Server{AccountRef: first}.Handler()
+	firstResponse := httptest.NewRecorder()
+	firstHandler.ServeHTTP(firstResponse, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status", nil))
+	if firstResponse.Code != http.StatusOK || firstTransport.calls != 1 {
+		t.Fatalf("first worker did not record throttle: code=%d calls=%d", firstResponse.Code, firstTransport.calls)
+	}
+
+	secondTransport := &usageRoundTripper{responses: []*http.Response{claudeFullUsageResponse(33)}}
+	second := &AccountRef{
+		accounts:    first.All(),
+		store:       first.store,
+		claudeStore: first.claudeStore,
+		client:      &http.Client{Transport: secondTransport},
+	}
+	second.restoreUsageThrottleState()
+	secondHandler := Server{AccountRef: second}.Handler()
+	secondResponse := httptest.NewRecorder()
+	secondHandler.ServeHTTP(secondResponse, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status?refresh=1", nil))
+	if secondResponse.Code != http.StatusOK || secondTransport.calls != 0 {
+		t.Fatalf("restarted worker ignored shared throttle: code=%d calls=%d", secondResponse.Code, secondTransport.calls)
+	}
+
+	old := second.All()[0]
+	replacement := old
+	replacement.Token = "relogin-token"
+	replacement.CredentialVersion = "relogin-chain"
+	second.invalidateReplacedAccountUsage([]accounts.Account{old}, []accounts.Account{replacement})
+	thirdResponse := httptest.NewRecorder()
+	secondHandler.ServeHTTP(thirdResponse, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status?refresh=1", nil))
+	if thirdResponse.Code != http.StatusOK || secondTransport.calls != 1 {
+		t.Fatalf("re-login did not clear shared throttle: code=%d calls=%d", thirdResponse.Code, secondTransport.calls)
+	}
+}
+
 func TestUsageStatusSnapshotQueryReusesLastSweep(t *testing.T) {
 	transport := &usageRoundTripper{responses: []*http.Response{usageOKResponse(), usageOKResponse()}}
 	ref := cacheTestAccountRef(t, transport)

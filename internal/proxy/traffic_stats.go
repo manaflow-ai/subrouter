@@ -3,15 +3,29 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/buildversion"
 )
+
+// trafficErrorClass reduces transport errors to a stable report label.
+func trafficErrorClass(err error) string {
+	if errors.Is(err, context.Canceled) {
+		return "context_canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "context_deadline"
+	}
+	return "proxy_error"
+}
 
 // TrafficStats counts client request outcomes for this worker process.
 //
@@ -21,7 +35,8 @@ import (
 // counters are process-local and never reset, so a reader derives rates as
 // count / (now - started_at) and compares one generation with the next.
 //
-// Only counts are kept. No account, token, path, or body is recorded.
+// Aggregate counters are retained for the bake gate; a bounded failure sample
+// adds route and account context without recording tokens, headers, or bodies.
 type TrafficStats struct {
 	startedUnix atomic.Int64
 
@@ -32,6 +47,98 @@ type TrafficStats struct {
 	responseOth atomic.Uint64
 	proxy5xx    atomic.Uint64
 	upstream5xx atomic.Uint64
+	// clientAborts counts proxy-generated 5xx written after the client had
+	// already gone; they are in no response class.
+	clientAborts atomic.Uint64
+	failuresMu   sync.Mutex
+	failures     []TrafficFailure
+
+	clientVersionsMu sync.Mutex
+	// clientVersions counts requests by the sr build that sent them. At most
+	// trafficClientVersionCap real versions are kept; later ones count as
+	// "other", so a misbehaving client cannot grow the map.
+	clientVersions map[string]uint64
+	// clientVersionsDistinct is how many real versions clientVersions holds,
+	// not counting the "unknown" and "other" buckets.
+	clientVersionsDistinct int
+}
+
+// ClientVersionHeader is the sr build version a client sends with every
+// request it forwards to a subrouter server. It only feeds the
+// client_versions histogram in /_subrouter/traffic; it grants nothing, and
+// session.StripSubrouterHeaders removes it before any upstream sees it.
+const ClientVersionHeader = "X-Subrouter-Client-Version"
+
+const (
+	trafficClientVersionCap     = 64
+	trafficClientVersionMaxLen  = 48
+	trafficClientVersionUnknown = "unknown"
+	trafficClientVersionOther   = "other"
+)
+
+// NormalizeClientVersion returns value when it looks like a build version
+// ("v0.1.174", "devel+abc123def456-dirty"), else "". It must start with a
+// letter or digit, be at most 48 bytes, and use only letters, digits, and
+// ".", "-", "+", "_".
+func NormalizeClientVersion(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > trafficClientVersionMaxLen {
+		return ""
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		alnum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if i == 0 && !alnum {
+			return ""
+		}
+		if !alnum && c != '.' && c != '-' && c != '+' && c != '_' {
+			return ""
+		}
+	}
+	switch value {
+	case trafficClientVersionUnknown, trafficClientVersionOther:
+		return ""
+	}
+	return value
+}
+
+// observeClientVersion counts one request under the client's reported
+// version, "unknown" when it sent none or an invalid one, or "other" once
+// the histogram is full.
+func (t *TrafficStats) observeClientVersion(raw string) {
+	label := NormalizeClientVersion(raw)
+	if label == "" {
+		label = trafficClientVersionUnknown
+	}
+	t.clientVersionsMu.Lock()
+	defer t.clientVersionsMu.Unlock()
+	if t.clientVersions == nil {
+		t.clientVersions = make(map[string]uint64)
+	}
+	if label != trafficClientVersionUnknown {
+		if _, seen := t.clientVersions[label]; !seen {
+			if t.clientVersionsDistinct >= trafficClientVersionCap {
+				label = trafficClientVersionOther
+			} else {
+				t.clientVersionsDistinct++
+			}
+		}
+	}
+	t.clientVersions[label]++
+}
+
+// TrafficFailure is a bounded diagnostic sample for a failed client request.
+// It gives the release supervisor enough context to distinguish an upstream
+// failure from a proxy-generated handoff without recording request bodies.
+type TrafficFailure struct {
+	At             string `json:"at"`
+	Status         int    `json:"status"`
+	UpstreamStatus int    `json:"upstream_status,omitempty"`
+	Method         string `json:"method"`
+	Path           string `json:"path"`
+	AccountHash    string `json:"account_hash,omitempty"`
+	RetryPath      string `json:"retry_path,omitempty"`
+	ErrorClass     string `json:"error_class,omitempty"`
 }
 
 // NewTrafficStats returns counters whose rate window starts at now.
@@ -43,14 +150,27 @@ func NewTrafficStats(now time.Time) *TrafficStats {
 
 // TrafficSnapshot is the /_subrouter/traffic payload.
 type TrafficSnapshot struct {
-	StartedAt     string            `json:"started_at,omitempty"`
-	UptimeSeconds int64             `json:"uptime_seconds"`
-	Version       string            `json:"version"`
-	Requests      uint64            `json:"requests"`
-	Responses     TrafficByClass    `json:"responses"`
-	Proxy5xx      uint64            `json:"proxy_5xx"`
-	Upstream5xx   uint64            `json:"upstream_5xx"`
-	Streams       StreamDropSummary `json:"stream_drops"`
+	StartedAt     string         `json:"started_at,omitempty"`
+	UptimeSeconds int64          `json:"uptime_seconds"`
+	Version       string         `json:"version"`
+	Requests      uint64         `json:"requests"`
+	Responses     TrafficByClass `json:"responses"`
+	Proxy5xx      uint64         `json:"proxy_5xx"`
+	Upstream5xx   uint64         `json:"upstream_5xx"`
+	// ClientAborts is requests the client cancelled before subrouter could
+	// answer; the error the proxy then writes reaches nobody and is not a
+	// proxy failure.
+	ClientAborts uint64 `json:"client_aborts"`
+	// ClientVersions counts requests by the sr build that sent them
+	// (X-Subrouter-Client-Version): at most 64 versions, then "other";
+	// "unknown" is a request with no valid version.
+	ClientVersions map[string]uint64 `json:"client_versions,omitempty"`
+	Streams        StreamDropSummary `json:"stream_drops"`
+	Failures       []TrafficFailure  `json:"failures,omitempty"`
+	Admission      admissionSnapshot `json:"admission,omitempty"`
+	// CodexCapacity is the live Codex capacity marks (accounts hashed) and
+	// what the capacity retry has done in this process.
+	CodexCapacity *codexCapacityTraffic `json:"codex_capacity,omitempty"`
 }
 
 // TrafficByClass groups completed responses by status class.
@@ -67,7 +187,7 @@ type StreamDropSummary struct {
 	Total uint64 `json:"total"`
 }
 
-// Snapshot reads the counters. drops may be nil.
+// Snapshot reads the counters and copies the bounded failure samples. drops may be nil.
 func (t *TrafficStats) Snapshot(drops *StreamDropStats, now time.Time) TrafficSnapshot {
 	snapshot := TrafficSnapshot{Version: buildversion.Version()}
 	streams := drops.Snapshot()
@@ -90,6 +210,18 @@ func (t *TrafficStats) Snapshot(drops *StreamDropStats, now time.Time) TrafficSn
 	}
 	snapshot.Proxy5xx = t.proxy5xx.Load()
 	snapshot.Upstream5xx = t.upstream5xx.Load()
+	snapshot.ClientAborts = t.clientAborts.Load()
+	t.failuresMu.Lock()
+	snapshot.Failures = append([]TrafficFailure(nil), t.failures...)
+	t.failuresMu.Unlock()
+	t.clientVersionsMu.Lock()
+	if len(t.clientVersions) > 0 {
+		snapshot.ClientVersions = make(map[string]uint64, len(t.clientVersions))
+		for version, count := range t.clientVersions {
+			snapshot.ClientVersions[version] = count
+		}
+	}
+	t.clientVersionsMu.Unlock()
 	return snapshot
 }
 
@@ -122,6 +254,71 @@ type trafficRecord struct {
 	// websocketUpgraded records a completed handshake written directly to the
 	// hijacked connection, bypassing ResponseWriter.WriteHeader.
 	websocketUpgraded atomic.Bool
+	mu                sync.Mutex
+	upstreamStatus    int
+	method            string
+	path              string
+	account           string
+	retryPath         string
+	errorClass        string
+}
+
+// markTrafficAccount records the selected credential fingerprint for a request.
+func markTrafficAccount(ctx context.Context, account string) {
+	if record, ok := ctx.Value(trafficRecordKey{}).(*trafficRecord); ok {
+		record.mu.Lock()
+		digest := sha256.Sum256([]byte(account))
+		record.account = "sha256:" + hex.EncodeToString(digest[:8])
+		record.mu.Unlock()
+	}
+}
+
+// markTrafficRetryPath records the retry or handoff path used by a request.
+func markTrafficRetryPath(ctx context.Context, path string) {
+	if record, ok := ctx.Value(trafficRecordKey{}).(*trafficRecord); ok {
+		record.mu.Lock()
+		record.retryPath = path
+		record.mu.Unlock()
+	}
+}
+
+// markTrafficUpstreamStatus records the status passed through from upstream.
+func markTrafficUpstreamStatus(ctx context.Context, status int) {
+	if record, ok := ctx.Value(trafficRecordKey{}).(*trafficRecord); ok {
+		record.mu.Lock()
+		record.upstreamStatus = status
+		record.mu.Unlock()
+	}
+}
+
+// markTrafficErrorClass records the coarse class of a proxy-generated error.
+func markTrafficErrorClass(ctx context.Context, class string) {
+	if record, ok := ctx.Value(trafficRecordKey{}).(*trafficRecord); ok {
+		record.mu.Lock()
+		record.errorClass = class
+		record.mu.Unlock()
+	}
+}
+
+// recordFailure appends one bounded diagnostic sample for a failed request.
+func (t *TrafficStats) recordFailure(record *trafficRecord, status int, now time.Time) {
+	if t == nil || record == nil {
+		return
+	}
+	record.mu.Lock()
+	failure := TrafficFailure{
+		At: now.UTC().Format(time.RFC3339), Status: status, UpstreamStatus: record.upstreamStatus,
+		Method: record.method, Path: record.path, AccountHash: record.account,
+		RetryPath: record.retryPath, ErrorClass: record.errorClass,
+	}
+	record.mu.Unlock()
+	t.failuresMu.Lock()
+	if len(t.failures) >= 32 {
+		copy(t.failures, t.failures[len(t.failures)-31:])
+		t.failures = t.failures[:31]
+	}
+	t.failures = append(t.failures, failure)
+	t.failuresMu.Unlock()
 }
 
 // markUpstreamResponse records that the response about to be written carries
@@ -155,8 +352,9 @@ func (t *TrafficStats) trafficCounted(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		record := &trafficRecord{}
+		record := &trafficRecord{method: r.Method, path: r.URL.Path, retryPath: "none"}
 		t.requests.Add(1)
+		t.observeClientVersion(r.Header.Get(ClientVersionHeader))
 		writer := &trafficResponseWriter{ResponseWriter: w}
 		defer func() {
 			recovered := recover()
@@ -171,7 +369,16 @@ func (t *TrafficStats) trafficCounted(next http.Handler) http.Handler {
 					status = http.StatusOK
 				}
 			}
-			t.observe(status, writer.upstream)
+			switch {
+			case status >= 500 && !writer.upstream && errors.Is(r.Context().Err(), context.Canceled):
+				// The client hung up first; the proxy's error went nowhere.
+				t.clientAborts.Add(1)
+			default:
+				t.observe(status, writer.upstream)
+				if status >= 500 {
+					t.recordFailure(record, status, time.Now())
+				}
+			}
 			if recovered != nil {
 				panic(recovered)
 			}
@@ -238,5 +445,10 @@ func (w *trafficResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 // handleTraffic reports request outcome counts for this worker process. Like
 // /_subrouter/stream-stats it is unauthenticated and carries counts only.
 func (s Server) handleTraffic(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, s.Traffic.Snapshot(s.StreamDrops, time.Now()))
+	snapshot := s.Traffic.Snapshot(s.StreamDrops, time.Now())
+	if s.admission != nil {
+		snapshot.Admission = s.admission.snapshot()
+	}
+	snapshot.CodexCapacity = s.codexCapacityTrafficSnapshot()
+	writeJSON(w, snapshot)
 }

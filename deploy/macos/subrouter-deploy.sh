@@ -67,6 +67,10 @@ log() { printf 'subrouter-deploy: %s\n' "$*" >&2; }
 canary_log() { log "canary: $2"; }
 die() { log "$*"; exit 1; }
 
+if [ "$BAKE_GATE" -eq 1 ]; then
+  bake_prepare_release_state || log "could not prepare $RELEASE_STATE_FILE for the service user"
+fi
+
 usage() {
   cat <<'EOF'
 Usage:

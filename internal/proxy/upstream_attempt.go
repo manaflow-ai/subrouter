@@ -48,6 +48,37 @@ type upstreamAttempt struct {
 	addressed            accounts.Account
 	capacityRetryStarted time.Time
 	capacityPolicy       *codexCapacityRetryPolicy
+	// reserved is an admission slot a spill already holds on the account it
+	// moved the request to. The next physical attempt on that account uses
+	// it instead of acquiring (and possibly queueing for) another.
+	reserved *admissionLease
+}
+
+// reserve hands lease to the next physical attempt on its account,
+// releasing any earlier reservation that was never used.
+func (a *upstreamAttempt) reserve(lease *admissionLease) {
+	a.mu.Lock()
+	previous := a.reserved
+	a.reserved = lease
+	a.mu.Unlock()
+	previous.release()
+}
+
+// takeReserved returns the reserved slot for accountID, if any.
+func (a *upstreamAttempt) takeReserved(accountID string) *admissionLease {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	lease := a.reserved
+	if lease == nil || lease.key.account != accountID {
+		return nil
+	}
+	a.reserved = nil
+	return lease
+}
+
+// releaseReserved returns a reservation no attempt used.
+func (a *upstreamAttempt) releaseReserved() {
+	a.reserve(nil)
 }
 
 // standaloneUpstreamAttempt is the private state a layer uses when it was
@@ -121,21 +152,75 @@ func (t inflightAttemptTransport) RoundTrip(req *http.Request) (*http.Response, 
 	}
 	// Broker mode is skipped on every path (WebSocket, non-replayable and
 	// replayable alike) so load accounting agrees across them.
-	if t.attempt == nil || t.attempt.server == nil || t.attempt.server.SchedulerRef == nil || t.attempt.server.CredentialBroker != nil {
+	if t.attempt == nil || t.attempt.server == nil {
 		return base.RoundTrip(req)
 	}
 	account := t.attempt.current()
-	release := t.attempt.server.SchedulerRef.BeginInflight(schedulerAccountProvider(account.Provider), account.ID)
+	if t.attempt.server.ErrorEvents != nil {
+		// Every physical attempt passes here once, so each failed attempt of
+		// a retried request is recorded against the account that answered.
+		base = errorRecordingTransport{base: base, attempt: t.attempt, account: account}
+	}
+	if t.attempt.server.CredentialBroker != nil ||
+		(t.attempt.server.SchedulerRef == nil && t.attempt.server.admission == nil) {
+		return base.RoundTrip(req)
+	}
+	admission := t.attempt.takeReserved(account.ID)
+	if admission == nil && t.attempt.server.admission != nil {
+		key := admissionKeyFor(schedulerAccountProvider(account.Provider), account.ID, t.attempt.poolModel)
+		var err error
+		admission, err = t.attempt.server.admission.acquireFor(req.Context(), key, admissionSessionKey{agent: t.attempt.agent, session: t.attempt.session})
+		if err != nil {
+			// A limiter rejection never reaches the upstream, so the error
+			// recorder below never sees it; record it here.
+			t.attempt.server.recordUpstreamFailure(req, t.attempt, account, nil, err)
+			return nil, err
+		}
+	}
+	release := func() {}
+	if t.attempt.server.SchedulerRef != nil {
+		release = t.attempt.server.SchedulerRef.BeginInflight(schedulerAccountProvider(account.Provider), account.ID)
+	}
 	response, err := base.RoundTrip(req)
 	if err != nil || response == nil {
 		release()
+		if admission != nil {
+			admission.release()
+		}
 		return response, err
+	}
+	if admission != nil {
+		t.attempt.server.admission.observe(
+			admission.key, response.StatusCode, response.Header, time.Now(),
+		)
 	}
 	if response.Body == nil || response.Body == http.NoBody {
 		release()
+		if admission != nil {
+			admission.release()
+		}
 		return response, err
 	}
-	response.Body = &inflightResponseBody{ReadCloser: response.Body, release: release}
+	response.Body = &inflightResponseBody{ReadCloser: response.Body, release: func() {
+		release()
+		if admission != nil {
+			admission.release()
+		}
+	}}
+	return response, err
+}
+
+// errorRecordingTransport records a failed physical attempt in the server's
+// error event log before the retry layers above react to it.
+type errorRecordingTransport struct {
+	base    http.RoundTripper
+	attempt *upstreamAttempt
+	account accounts.Account
+}
+
+func (t errorRecordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	response, err := t.base.RoundTrip(req)
+	t.attempt.server.recordUpstreamFailure(req, t.attempt, t.account, response, err)
 	return response, err
 }
 

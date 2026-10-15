@@ -438,3 +438,187 @@ func TestCodexModelCatalogBoundLeaseRequiresOAuth(t *testing.T) {
 		})
 	}
 }
+
+func TestCodexModelCatalogHonorsOAuthAccountPin(t *testing.T) {
+	codexUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch request.Header.Get("Authorization") {
+		case "Bearer promax-token":
+			_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-6-astra","tier":"ultrafast"}]}`)
+		default:
+			_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-6-astra","tier":"priority"}]}`)
+		}
+	}))
+	defer codexUpstream.Close()
+	upstream, err := url.Parse(codexUpstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// New-session placement is randomly spread, so seed the shared catalog
+	// session; a pin that leaked into it would move this assignment.
+	if _, err := store.Put("codex", codexModelCatalogSessionID, "pro@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		CodexUpstream: upstream,
+		Accounts: []accounts.Account{
+			{ID: "pro@example.com", AuthMode: accounts.AuthModeOAuth, Token: "pro-token", AccountID: "pro-account"},
+			{ID: "promax@example.com", AuthMode: accounts.AuthModeOAuth, Token: "promax-token", AccountID: "promax-account"},
+		},
+		Sessions: store,
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "pro@example.com", Headroom: 0.99, ShortHeadroom: 0.99},
+			{AccountID: "promax@example.com", Headroom: 0.1, ShortHeadroom: 0.1},
+		}),
+		MaxBodyBytes: 1024,
+	}.Handler()
+
+	fetch := func(pin string) string {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.162.1", nil)
+		request.Header.Set("X-Subrouter-Agent", "codex")
+		if pin != "" {
+			request.Header.Set("X-Subrouter-Account-ID", pin)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("pin %q: status = %d, body = %s", pin, response.Code, response.Body.String())
+		}
+		return response.Body.String()
+	}
+
+	if got := fetch("promax@example.com"); got != `{"models":[{"slug":"gpt-6-astra","tier":"ultrafast"}]}` {
+		t.Fatalf("pinned catalog = %s, want the pinned account's catalog", got)
+	}
+	if got := fetch(""); got != `{"models":[{"slug":"gpt-6-astra","tier":"priority"}]}` {
+		t.Fatalf("unpinned catalog = %s, want the shared catalog session unaffected by the pin", got)
+	}
+	if assignment, ok := store.Get("codex", codexPinnedModelCatalogSessionID("promax@example.com")); !ok || assignment.AccountID != "promax@example.com" {
+		t.Fatalf("pinned catalog assignment = %#v, %t; want promax@example.com", assignment, ok)
+	}
+	if assignment, ok := store.Get("codex", codexModelCatalogSessionID); !ok || assignment.AccountID != "pro@example.com" {
+		t.Fatalf("shared catalog assignment = %#v, %t; want pro@example.com", assignment, ok)
+	}
+}
+
+func TestCodexModelCatalogUsesCallersOwnPoolAccount(t *testing.T) {
+	codexUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if request.Header.Get("Authorization") == "Bearer promax-token" {
+			_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-6-astra","tier":"ultrafast"}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-6-astra","tier":"priority"}]}`)
+	}))
+	defer codexUpstream.Close()
+	upstream, err := url.Parse(codexUpstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", codexModelCatalogSessionID, "pro@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		CodexUpstream: upstream,
+		Accounts: []accounts.Account{
+			{ID: "pro@example.com", AuthMode: accounts.AuthModeOAuth, Token: "pro-token", AccountID: "team-workspace"},
+			{ID: "pro2@example.com", AuthMode: accounts.AuthModeOAuth, Token: "pro2-token", AccountID: "team-workspace"},
+			{ID: "promax@example.com", AuthMode: accounts.AuthModeOAuth, Token: "promax-token", AccountID: "promax-account"},
+		},
+		Sessions: store,
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "pro@example.com", Headroom: 0.99, ShortHeadroom: 0.99},
+			{AccountID: "pro2@example.com", Headroom: 0.99, ShortHeadroom: 0.99},
+			{AccountID: "promax@example.com", Headroom: 0.5, ShortHeadroom: 0.5},
+		}),
+		MaxBodyBytes: 1024,
+	}.Handler()
+
+	fetch := func(callerAccountID string) string {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.162.1", nil)
+		request.Header.Set("X-Subrouter-Agent", "codex")
+		request.Header.Set("ChatGPT-Account-ID", callerAccountID)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("caller %q: status = %d, body = %s", callerAccountID, response.Code, response.Body.String())
+		}
+		return response.Body.String()
+	}
+
+	if got := fetch("promax-account"); got != `{"models":[{"slug":"gpt-6-astra","tier":"ultrafast"}]}` {
+		t.Fatalf("caller's own account catalog = %s, want the promax catalog", got)
+	}
+	if got := fetch("team-workspace"); got != `{"models":[{"slug":"gpt-6-astra","tier":"priority"}]}` {
+		t.Fatalf("shared workspace catalog = %s, want the shared catalog session", got)
+	}
+	if assignment, ok := store.Get("codex", codexModelCatalogSessionID); !ok || assignment.AccountID != "pro@example.com" {
+		t.Fatalf("shared catalog assignment = %#v, %t; want pro@example.com", assignment, ok)
+	}
+}
+
+func TestCodexModelCatalogCallerAccountPrefersOwnerRecordAndFallsBack(t *testing.T) {
+	codexUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"models":[{"slug":"`+request.Header.Get("Authorization")+`"}]}`)
+	}))
+	defer codexUpstream.Close()
+	upstream, err := url.Parse(codexUpstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newHandler := func(t *testing.T, ownerHeadroom float64) http.Handler {
+		t.Helper()
+		store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Put("codex", codexModelCatalogSessionID, "pro@example.com", ""); err != nil {
+			t.Fatal(err)
+		}
+		return Server{
+			CodexUpstream: upstream,
+			Accounts: []accounts.Account{
+				{ID: "pro@example.com", AuthMode: accounts.AuthModeOAuth, Token: "pro-token", AccountID: "pro-account"},
+				{ID: "me@example.com", AuthMode: accounts.AuthModeOAuth, Token: "legacy-token", AccountID: "my-account"},
+				{ID: "codex-owner-abc", AuthMode: accounts.AuthModeOAuth, Token: "owner-token", AccountID: "my-account"},
+			},
+			Sessions: store,
+			Scheduler: selectacct.NewScheduler([]selectacct.Score{
+				{AccountID: "pro@example.com", Headroom: 0.99, ShortHeadroom: 0.99},
+				{AccountID: "me@example.com", Headroom: 0, ShortHeadroom: 0},
+				{AccountID: "codex-owner-abc", Headroom: ownerHeadroom, ShortHeadroom: ownerHeadroom},
+			}),
+			MaxBodyBytes: 1024,
+		}.Handler()
+	}
+	fetch := func(t *testing.T, handler http.Handler) string {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.162.1", nil)
+		request.Header.Set("X-Subrouter-Agent", "codex")
+		request.Header.Set("ChatGPT-Account-ID", "my-account")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+		}
+		return response.Body.String()
+	}
+
+	if got := fetch(t, newHandler(t, 0.5)); got != `{"models":[{"slug":"Bearer owner-token"}]}` {
+		t.Fatalf("catalog = %s, want the owner-keyed record", got)
+	}
+	if got := fetch(t, newHandler(t, 0)); got == `{"models":[{"slug":"Bearer owner-token"}]}` {
+		t.Fatalf("catalog = %s, want a pool fallback while the caller's account is exhausted", got)
+	}
+}

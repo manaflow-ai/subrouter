@@ -40,6 +40,12 @@ type updateFixture struct {
 	running    string
 	restarts   int
 	upgrades   []string
+	// active is what the fake daemon's drain-status reports in flight.
+	active int
+	// busyAfterProbes, when set, makes every drain-status probe after that
+	// many report a request in flight.
+	busyAfterProbes int
+	probes          int
 }
 
 type fakeUpdateController struct{ f *updateFixture }
@@ -68,6 +74,7 @@ func (f *updateFixture) restartFromDisk() {
 	f.healthy = !f.broken[version]
 }
 
+// newUpdateFixture builds an isolated release server and binary install.
 func newUpdateFixture(t *testing.T, installed string) *updateFixture {
 	t.Helper()
 	root := t.TempDir()
@@ -136,6 +143,16 @@ func newUpdateFixture(t *testing.T, installed string) *updateFixture {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "version": running})
 	})
+	mux.HandleFunc("/_subrouter/drain-status", func(w http.ResponseWriter, _ *http.Request) {
+		f.mu.Lock()
+		f.probes++
+		active := f.active
+		if f.busyAfterProbes > 0 && f.probes > f.busyAfterProbes {
+			active = 1
+		}
+		f.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "active_proxy_requests": active})
+	})
 	f.server = httptest.NewServer(mux)
 	t.Cleanup(f.server.Close)
 
@@ -159,6 +176,7 @@ func newUpdateFixture(t *testing.T, installed string) *updateFixture {
 		linuxTeamUnits: []string{filepath.Join(root, "etc", "subrouter-autoupdate.timer")},
 		systemUnitPath: filepath.Join(root, "etc", "subrouter.service"),
 		controllerFor:  func(installKind) serviceController { return f.controller },
+		launchdProbe:   func(string) (launchAgentState, error) { return launchAgentLoaded, nil },
 		runBinary:      runBinaryOutput,
 		upgradeWorker: func(_ context.Context, socket string) error {
 			f.mu.Lock()
@@ -167,10 +185,14 @@ func newUpdateFixture(t *testing.T, installed string) *updateFixture {
 			f.restartFromDisk()
 			return nil
 		},
-		now:         time.Now,
-		out:         f.out,
-		in:          strings.NewReader(""),
-		programName: "sr",
+		now:           time.Now,
+		out:           f.out,
+		in:            strings.NewReader(""),
+		programName:   "sr",
+		autoStampPath: filepath.Join(home, ".subrouter", "auto-update.json"),
+		autoLogPath:   filepath.Join(home, ".subrouter", "logs", "auto-update.log"),
+		idleSamples:   2,
+		idleInterval:  time.Millisecond,
 	}
 	return f
 }
@@ -316,6 +338,7 @@ func TestUpdatePlainBinaryWithoutService(t *testing.T) {
 	}
 }
 
+// TestUpdateSupervisedLaunchAgentUsesControlSocket verifies worker handoff via the supervisor socket.
 func TestUpdateSupervisedLaunchAgentUsesControlSocket(t *testing.T) {
 	f := newUpdateFixture(t, "v1.0.0")
 	f.u.goos = "darwin"
@@ -343,6 +366,38 @@ func TestUpdateSupervisedLaunchAgentUsesControlSocket(t *testing.T) {
 	}
 	if got := f.installedVersion(); got != "v1.1.0" {
 		t.Fatalf("worker version = %q", got)
+	}
+}
+
+// TestUpdateSkipsInactiveLaunchAgentService verifies binary-only updates for inactive agents.
+func TestUpdateSkipsInactiveLaunchAgentService(t *testing.T) {
+	for _, state := range []launchAgentState{launchAgentDisabledState, launchAgentNotLoaded} {
+		t.Run(fmt.Sprint(state), func(t *testing.T) {
+			f := newUpdateFixture(t, "v1.0.0")
+			f.u.goos = "darwin"
+			f.u.goarch = "arm64"
+			f.u.launchdProbe = func(string) (launchAgentState, error) { return state, nil }
+			plist := launchAgentPath(f.u.home, defaultDaemonLabel)
+			if err := os.MkdirAll(filepath.Dir(plist), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			body := `<?xml version="1.0"?><plist version="1.0"><dict>
+<key>Label</key><string>ai.manaflow.subrouter</string>
+<key>ProgramArguments</key><array><string>` + f.binary + `</string><string>serve</string></array>
+</dict></plist>`
+			if err := os.WriteFile(plist, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.u.runUpdateArgs(context.Background(), []string{"--yes"}); err != nil {
+				t.Fatalf("update: %v\n%s", err, f.out)
+			}
+			if got := f.installedVersion(); got != "v1.1.0" {
+				t.Fatalf("installed version = %q, want v1.1.0", got)
+			}
+			if f.restarts != 0 {
+				t.Fatalf("inactive LaunchAgent was restarted %d times", f.restarts)
+			}
+		})
 	}
 }
 
@@ -551,6 +606,7 @@ func TestPlistProgramArgumentsIgnoresNestedArrays(t *testing.T) {
 	}
 }
 
+// TestCompareReleaseVersions verifies semver and pseudo-version ordering.
 func TestCompareReleaseVersions(t *testing.T) {
 	const pseudo = "v0.1.134-0.20260927095747-b5bd50354af3"
 	for _, tc := range []struct {
@@ -585,6 +641,13 @@ func TestCompareReleaseVersions(t *testing.T) {
 				t.Errorf("compareReleaseVersions(%q, %q) = %d, not the inverse", tc.right, tc.left, back)
 			}
 		}
+	}
+}
+
+// TestSameVersionIgnoresBuildMetadata verifies semver build metadata is non-ordering.
+func TestSameVersionIgnoresBuildMetadata(t *testing.T) {
+	if !sameVersion("v0.1.146+main.f8124b9f", "v0.1.146") {
+		t.Fatal("sameVersion treated a main build of the same release as newer")
 	}
 }
 

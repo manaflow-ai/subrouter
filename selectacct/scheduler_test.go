@@ -347,15 +347,22 @@ func TestFablePickPrefersSoonerWeeklyReset(t *testing.T) {
 	})
 	later.Provider = account.ProviderClaude
 	scheduler := NewScheduler([]Score{later, soon}).ForModel(fable)
-	picked, err := scheduler.Pick([]account.Account{
+	candidates := []account.Account{
 		{ID: "later@example.com", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"},
 		{ID: "soon@example.com", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"},
-	})
+	}
+	// PickBest: the sooner weekly reset must lead the order. Pick spreads
+	// new sessions across both, so it must lean toward the same account.
+	picked, err := scheduler.PickBest(candidates)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if picked.ID != "soon@example.com" {
 		t.Fatalf("picked %q, want sooner-resetting fable account", picked.ID)
+	}
+	counts := pickCounts(t, scheduler, candidates, 2000)
+	if counts["soon@example.com"] <= counts["later@example.com"] {
+		t.Fatalf("spread placements %v, want most new sessions on the sooner-resetting fable account", counts)
 	}
 }
 
@@ -443,6 +450,17 @@ func TestWeeklyHeadroomTracksOnlyLongWindows(t *testing.T) {
 	}
 	if NewScheduler(nil).ScoreFor(account.ProviderClaude, "ghost").WeeklyCooked() {
 		t.Fatal("default score for an unknown account must not read as weekly-cooked")
+	}
+}
+
+func TestScoreFromLimitWindowsClearsExpiredAbsoluteReset(t *testing.T) {
+	weekly := int64(7 * 24 * 60 * 60)
+	score := ScoreFromLimitWindows("acct", 0, []LimitWindow{{
+		Name: "7d", UsedPercent: 100, LimitWindowSeconds: weekly,
+		ResetAt: time.Now().Add(-time.Minute),
+	}})
+	if score.exhausted() || score.WeeklyCooked() {
+		t.Fatalf("expired weekly window stayed cooked: %+v", score)
 	}
 }
 

@@ -30,12 +30,6 @@ LEGS = (
     "existing-session-next-turn",
 )
 SOURCE_OID = "a" * 40
-# Tests that snapshot the per-user lease directory the runner shares across
-# all runs. Harnesses that run cases concurrently (cmd/subrouter's Go test)
-# must run these alone, because any other runner adds lease files there.
-SHARED_LEASE_DIRECTORY_TESTS = frozenset({
-    "test_transaction_worker_path_and_hash_are_required_before_leases",
-})
 _active_runner: subprocess.Popen[str] | None = None
 
 
@@ -635,54 +629,71 @@ class FunctionalCanaryTest(unittest.TestCase):
         self.assertNotEqual(self.run_runner(manifest, "--validate-only").returncode, 0)
 
     def test_transaction_worker_path_and_hash_are_required_before_leases(self) -> None:
+        # Drive main() in process with the lease step replaced, rather than
+        # diffing the runner's real per-user lease directory: that directory
+        # is shared by every runner on the machine, so any concurrent run
+        # (another test case, another -count iteration, another checkout)
+        # adds files to it and made a snapshot comparison flaky.
         manifest = self.manifest()
         evidence = self.root / "evidence.json"
-        lease_directory = Path("/tmp") / f"subrouter-functional-canary-leases-{os.getuid()}"
-        leases_before = set(lease_directory.glob("*.lock")) if lease_directory.exists() else set()
-        base = dict(os.environ)
+        spec = importlib.util.spec_from_file_location("functional_canary_runner_lease_order", RUNNER)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        worker_hash = hashlib.sha256(self.success.read_bytes()).hexdigest()
+        lease_reached = "lease acquisition reached"
         cases = (
-            (
-                "missing",
-                base,
-                "migration transaction worker binding is required",
-            ),
+            ("missing", {}, "migration transaction worker binding is required"),
             (
                 "path",
-                dict(
-                    base,
-                    SUBROUTER_CANARY_TRANSACTION_WORKER_PATH=str(self.config),
-                    SUBROUTER_CANARY_TRANSACTION_WORKER_SHA256=hashlib.sha256(
-                        self.success.read_bytes()
-                    ).hexdigest(),
-                ),
+                {
+                    "SUBROUTER_CANARY_TRANSACTION_WORKER_PATH": str(self.config),
+                    "SUBROUTER_CANARY_TRANSACTION_WORKER_SHA256": worker_hash,
+                },
                 "candidate worker path does not match migration transaction",
             ),
             (
                 "hash",
-                dict(
-                    base,
-                    SUBROUTER_CANARY_TRANSACTION_WORKER_PATH=str(self.success),
-                    SUBROUTER_CANARY_TRANSACTION_WORKER_SHA256="f" * 64,
-                ),
+                {
+                    "SUBROUTER_CANARY_TRANSACTION_WORKER_PATH": str(self.success),
+                    "SUBROUTER_CANARY_TRANSACTION_WORKER_SHA256": "f" * 64,
+                },
                 "candidate worker sha256 does not match migration transaction",
+            ),
+            # Positive control: a correct binding does reach the lease step,
+            # so the three rejections above are not passing vacuously.
+            (
+                "bound",
+                {
+                    "SUBROUTER_CANARY_TRANSACTION_WORKER_PATH": str(self.success),
+                    "SUBROUTER_CANARY_TRANSACTION_WORKER_SHA256": worker_hash,
+                },
+                lease_reached,
             ),
         )
         for name, environment, message in cases:
             with self.subTest(name=name):
-                completed = subprocess.run(
-                    [sys.executable, str(RUNNER), "--manifest", str(manifest)],
-                    text=True,
-                    capture_output=True,
-                    cwd=self.root,
-                    env=environment,
-                    timeout=10,
-                    check=False,
-                )
-                self.assertNotEqual(completed.returncode, 0)
-                self.assertIn(message, completed.stderr)
+                with (
+                    mock.patch.dict(os.environ, environment, clear=True),
+                    mock.patch.object(
+                        sys, "argv", [str(RUNNER), "--manifest", str(manifest)]
+                    ),
+                    mock.patch.object(
+                        module,
+                        "_acquire_run_leases",
+                        side_effect=module.CanaryError(lease_reached),
+                    ) as acquire,
+                    mock.patch.object(
+                        module, "_private_lease_directory", side_effect=AssertionError
+                    ) as lease_directory,
+                ):
+                    with self.assertRaisesRegex(module.CanaryError, message):
+                        module.main()
+                self.assertEqual(acquire.call_count, 1 if name == "bound" else 0)
+                lease_directory.assert_not_called()
                 self.assertFalse(evidence.exists())
-                leases_after = set(lease_directory.glob("*.lock")) if lease_directory.exists() else set()
-                self.assertEqual(leases_after, leases_before)
 
     def test_transaction_worker_replacement_is_rejected_before_leases(self) -> None:
         manifest_path = self.manifest()

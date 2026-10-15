@@ -202,9 +202,9 @@ func TestSupersededUsage429CannotThrottleRepairedCredential(t *testing.T) {
 	}
 }
 
-func TestUsageThrottleSameAccessTokenWithRepairedGrant(t *testing.T) {
-	// A failed quota check belongs to the complete OAuth grant. Repairing
-	// only the refresh grant must allow one fresh check immediately.
+func TestUsageThrottleSameAccessTokenAfterReLogin(t *testing.T) {
+	// A full reload marks the new refresh grant as a true re-login, so it must
+	// clear the prior account throttle before its first usage check.
 	transport := &countingTransport{}
 	transport.responses = func() *http.Response {
 		if transport.calls == 1 {
@@ -219,6 +219,7 @@ func TestUsageThrottleSameAccessTokenWithRepairedGrant(t *testing.T) {
 		t.Fatal("first credential should receive the upstream throttle")
 	}
 	repaired := usageCredentialForTest("same-access-token", "repaired-grant")
+	ref.invalidateReplacedAccountUsage([]accounts.Account{old}, []accounts.Account{repaired})
 	windows, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, repaired)
 	if err != nil || !fresh || len(windows) != 1 || windows[0].UsedPercent != 30 {
 		t.Fatalf("new grant inherited old throttle: windows=%+v fresh=%t err=%v", windows, fresh, err)

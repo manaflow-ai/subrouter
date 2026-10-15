@@ -12,6 +12,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 )
 
 // Claude API-credit and revocation state.
@@ -86,6 +88,22 @@ type claudeCreditKeyState struct {
 type claudeRevokedState struct {
 	CredentialFingerprint string    `json:"credential_fingerprint"`
 	FirstSeen             time.Time `json:"first_seen"`
+	// The evidence of the death. Entries written before these fields existed
+	// carry none; their kind is "revoked".
+	Kind         string `json:"kind,omitempty"`
+	Status       int    `json:"status,omitempty"`
+	ErrorType    string `json:"error_type,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	RequestID    string `json:"request_id,omitempty"`
+	Source       string `json:"source,omitempty"`
+}
+
+// kind is the death kind, defaulting entries recorded before kinds existed.
+func (s claudeRevokedState) kind() string {
+	if s.Kind == "" {
+		return agentclaude.CredentialDeathRevoked
+	}
+	return s.Kind
 }
 
 type claudeCostStateFile struct {
@@ -393,18 +411,49 @@ func claudeCredentialFingerprint(identity string) string {
 
 // markRevoked records a revoked credential the first time it is seen.
 func (s *claudeCostStore) markRevoked(accountID, credentialIdentity string) time.Time {
+	state, _ := s.markDead(accountID, credentialIdentity, claudeRevokedState{Kind: agentclaude.CredentialDeathRevoked})
+	return state.FirstSeen
+}
+
+// markDead records a dead credential with its evidence. It reports the
+// stored state and whether this call is the alive-to-dead transition. A
+// later answer for the same dead credential keeps the first evidence, except
+// that an entry recorded without evidence gains it.
+func (s *claudeCostStore) markDead(accountID, credentialIdentity string, evidence claudeRevokedState) (claudeRevokedState, bool) {
 	fingerprint := claudeCredentialFingerprint(credentialIdentity)
-	var first time.Time
+	var stored claudeRevokedState
+	transition := false
 	_ = s.mutate(func(file *claudeCostStateFile, now time.Time) {
 		existing, ok := file.Revoked[accountID]
 		if ok && existing.CredentialFingerprint == fingerprint {
-			first = existing.FirstSeen
+			if existing.Kind == "" && evidence.Kind != "" {
+				first := existing.FirstSeen
+				existing = evidence
+				existing.CredentialFingerprint, existing.FirstSeen = fingerprint, first
+				file.Revoked[accountID] = existing
+			}
+			stored = existing
 			return
 		}
-		first = now.UTC()
-		file.Revoked[accountID] = claudeRevokedState{CredentialFingerprint: fingerprint, FirstSeen: first}
+		stored = evidence
+		stored.CredentialFingerprint, stored.FirstSeen = fingerprint, now.UTC()
+		file.Revoked[accountID] = stored
+		transition = true
 	})
-	return first
+	return stored, transition
+}
+
+// clearDead removes accountID's dead record, returning it when one existed.
+func (s *claudeCostStore) clearDead(accountID string) (claudeRevokedState, bool) {
+	var prior claudeRevokedState
+	found := false
+	_ = s.mutate(func(file *claudeCostStateFile, _ time.Time) {
+		prior, found = file.Revoked[accountID]
+		if found {
+			delete(file.Revoked, accountID)
+		}
+	})
+	return prior, found
 }
 
 // revokedSince reports whether accountID's current credential is the one

@@ -33,6 +33,50 @@ BAKE_5XX_MARGIN="${SUBROUTER_BAKE_5XX_MARGIN:-0.05}"
 # roll it back.
 BAKE_MAX_RESTARTS="${SUBROUTER_BAKE_MAX_RESTARTS:-2}"
 
+# The supervisor and worker run as the LaunchDaemon's service user, while the
+# deploy and guard jobs run as root. Canary transitions write this file with an
+# atomic same-directory rename, so the service user needs to create and remove
+# its temporary file in the state directory as well as read the final file.
+# The directory is dedicated to deploy bookkeeping; the service group needs
+# directory write access because an atomic rename replaces the old state file.
+bake_prepare_release_state() {
+  [ "$(id -u 2>/dev/null || echo 1)" -eq 0 ] || return 0
+  [ -f "${PLIST:-}" ] || return 0
+
+  local state_dir
+  state_dir="$(dirname "$RELEASE_STATE_FILE")"
+  RELEASE_STATE_FILE="$RELEASE_STATE_FILE" PLIST="$PLIST" STATE_DIR="$state_dir" python3 - <<'PY'
+import os, plistlib, pwd, stat
+
+path = os.environ["RELEASE_STATE_FILE"]
+state_dir = os.environ["STATE_DIR"]
+with open(os.environ["PLIST"], "rb") as stream:
+    service_user = plistlib.load(stream).get("UserName") or ""
+if not service_user or service_user == "root":
+    raise SystemExit(0)
+try:
+    service_gid = pwd.getpwnam(service_user).pw_gid
+except KeyError:
+    raise SystemExit(f"unknown LaunchDaemon service user {service_user!r}")
+
+if os.path.lexists(state_dir):
+    if stat.S_ISLNK(os.lstat(state_dir).st_mode):
+        raise SystemExit(f"refusing symlink in release state path: {state_dir}")
+else:
+    os.makedirs(state_dir)
+for target, mode in ((state_dir, 0o770), (path, 0o660)):
+    if not os.path.lexists(target):
+        if target == path:
+            continue
+    info = os.lstat(target)
+    if stat.S_ISLNK(info.st_mode):
+        raise SystemExit(f"refusing symlink in release state path: {target}")
+    os.chown(target, 0, service_gid, follow_symlinks=False)
+    os.chmod(target, mode, follow_symlinks=False)
+PY
+  return $?
+}
+
 bake_enabled() { [ "${BAKE_SECONDS:-0}" -gt 0 ] 2>/dev/null; }
 
 bake_traffic_url() {

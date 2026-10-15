@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -103,6 +104,80 @@ func TestCodexOverloadFailoverSwitchesAccountAndSticks(t *testing.T) {
 	}
 	if got := seen(); got[len(got)-1] != "oauth-token-1" {
 		t.Fatalf("new session was routed to the overloaded account: %v", got)
+	}
+}
+
+// Two capacity failures on one account ban only that account for this
+// session. Reassigning the durable sticky record cannot make the next proxy
+// request call the failed account again.
+func TestCodexCapacitySessionBanSkipsRepeatedAccountAtProxyBoundary(t *testing.T) {
+	pool, seen := codexOverloadPool(t, "oauth-token-0")
+	poolURL, _ := url.Parse(pool.URL)
+	server := codexOverloadServer(t, poolURL, 2, true)
+	fastCapacityGaps(server.CodexOverloadFailover, time.Millisecond)
+	if _, err := server.Sessions.Put("codex", "session-ban", "codex-account-0", ""); err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	status, body := codexEgressPost(t, proxy.URL, "session-ban")
+	if status != http.StatusOK || !strings.Contains(body, "served-from-oauth-token-1") {
+		t.Fatalf("first request status=%d body=%s", status, body)
+	}
+	first := seen()
+	if len(first) != 3 || first[0] != "oauth-token-0" || first[1] != "oauth-token-0" || first[2] != "oauth-token-1" {
+		t.Fatalf("first request attempts=%v, want account 0 twice then account 1", first)
+	}
+	if _, err := server.Sessions.Put("codex", "session-ban", "codex-account-0", ""); err != nil {
+		t.Fatal(err)
+	}
+	status, body = codexEgressPost(t, proxy.URL, "session-ban")
+	if status != http.StatusOK || !strings.Contains(body, "served-from-oauth-token-1") {
+		t.Fatalf("banned-session request status=%d body=%s", status, body)
+	}
+	all := seen()
+	if len(all) != len(first)+1 || all[len(all)-1] != "oauth-token-1" {
+		t.Fatalf("banned-session attempts=%v, want one direct account-1 call", all)
+	}
+}
+
+// One HTTP request gets one same-account retry, but both physical failures
+// belong to one capacity episode in the report.
+func TestCodexCapacityHistoryCountsOneBoundaryEpisode(t *testing.T) {
+	pool, _ := codexOverloadPool(t, "oauth-token-0")
+	poolURL, _ := url.Parse(pool.URL)
+	server := codexOverloadServer(t, poolURL, 2, true)
+	server.AdminToken = "capacity-admin"
+	fastCapacityGaps(server.CodexOverloadFailover, time.Millisecond)
+	if _, err := server.Sessions.Put("codex", "session-history", "codex-account-0", ""); err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+	status, _ := codexEgressPost(t, proxy.URL, "session-history")
+	if status != http.StatusOK {
+		t.Fatalf("request status=%d", status)
+	}
+	req, err := http.NewRequest(http.MethodGet, proxy.URL+"/_subrouter/codex-capacity", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer capacity-admin")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("capacity status=%d", response.StatusCode)
+	}
+	var report CodexCapacityReport
+	if err := json.NewDecoder(response.Body).Decode(&report); err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Accounts) == 0 || report.Accounts[0].Last24h.Failures != 2 || report.Accounts[0].Last24h.Episodes != 1 {
+		t.Fatalf("capacity report=%+v, want two failures in one episode", report.Accounts)
 	}
 }
 
@@ -497,7 +572,7 @@ func TestCodexOverloadMarkTTLHonorsRetryHints(t *testing.T) {
 		{"resets_in_seconds body", "", `{"error":{"code":"slow_down","resets_in_seconds":90}}`, 72 * time.Second, 108 * time.Second},
 		{"short hint clamps up", "", `{"error":{"code":"server_is_overloaded","retry_after_ms":2000}}`, 30 * time.Second, 30 * time.Second},
 		{"long hint clamps down", "3600", `{"error":{"code":"server_is_overloaded"}}`, 5 * time.Minute, 5 * time.Minute},
-		{"no hint uses the default", "", `{"error":{"code":"server_is_overloaded"}}`, 96 * time.Second, 144 * time.Second},
+		{"no hint uses the default", "", `{"error":{"code":"server_is_overloaded"}}`, 240 * time.Second, 360 * time.Second},
 	}
 	for index, test := range cases {
 		t.Run(test.name, func(t *testing.T) {

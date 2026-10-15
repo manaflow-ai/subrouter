@@ -1,6 +1,9 @@
 package accounts
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestWeeklyCookedWindow(t *testing.T) {
 	const week = 604800
@@ -32,6 +35,7 @@ func TestWeeklyCookedWindow(t *testing.T) {
 			{Name: "reached", UsedPercent: 100},
 		}, false},
 		{"only 5h full", []UsageWindow{{Name: "primary", UsedPercent: 100, LimitWindowSeconds: fiveHours}}, false},
+		{"weekly reset has passed", []UsageWindow{{Name: "secondary", UsedPercent: 100, LimitWindowSeconds: week, ResetAt: time.Now().Add(-time.Minute)}}, false},
 		{"none", nil, false},
 	}
 	for _, tc := range cases {

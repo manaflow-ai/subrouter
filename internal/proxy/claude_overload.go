@@ -30,6 +30,8 @@ type claudeSSEPeek struct {
 	body       io.ReadCloser
 	prefix     []byte
 	overloaded bool
+	denied     bool
+	credit     bool
 }
 
 func (p *claudeSSEPeek) run() {
@@ -48,9 +50,11 @@ func (p *claudeSSEPeek) run() {
 				}
 				line := bytes.TrimRight(pending[:i], "\r")
 				pending = pending[i+1:]
-				decided, overloaded := claudeSSELineDecision(line)
+				decided, overloaded, denied, credit := claudeSSELineDecision(line)
 				if decided {
 					p.overloaded = overloaded
+					p.denied = denied
+					p.credit = credit
 					return
 				}
 			}
@@ -65,10 +69,10 @@ func (p *claudeSSEPeek) run() {
 // nothing; an error event decides the stream (overloaded_error is retryable,
 // any other error passes through); every other data event is content or the
 // end of the message, after which nothing may be replayed.
-func claudeSSELineDecision(line []byte) (decided, overloaded bool) {
+func claudeSSELineDecision(line []byte) (decided, overloaded, denied, credit bool) {
 	data, ok := bytes.CutPrefix(line, []byte("data:"))
 	if !ok {
-		return false, false
+		return false, false, false, false
 	}
 	var ev struct {
 		Type  string `json:"type"`
@@ -77,15 +81,16 @@ func claudeSSELineDecision(line []byte) (decided, overloaded bool) {
 		} `json:"error"`
 	}
 	if json.Unmarshal(bytes.TrimSpace(data), &ev) != nil {
-		return false, false
+		return false, false, false, false
 	}
 	switch ev.Type {
 	case "message_start", "ping", "":
-		return false, false
+		return false, false, false, false
 	case "error":
-		return true, ev.Error.Type == "overloaded_error"
+		body := bytes.TrimSpace(data)
+		return true, ev.Error.Type == "overloaded_error", persistentAuthorizationDenialJSON(body), claudeCreditExhaustedMessage(body)
 	}
-	return true, false
+	return true, false, false, false
 }
 
 // claudeStreamOverloaded reports whether a 2xx Claude SSE response carries an
@@ -103,7 +108,7 @@ func claudeStreamOverloaded(response *http.Response) bool {
 	defer timer.Stop()
 	select {
 	case <-peek.done:
-		response.Body = prefixReadCloser{Reader: io.MultiReader(bytes.NewReader(peek.prefix), peek.body), Closer: peek.body}
+		response.Body = &claudeSSEPeekBody{ReadCloser: prefixReadCloser{Reader: io.MultiReader(bytes.NewReader(peek.prefix), peek.body), Closer: peek.body}, denied: peek.denied, credit: peek.credit}
 		return peek.overloaded
 	case <-timer.C:
 		// Hand the stream over undecided. The reader waits for the peek
@@ -112,6 +117,28 @@ func claudeStreamOverloaded(response *http.Response) bool {
 		response.Body = &claudeSSEDeferredBody{peek: peek}
 		return false
 	}
+}
+
+type claudeSSEPeekBody struct {
+	io.ReadCloser
+	denied bool
+	credit bool
+}
+
+func claudeStreamPersistentAuthorizationDenied(response *http.Response) bool {
+	if response == nil {
+		return false
+	}
+	peek, ok := response.Body.(*claudeSSEPeekBody)
+	return ok && peek.denied
+}
+
+func claudeStreamCreditExhausted(response *http.Response) bool {
+	if response == nil {
+		return false
+	}
+	peek, ok := response.Body.(*claudeSSEPeekBody)
+	return ok && peek.credit
 }
 
 // claudeSSEDeferredBody replays an undecided peek once its goroutine is done.

@@ -304,6 +304,18 @@ func TestRenderCompactSessionStatus(t *testing.T) {
 	}
 }
 
+func TestRenderSessionStatusLabelsClaudeAPIKeyRoute(t *testing.T) {
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	view := sessionStatusView{AccountID: "claude:key", Label: "claude:key", AuthMode: accounts.AuthModeAPIKey}
+	if got := renderCompactSessionStatus(view, now); !strings.Contains(got, "API key fallback") {
+		t.Fatalf("automatic API-key status = %q, want fallback label", got)
+	}
+	view.Pinned = true
+	if got := renderSessionStatus(view, now); !strings.Contains(got, "API key pinned") {
+		t.Fatalf("forced API-key status = %q, want pinned label", got)
+	}
+}
+
 func TestClaudeFlagsLaunchPooled(t *testing.T) {
 	if !claudeFlagsLaunchPooled([]string{"--resume", "abc"}, "") {
 		t.Fatal("--resume without an active profile should launch pooled")

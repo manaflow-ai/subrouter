@@ -54,6 +54,16 @@ func TestScoreAccountsPreservesHealthyScoreWhenUsageIsStale(t *testing.T) {
 	}
 }
 
+func TestScoreFromUsageWindowsClearsExpiredQuotaReset(t *testing.T) {
+	score := scoreFromUsageWindows(accounts.ProviderClaude, "claude@example.com", []accounts.UsageWindow{{
+		Name: "7d", UsedPercent: 100, LimitWindowSeconds: 7 * 24 * 60 * 60,
+		ResetAt: time.Now().Add(-time.Minute),
+	}})
+	if score.Headroom <= 0 || score.WeeklyCooked() {
+		t.Fatalf("expired quota reset stayed cooked: %+v", score)
+	}
+}
+
 func TestScoreAccountsTreatsAuthOnlyOAuthRefreshAsAuthEvidenceOnly(t *testing.T) {
 	account := accounts.Account{
 		ID: "antigravity", Provider: accounts.ProviderAntigravity,

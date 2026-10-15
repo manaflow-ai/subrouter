@@ -102,6 +102,8 @@ Usage:
   sr reset [email]      Redeem a rate-limit reset credit (pick best, or --all, or --dry-run)
   sr usage [days]       Refresh and show API-key spend
   sr trace <email>      Show OAuth refresh breadcrumbs for an account
+  sr errors [--provider claude|codex] [--since 1h] [--account ID] [--json]
+                        Show recent upstream errors and every account's quota at the newest one
   sr codex isolation-check [--json] [--retiring-state-dir PATH]
                         Check serving credential isolation without changing credentials
   sr codex migrate-isolation [--device-auth]
@@ -322,8 +324,11 @@ type srUsageRow struct {
 	creditsExhaustedUntil time.Time
 	// credit is a Claude API key's grant state; revokedSince marks a Claude
 	// OAuth credential Anthropic revoked.
-	credit           *proxy.ClaudeCreditStatus
-	revokedSince     time.Time
+	credit       *proxy.ClaudeCreditStatus
+	revokedSince time.Time
+	// revokedKind is the server's death kind: "revoked" or
+	// "org_oauth_disallowed".
+	revokedKind      string
 	apiKeySpend      *accounts.APIKeyUsageSnapshot
 	apiKeyHint       string
 	usageThrottled   bool
@@ -641,6 +646,8 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 		return r.claudeDirect(ctx, args[1:])
 	case "spend", "cost":
 		return r.spend(ctx)
+	case "errors", "error":
+		return r.upstreamErrors(ctx, args[1:])
 	case "gemini":
 		return r.gemini(args[1:])
 	case "oai", "openai":
@@ -3358,6 +3365,26 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 	if provider == accounts.ProviderClaude {
 		return claudeUsageGridColumns(rows, numbered, termWidth)
 	}
+	if provider == accounts.ProviderCodex {
+		columns := []usageGridColumn{}
+		if numbered {
+			columns = append(columns, usageGridColumn{Key: "#", Title: "#", Width: 3})
+		}
+		for _, column := range []usageGridColumn{
+			{Key: "Account", Title: "Account", Width: 48},
+			{Key: "Plan", Title: "Plan", Width: 16},
+			{Key: "State", Title: "State", Width: 0},
+			{Key: "Pick", Title: "Use", Width: 34},
+			{Key: "5h", Title: "5h", Width: 12},
+			{Key: "7d", Title: "7d", Width: 12},
+			{Key: "Reset", Title: "1x reset", Width: 8},
+		} {
+			column.Width = usageGridDesiredWidth(rows, column.Key, column.Title, column.Width)
+			columns = append(columns, column)
+		}
+		shrinkUsageGridColumnsToFit(columns, termWidth, []string{"Account", "Pick", "Plan", "Reset"})
+		return columns
+	}
 	accountWidth := 22
 	planWidth := 8
 	stateWidth := 10
@@ -3493,23 +3520,26 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 		columns = append(columns, usageGridColumn{Key: "#", Title: "#", Width: 3})
 	}
 	for _, column := range []usageGridColumn{
-		{Key: "Account", Title: "Account", Width: usageGridDesiredWidth(rows, "Account", "Account", 36)},
-		{Key: "Plan", Title: "Plan", Width: usageGridDesiredWidth(rows, "Plan", "Plan", 16)},
-		{Key: "State", Title: "State", Width: usageGridDesiredWidth(rows, "State", "State", 20)},
-		{Key: "Pick", Title: "Use", Width: usageGridDesiredWidth(rows, "Pick", "Use", 34)},
+		{Key: "Account", Title: "Account", Width: usageGridDesiredWidth(rows, "Account", "Account", 48)},
+		{Key: "State", Title: "State", Width: usageGridDesiredWidth(rows, "State", "State", 0)},
+		{Key: "Pick", Title: "Use", Width: usageGridDesiredWidth(rows, "Pick", "Use", 30)},
+		{Key: "5h", Title: "5h", Width: usageGridDesiredWidth(rows, "5h", "5h", 12)},
+		{Key: "7d", Title: "7d", Width: usageGridDesiredWidth(rows, "7d", "7d", 12)},
 	} {
 		columns = append(columns, column)
 	}
 	if usageGridRowsHaveValue(rows, "Tier") {
-		columns = append(columns, usageGridColumn{Key: "Tier", Title: "Tier", Width: usageGridDesiredWidth(rows, "Tier", "Tier", 36)})
+		columns = append(columns, usageGridColumn{Key: "Tier", Title: "Tier", Width: usageGridDesiredWidth(rows, "Tier", "Tier", 18)})
 	}
-	if usageGridRowsHaveValue(rows, "Credit") {
-		columns = append(columns, usageGridColumn{Key: "Credit", Title: "Credit", Width: usageGridDesiredWidth(rows, "Credit", "Credit", 56)})
+	if usageGridRowsHaveValue(rows, "Detail") {
+		columns = append(columns, usageGridColumn{Key: "Detail", Title: "Detail", Width: usageGridDesiredWidth(rows, "Detail", "Detail", 28)})
 	}
-	shrinkUsageGridColumnsToFit(columns, termWidth, []string{"State", "Account", "Plan", "Pick"})
+	// State is intentionally absent from the shrink list. Its values are short
+	// semantic labels, and truncating "active, cooked" to "ac..." loses the
+	// reason a row needs attention. Account, Use, Tier, and Detail can yield
+	// compact cells when a narrow terminal leaves less room.
+	shrinkUsageGridColumnsToFit(columns, termWidth, []string{"Account", "Pick", "Detail", "Tier"})
 	for _, candidate := range []usageGridColumn{
-		{Key: "Session", Title: "Session"},
-		{Key: "Weekly", Title: "Weekly"},
 		{Key: "Fable wk", Title: "Fable wk"},
 		{Key: "Opus wk", Title: "Opus wk"},
 		{Key: "Sonnet wk", Title: "Sonnet wk"},
@@ -3531,6 +3561,14 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 		}
 		candidate.Width = usageGridDesiredWidth(rows, candidate.Key, candidate.Title, capWidth)
 		columns = appendUsageGridColumnIfFits(columns, candidate, termWidth)
+	}
+	// Reserve Detail's space before optional windows, but print it last.
+	for i, column := range columns {
+		if column.Key == "Detail" {
+			copy(columns[i:], columns[i+1:])
+			columns[len(columns)-1] = column
+			break
+		}
 	}
 	return columns
 }
@@ -3561,6 +3599,9 @@ func usageGridDesiredWidth(rows []srUsageRow, key, title string, capWidth int) i
 	desired := runewidth.StringWidth(title)
 	for _, row := range rows {
 		desired = max(desired, runewidth.StringWidth(usageGridValues(row, "")[key].Text))
+	}
+	if capWidth <= 0 {
+		return desired
 	}
 	return min(desired, capWidth)
 }
@@ -3600,6 +3641,7 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"7d":              usageGridProviderLongWindowCell(row),
 		"Reset":           usageGridResetCell(row),
 		"Credits":         usageGridCreditsCell(row),
+		"Detail":          usageGridClaudeDetailCell(row),
 		"Session":         usageGridWindowCell(row.windows, isClaudeSessionWindow),
 		"Weekly":          usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
 		"Fable wk":        usageGridWindowCell(row.windows, isClaudeOAuthAppsWeeklyWindow),
@@ -3644,6 +3686,42 @@ func usageGridClaudeCreditCell(row srUsageRow) usageGridCell {
 	}
 	if credit.Pace != "" {
 		text += ", " + credit.Pace
+	}
+	style := ansiDim
+	if credit.Promoted {
+		style = ansiYellow
+	}
+	return usageGridCell{Text: text, Style: style}
+}
+
+// revokedLabel names a dead Claude credential for the table: "revoked" for
+// a revoked OAuth token, "org disabled" when the organization no longer
+// allows OAuth.
+func revokedLabel(row srUsageRow) string {
+	if row.revokedKind == "org_oauth_disallowed" {
+		return "org disabled"
+	}
+	return "revoked"
+}
+
+// usageGridClaudeDetailCell keeps long Claude-only notes out of the core
+// routing columns. The table gives this cell the final compact column, so
+// credits and revoked credentials remain readable without widening Use or
+// truncating State.
+func usageGridClaudeDetailCell(row srUsageRow) usageGridCell {
+	if !row.revokedSince.IsZero() {
+		return usageGridCell{
+			Text:  revokedLabel(row) + " " + row.revokedSince.UTC().Format("01-02 15:04Z"),
+			Style: ansiRed,
+		}
+	}
+	credit := row.credit
+	if credit == nil {
+		return usageGridCell{}
+	}
+	text := fmt.Sprintf("$%.2f/$%.0f exp %s", credit.RemainingUSD, credit.GrantUSD, credit.ExpiresAt.UTC().Format("01-02"))
+	if credit.Defaulted {
+		text += "~"
 	}
 	style := ansiDim
 	if credit.Promoted {
@@ -3962,7 +4040,7 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 
 func usageGridState(row srUsageRow) string {
 	if usageProvider(row) == accounts.ProviderClaude && !row.revokedSince.IsZero() {
-		return "revoked"
+		return revokedLabel(row)
 	}
 	if usageProvider(row) == accounts.ProviderClaude {
 		if claudeCreditCooldownActive(row) {
@@ -3989,6 +4067,12 @@ func usageGridState(row srUsageRow) string {
 			return "active, throttled"
 		}
 		return "throttled"
+	}
+	if usageProvider(row) == accounts.ProviderClaude && row.authMode == accounts.AuthModeAPIKey {
+		if row.active || (row.sessionsKnown && row.assignedSessions > 0) {
+			return "active, API key fallback"
+		}
+		return "API key fallback"
 	}
 	if usageProvider(row) == accounts.ProviderAntigravity && row.authMode == accounts.AuthModeOAuth {
 		active := row.active || (row.sessionsKnown && row.assignedSessions > 0)
@@ -4187,7 +4271,7 @@ func usageGridError(row srUsageRow) string {
 
 func compactPickReason(row srUsageRow) string {
 	if !row.revokedSince.IsZero() {
-		return "revoked since " + row.revokedSince.Local().Format("01-02 15:04") + ", re-add"
+		return "re-add"
 	}
 	if claudeCreditCooldownActive(row) {
 		return "credit cooldown, probe in " + formatDuration(int64(time.Until(row.creditsExhaustedUntil).Seconds()))
@@ -4267,6 +4351,12 @@ func compactPickReason(row srUsageRow) string {
 	}
 	if usingExpiringWeeklyQuota(row.score) {
 		return fmt.Sprintf("%s, weekly expiring%s", left, suffix)
+	}
+	// Claude's account-wide windows are rendered in the explicit 5h and 7d
+	// columns below. Keep Use compact so those reset values remain readable in
+	// the same row instead of repeating the 5h reset here.
+	if usageProvider(row) == accounts.ProviderClaude && hasAccountWideQuotaEvidence(row.windows) {
+		return left + suffix
 	}
 	if row.score.ShortResetAfterSeconds > 0 {
 		if usageProvider(row) == accounts.ProviderClaude {
@@ -4378,9 +4468,6 @@ func modelScopedWindowLabel(window accounts.UsageWindow) string {
 }
 
 func usageGridShortWindowCell(row srUsageRow) usageGridCell {
-	if longQuotaSaturated(row.windows) {
-		return usageGridCell{}
-	}
 	return usageGridWindowCell(row.windows, accountWideWindow(isShortQuotaWindow))
 }
 

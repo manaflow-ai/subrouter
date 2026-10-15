@@ -56,6 +56,10 @@ type SchedulerRef struct {
 	// rotation proves that account state recovered, so those events must not
 	// clear this overlay.
 	accountUnavailableUntil map[string]time.Time
+	// credentialUnavailable records persistent authorization or entitlement
+	// denials for the exact credential that observed them. A credential reload
+	// changes the fingerprint, which makes the old denial inactive immediately.
+	credentialUnavailable map[string]struct{}
 	// creditExhaustedUntil labels the accountUnavailableUntil entries that
 	// came from a spent API credit balance, so status views can say why a
 	// key is held out. It never affects routing on its own.
@@ -108,6 +112,7 @@ func (r *SchedulerRef) Get() Scheduler {
 	scheduler = applyWeeklyExhaustionMarks(scheduler, r.weeklyExhaustedUntil, now)
 	scheduler = applyExhaustionMarks(scheduler, r.activeCredentialExhaustionLocked(), now)
 	scheduler = applyExhaustionMarks(scheduler, r.accountUnavailableUntil, now)
+	scheduler = applyPersistentCredentialMarks(scheduler, r.activeCredentialUnavailableLocked())
 	return applyExhaustionMarks(scheduler, r.incompatibleUntil, now)
 }
 
@@ -186,6 +191,9 @@ func (r *SchedulerRef) ExplicitBlockedUntilFor(
 	r.pruneExpired(now)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if r.persistentCredentialBlockedLocked(provider, accountID) {
+		return time.Time{}, true
+	}
 	return r.explicitBlockedUntilLocked(provider, accountID, model, now)
 }
 
@@ -241,7 +249,11 @@ func (r *SchedulerRef) blockedUntilLocked(
 	scheduler := applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
 	scheduler = applyExhaustionMarks(scheduler, r.activeCredentialExhaustionLocked(), now)
 	scheduler = applyExhaustionMarks(scheduler, r.accountUnavailableUntil, now)
+	scheduler = applyPersistentCredentialMarks(scheduler, r.activeCredentialUnavailableLocked())
 	scheduler = applyExhaustionMarks(scheduler, r.incompatibleUntil, now)
+	if r.persistentCredentialBlockedLocked(provider, accountID) {
+		return time.Time{}, true
+	}
 	if !scheduler.ForModel(model).Exhausted(provider, accountID) {
 		return time.Time{}, false
 	}
@@ -596,6 +608,16 @@ func (r *SchedulerRef) pruneExhaustedMarksForAccountsLocked(accounts []account.A
 		}
 		if _, exists := present[scoreKey]; !exists {
 			delete(r.exhaustedMarkSeq, key)
+		}
+	}
+	for key := range r.credentialUnavailable {
+		parts := strings.SplitN(key, "\x00", 3)
+		if len(parts) != 3 {
+			delete(r.credentialUnavailable, key)
+			continue
+		}
+		if _, exists := present[ScoreKey(account.Provider(parts[0]), parts[1])]; !exists {
+			delete(r.credentialUnavailable, key)
 		}
 	}
 }
@@ -986,6 +1008,55 @@ func (r *SchedulerRef) MarkCredentialExhaustedForSnapshot(
 	return true
 }
 
+// MarkCredentialUnavailableForSnapshot permanently excludes the exact
+// credential that received a persistent authorization or entitlement denial.
+// A later credential update changes the fingerprint and restores eligibility;
+// usage refreshes cannot supersede the denial.
+func (r *SchedulerRef) MarkCredentialUnavailableForSnapshot(
+	provider account.Provider,
+	accountID string,
+	credentialIdentity string,
+	accountGeneration uint64,
+	credentialRevision uint64,
+	accounts []account.Account,
+) bool {
+	if r == nil || accountID == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if accountGeneration < r.accountGeneration ||
+		(accountGeneration == r.accountGeneration && credentialRevision < r.credentialRevision) {
+		return false
+	}
+	publishesSnapshot := accountGeneration > r.accountGeneration
+	if accountGeneration > r.accountGeneration {
+		r.advanceAccountGenerationLocked(accountGeneration)
+	}
+	if credentialRevision > r.credentialRevision || r.credentialFingerprints == nil {
+		publishesSnapshot = true
+		r.credentialRevision = credentialRevision
+		r.credentialFingerprints = make(map[string]string, len(accounts))
+		for _, candidate := range accounts {
+			r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
+		}
+	}
+	if publishesSnapshot {
+		r.pruneExhaustedMarksForAccountsLocked(accounts)
+	}
+	fingerprint := credentialFingerprint(credentialIdentity)
+	scoreKey := ScoreKey(provider, accountID)
+	if current, tracked := r.credentialFingerprints[scoreKey]; !tracked || current != fingerprint {
+		return false
+	}
+	if r.credentialUnavailable == nil {
+		r.credentialUnavailable = make(map[string]struct{})
+	}
+	r.credentialUnavailable[scoreKey+"\x00"+fingerprint] = struct{}{}
+	r.updatedAt = time.Now()
+	return true
+}
+
 func credentialFingerprint(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
@@ -1005,6 +1076,27 @@ func (r *SchedulerRef) activeCredentialExhaustionLocked() map[string]time.Time {
 		active[poolScopedExhaustionKey(account.Provider(parts[0]), parts[1], "")] = until
 	}
 	return active
+}
+
+func (r *SchedulerRef) activeCredentialUnavailableLocked() map[string]struct{} {
+	active := make(map[string]struct{})
+	for key := range r.credentialUnavailable {
+		parts := strings.SplitN(key, "\x00", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		scoreKey := ScoreKey(account.Provider(parts[0]), parts[1])
+		if current, tracked := r.credentialFingerprints[scoreKey]; tracked && current != parts[2] {
+			continue
+		}
+		active[poolScopedExhaustionKey(account.Provider(parts[0]), parts[1], "")] = struct{}{}
+	}
+	return active
+}
+
+func (r *SchedulerRef) persistentCredentialBlockedLocked(provider account.Provider, accountID string) bool {
+	_, ok := r.activeCredentialUnavailableLocked()[poolScopedExhaustionKey(provider, accountID, "")]
+	return ok
 }
 
 // MarkAccountUnavailableUntil excludes an account because of state that is
@@ -1082,6 +1174,9 @@ func (r *SchedulerRef) ExhaustedUntilFor(provider account.Provider, accountID, p
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	key := poolScopedExhaustionKey(provider, accountID, poolKey)
+	if poolKey == "" && r.persistentCredentialBlockedLocked(provider, accountID) {
+		return time.Time{}, true
+	}
 	until, ok := r.exhaustedUntil[key]
 	if credentialUntil, credentialOK := r.activeCredentialExhaustionLocked()[key]; credentialOK && (!ok || credentialUntil.After(until)) {
 		until, ok = credentialUntil, true
@@ -1120,6 +1215,38 @@ func (r *SchedulerRef) expiryMarksLocked() map[string]time.Time {
 		}
 	}
 	return marks
+}
+
+func applyPersistentCredentialMarks(base Scheduler, blocked map[string]struct{}) Scheduler {
+	if len(blocked) == 0 {
+		return base
+	}
+	next := Scheduler{
+		scores:        make(map[string]Score, len(base.scores)+len(blocked)),
+		sessionCounts: base.sessionCounts,
+		liveDebits:    base.liveDebits,
+		capacity:      base.capacity,
+	}
+	for key, score := range base.scores {
+		next.scores[key] = copyScore(score)
+	}
+	for key := range blocked {
+		scoreKey, provider, _, ok := exhaustionKeyParts(key)
+		if !ok {
+			continue
+		}
+		score := next.scores[scoreKey]
+		if score.AccountID == "" {
+			_, accountID, _ := strings.Cut(scoreKey, "\x00")
+			score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1}
+		}
+		score.Provider = provider
+		score.Headroom = 0
+		score.ShortHeadroom = 0
+		score.ModelScores = nil
+		next.scores[scoreKey] = score
+	}
+	return next
 }
 
 func poolScopedExhaustionKey(provider account.Provider, accountID, poolKey string) string {

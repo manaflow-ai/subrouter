@@ -4329,14 +4329,14 @@ func TestDisplayUsageRowsGridUsesClaudeLimitLabels(t *testing.T) {
 	}, false)
 
 	got := out.String()
-	if !strings.Contains(got, "Session") || !strings.Contains(got, "Weekly") || !strings.Contains(got, "Fable wk") || !strings.Contains(got, "Opus wk") || !strings.Contains(got, "Sonnet wk") {
+	if !strings.Contains(got, "5h") || !strings.Contains(got, "7d") || !strings.Contains(got, "Fable wk") || !strings.Contains(got, "Opus wk") || !strings.Contains(got, "Sonnet wk") {
 		t.Fatalf("Claude grid missing Claude-specific labels:\n%s", got)
 	}
-	if strings.Contains(got, "  5h  ") || strings.Contains(got, "  7d  ") || strings.Contains(got, "Spark") {
-		t.Fatalf("Claude grid should not use Codex labels:\n%s", got)
+	if strings.Contains(got, "Plan") || strings.Contains(got, "unknown") || strings.Contains(got, "Spark") {
+		t.Fatalf("Claude grid should not use an unknown Plan column:\n%s", got)
 	}
-	if !strings.Contains(got, "session reset") {
-		t.Fatalf("Claude pick reason should use session terminology:\n%s", got)
+	if strings.Contains(got, "session reset") {
+		t.Fatalf("Claude Use should leave reset details to the 5h column:\n%s", got)
 	}
 }
 
@@ -4354,24 +4354,24 @@ func TestClaudeUsageGridPrioritizesPopulatedColumnsWithoutTruncatingCore(t *test
 		fableUsed    float64
 		fableReset   time.Duration
 		wantUse      string
-		wantSession  string
-		wantWeekly   string
+		want5h       string
+		want7d       string
 		wantFable    string
 	}{
 		{
 			email: "primary.account@example.test", plan: "max", headroom: .74,
 			sessionReset: 4*time.Hour + 34*time.Minute, weeklyReset: 2*24*time.Hour + 6*time.Hour, fableReset: 24*time.Hour + 8*time.Hour,
-			wantUse: "74% left, session reset 4h34m", wantSession: "100%/4h34m", wantWeekly: "100%/2d6h", wantFable: "100%/1d8h",
+			wantUse: "74% left", want5h: "100%/4h34m", want7d: "100%/2d6h", wantFable: "100%/1d8h",
 		},
 		{
 			email: "secondary.account@example.test", plan: "pro", headroom: .83,
 			sessionUsed: 11, sessionReset: 3*time.Hour + 21*time.Minute, weeklyUsed: 12, weeklyReset: 24*time.Hour + 5*time.Hour, fableUsed: 13, fableReset: 17 * time.Hour,
-			wantUse: "83% left, session reset 3h21m", wantSession: "89%/3h21m", wantWeekly: "88%/1d5h", wantFable: "87%/17h",
+			wantUse: "83% left", want5h: "89%/3h21m", want7d: "88%/1d5h", wantFable: "87%/17h",
 		},
 		{
 			email: "lab-profile", plan: "free", headroom: .92,
 			sessionUsed: 22, sessionReset: 2*time.Hour + 8*time.Minute, weeklyUsed: 23, weeklyReset: 12 * time.Hour, fableUsed: 24, fableReset: 9 * time.Hour,
-			wantUse: "92% left, session reset 2h8m", wantSession: "78%/2h8m", wantWeekly: "77%/12h", wantFable: "76%/9h",
+			wantUse: "92% left", want5h: "78%/2h8m", want7d: "77%/12h", wantFable: "76%/9h",
 		},
 	}
 	for i, profile := range profiles {
@@ -4400,10 +4400,9 @@ func TestClaudeUsageGridPrioritizesPopulatedColumnsWithoutTruncatingCore(t *test
 		}
 		wantCells := map[string]string{
 			"Account":  profile.email,
-			"Plan":     profile.plan,
 			"Pick":     profile.wantUse,
-			"Session":  profile.wantSession,
-			"Weekly":   profile.wantWeekly,
+			"5h":       profile.want5h,
+			"7d":       profile.want7d,
 			"Fable wk": profile.wantFable,
 		}
 		for key, want := range wantCells {
@@ -4412,12 +4411,12 @@ func TestClaudeUsageGridPrioritizesPopulatedColumnsWithoutTruncatingCore(t *test
 			}
 		}
 	}
-	for _, want := range []string{"Plan", "Session", "Weekly", "Fable wk"} {
+	for _, want := range []string{"5h", "7d", "Fable wk"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("Claude grid missing %q:\n%s", want, got)
 		}
 	}
-	for _, unwanted := range []string{"Opus wk", "Sonnet wk", "Extra", "Auto-reload", "..."} {
+	for _, unwanted := range []string{"Plan", "unknown", "Opus wk", "Sonnet wk", "Extra", "Auto-reload", "..."} {
 		if strings.Contains(got, unwanted) {
 			t.Fatalf("Claude grid unexpectedly contains %q:\n%s", unwanted, got)
 		}
@@ -4452,7 +4451,7 @@ func TestClaudeUsageGridNarrowSchemaIsDeterministicAndOmitsEmptyColumns(t *testi
 	}}
 	var shortOut bytes.Buffer
 	displayUsageRows(&shortOut, shortRows, false)
-	for _, want := range []string{"74% left, session reset 1h", "100%/1h", "100%/1d"} {
+	for _, want := range []string{"74% left", "100%/1h", "100%/1d"} {
 		if !strings.Contains(shortOut.String(), want) {
 			t.Fatalf("narrow short-account grid truncated %q:\n%s", want, shortOut.String())
 		}
@@ -4464,7 +4463,7 @@ func TestClaudeUsageGridNarrowSchemaIsDeterministicAndOmitsEmptyColumns(t *testi
 		email: strings.Repeat("a", 36), planType: "enterprise", provider: accounts.ProviderClaude,
 		active: true, err: errors.New("usage unavailable"),
 	}}, false)
-	if !strings.Contains(worstOut.String(), "enterprise") || !strings.Contains(worstOut.String(), "usage unavailable") {
+	if !strings.Contains(worstOut.String(), strings.Repeat("a", 28)) || !strings.Contains(worstOut.String(), "usage unavailable") {
 		t.Fatalf("narrow worst-case grid lost higher-priority values:\n%s", worstOut.String())
 	}
 	assertUsageGridLineWidths(t, worstOut.String(), 80)
@@ -4488,7 +4487,7 @@ func TestClaudeUsageGridDropsLowerPriorityPopulatedWindowsBeforeTruncatingCore(t
 	var out bytes.Buffer
 	displayUsageRows(&out, []srUsageRow{row}, false)
 	got := out.String()
-	for _, want := range []string{"74% left, session reset 4h34m", "100%/4h34m", "100%/1d", "Session", "Weekly", "Fable wk"} {
+	for _, want := range []string{"74% left", "100%/4h34m", "100%/1d", "5h", "7d", "Fable wk"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("all-window Claude grid truncated priority value %q:\n%s", want, got)
 		}
@@ -4508,7 +4507,7 @@ func TestClaudeUsageGridUsesOneSchemaForMixedRows(t *testing.T) {
 	var out bytes.Buffer
 	displayUsageRows(&out, rows, false)
 	got := out.String()
-	if strings.Count(got, "Session") != 1 || strings.Count(got, "Fable wk") != 1 {
+	if strings.Count(got, "5h") != 1 || strings.Count(got, "Fable wk") != 1 {
 		t.Fatalf("mixed Claude rows did not share one populated schema:\n%s", got)
 	}
 	assertUsageGridLineWidths(t, got, 137)
@@ -4799,7 +4798,7 @@ func TestDisplayUsageRowsGridColorsWhenForced(t *testing.T) {
 	}
 }
 
-func TestUsageGridSuppressesShortWindowsByQuotaFamily(t *testing.T) {
+func TestUsageGridPreservesShortWindowsByQuotaFamily(t *testing.T) {
 	windows := []accounts.UsageWindow{
 		{Name: "primary", UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
 		{Name: "secondary", UsedPercent: 100, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
@@ -4807,8 +4806,8 @@ func TestUsageGridSuppressesShortWindowsByQuotaFamily(t *testing.T) {
 		{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
 	}
 	cooked := srUsageRow{cooked: true, windows: windows}
-	if cell := usageGridShortWindowCell(cooked); cell.Text != "" {
-		t.Fatalf("short window cell = %q, want blank when general weekly quota is cooked", cell.Text)
+	if cell := usageGridShortWindowCell(cooked); cell.Text != "90%" {
+		t.Fatalf("short window cell = %q, want 90%% even when general weekly quota is cooked", cell.Text)
 	}
 
 	tempCooked := srUsageRow{tempCooked: true, windows: []accounts.UsageWindow{
@@ -5169,6 +5168,19 @@ func TestKimiSubscriptionStateDistinguishesReadyRecommendedAndActive(t *testing.
 	}
 }
 
+func TestClaudeAPIKeyStateSaysFallback(t *testing.T) {
+	row := srUsageRow{provider: accounts.ProviderClaude, authMode: accounts.AuthModeAPIKey}
+	if got := usageGridState(row); got != "API key fallback" {
+		t.Fatalf("Claude API-key state = %q, want explicit fallback label", got)
+	}
+	row.active = true
+	row.sessionsKnown = true
+	row.assignedSessions = 1
+	if got := usageGridState(row); got != "active, API key fallback" {
+		t.Fatalf("active Claude API-key state = %q, want explicit active fallback label", got)
+	}
+}
+
 func TestKimiAPIKeyShowsQuotaWindowsOnlyWhenAvailable(t *testing.T) {
 	withQuota := srUsageRow{
 		provider: accounts.ProviderKimi, authMode: accounts.AuthModeAPIKey,
@@ -5340,8 +5352,8 @@ func TestCompactPickReasonUsesCachedWindowsWhenUsageRefreshFails(t *testing.T) {
 			ShortResetAfterSeconds: 3600,
 		},
 	}
-	if got := compactPickReason(row); got != "74% left, session reset 1h" {
-		t.Fatalf("cached quota Use = %q, want reset-aware value", got)
+	if got := compactPickReason(row); got != "74% left" {
+		t.Fatalf("cached quota Use = %q, want compact value", got)
 	}
 }
 

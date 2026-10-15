@@ -77,10 +77,32 @@ func claudeRetryCandidatesFromScores(
 // scheduler's unknown-account default is optimistically 100% healthy, which
 // otherwise places fresh sessions there ahead of accounts with measured quota.
 //
-// A missing or stale measurement never makes an account ineligible: if no
-// verified usable choice exists, return the original pool unchanged. Callers
-// must only use this for initial placement, not existing sticky assignments.
+// A missing measurement remains eligible as a conservative subscription-first
+// choice; a fresh dedicated-pool reading without the requested bucket is
+// excluded. If no subscription has capacity, return the original pool so the
+// scheduler can choose the API-key last resort. Callers must only use this for
+// initial placement, not existing sticky assignments.
 func claudeNewSessionCandidatesFromScores(
+	base, model selectacct.Scheduler,
+	candidates []accounts.Account,
+	poolModel string,
+) []accounts.Account {
+	// A Claude subscription is always the cheapest route while it has quota.
+	// In particular, a behind-pace API-key credit grant is not permission to
+	// spend metered traffic while an OAuth account can serve the request.
+	if subscriptions := claudeSubscriptionCandidatesFromScores(base, model, candidates, poolModel); len(subscriptions) > 0 {
+		return subscriptions
+	}
+	return candidates
+}
+
+// claudeSubscriptionCandidatesFromScores returns OAuth accounts that still
+// have quota for a Claude request. It deliberately uses the measured
+// exhaustion decision rather than the new-session headroom floor: a
+// subscription with 10% left is still cheaper than a metered API key. Unknown
+// scores remain eligible, while a fresh dedicated-pool reading with no bucket
+// remains ineligible for that model.
+func claudeSubscriptionCandidatesFromScores(
 	base, model selectacct.Scheduler,
 	candidates []accounts.Account,
 	poolModel string,
@@ -88,37 +110,37 @@ func claudeNewSessionCandidatesFromScores(
 	modelKey := selectacct.ModelKey(poolModel)
 	hasDedicatedPool := modelKey != "" && base.HasModelPool(poolModel)
 	verified := make([]accounts.Account, 0, len(candidates))
-	promoted := make([]accounts.Account, 0)
+	constrained := make([]accounts.Account, 0, len(candidates))
+	uncertain := make([]accounts.Account, 0, len(candidates))
 	for _, candidate := range candidates {
-		if candidate.AuthMode == accounts.AuthModeAPIKey {
-			// A credit grant behind pace outranks plan quota for new
-			// sessions (selectacct.SelectionTierPromotedCredits); keep it in
-			// the verified set so Pick can choose it.
-			provider := schedulerAccountProvider(candidate.Provider)
-			if model.ScoreFor(provider, candidate.ID).CreditPromoted && !model.Exhausted(provider, candidate.ID) {
-				promoted = append(promoted, candidate)
-			}
-			continue
-		}
 		if candidate.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
 		provider := schedulerAccountProvider(candidate.Provider)
 		baseScore := base.ScoreFor(provider, candidate.ID)
-		if !baseScore.Fresh || !model.UsableForNewSession(provider, candidate.ID) {
+		if model.Exhausted(provider, candidate.ID) {
 			continue
 		}
-		if hasDedicatedPool {
+		if hasDedicatedPool && baseScore.Fresh {
 			// A fresh account-wide reading is not proof that this account
 			// can serve a separately measured model quota pool.
 			if _, hasBucket := baseScore.ModelScores[modelKey]; !hasBucket {
 				continue
 			}
 		}
-		verified = append(verified, candidate)
+		switch {
+		case baseScore.Fresh && model.UsableForNewSession(provider, candidate.ID):
+			verified = append(verified, candidate)
+		case baseScore.Fresh:
+			constrained = append(constrained, candidate)
+		default:
+			uncertain = append(uncertain, candidate)
+		}
 	}
 	if len(verified) > 0 {
-		return append(verified, promoted...)
+		// Preserve the measured-healthy admission preference: optimistic or
+		// stale subscriptions must not dilute a confirmed quota choice.
+		return verified
 	}
-	return candidates
+	return append(constrained, uncertain...)
 }

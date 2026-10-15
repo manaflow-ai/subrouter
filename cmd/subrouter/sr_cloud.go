@@ -63,6 +63,9 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("load hosted login configuration: %w", err)
 	}
+	if strings.TrimSpace(publicConfig.Subrouter.ExchangeURL) == "" {
+		return hostedExchangeLoginError(errors.New("cmux.com does not advertise hosted Subrouter"))
+	}
 	if override := strings.TrimRight(strings.TrimSpace(*hostedURL), "/"); override != "" {
 		publicConfig.Subrouter.URL = override
 		if err := publicConfig.Validate(); err != nil {
@@ -179,7 +182,7 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 		team.DisplayName,
 	)
 	if err != nil {
-		return err
+		return hostedExchangeLoginError(err)
 	}
 	config.AccessToken = tokens.AccessToken
 	config.RefreshToken = tokens.RefreshToken
@@ -202,6 +205,13 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	fmt.Fprintf(r.out, "Logged in to cmux.com team %s (%s).\n", team.DisplayName, team.ID)
 	fmt.Fprintln(r.out, "Remote: cmux (hosted)")
 	return nil
+}
+
+func hostedExchangeLoginError(err error) error {
+	return fmt.Errorf(
+		"hosted cmux.com tenant exchange failed: %w\nIf you want the team server instead, run:\n  sr storage legacy\n  sr server add lawrence --url http://127.0.0.1:31415 --default",
+		err,
+	)
 }
 
 func cliVerificationURL(baseURL, loginCode string) (string, error) {
