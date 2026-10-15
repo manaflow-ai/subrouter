@@ -3,6 +3,7 @@ package transcript
 import (
 	"bytes"
 	"encoding/json"
+	"unicode/utf8"
 )
 
 // usageScanner reads token usage, the stop reason and the model out of a
@@ -24,12 +25,24 @@ type usageScanner struct {
 	model      string
 	done       bool
 	anthropic  bool
+	// parsed is set once any message decoded, so the whole-body fallback
+	// never counts the same blocks again.
+	parsed bool
+
+	thinkingBlocks int64
+	thinkingChars  int64
+	signatureBytes int64
+	redactedBytes  int64
+	encryptedBytes int64
+	summaryChars   int64
 }
 
 type usageResult struct {
 	input, cached, cacheWrite, output, reasoning int64
 	stop, model                                  string
 	done                                         bool
+
+	thinkingBlocks, thinkingChars, signatureBytes, redactedBytes, encryptedBytes, summaryChars int64
 }
 
 // usageCarryMax bounds a partial line kept between chunks.
@@ -91,7 +104,8 @@ func (u *usageScanner) line(line []byte) {
 	u.parse(bytes.TrimSpace(line))
 }
 
-var usageMarkers = [][]byte{[]byte(`"usage"`), []byte(`"stop_reason"`), []byte(`"finish_reason"`), []byte(`"model"`), []byte(`response.completed`)}
+var usageMarkers = [][]byte{[]byte(`"usage"`), []byte(`"stop_reason"`), []byte(`"finish_reason"`), []byte(`"model"`), []byte(`response.completed`),
+	[]byte(`thinking`), []byte(`signature`), []byte(`encrypted_content`), []byte(`"reasoning"`)}
 
 type usageFields struct {
 	InputTokens              int64 `json:"input_tokens"`
@@ -140,6 +154,8 @@ func (u *usageScanner) parse(message []byte) {
 		} `json:"message"`
 		Delta *struct {
 			StopReason string `json:"stop_reason"`
+			Thinking   string `json:"thinking"`
+			Signature  string `json:"signature"`
 		} `json:"delta"`
 		Response *struct {
 			Model             string       `json:"model"`
@@ -152,10 +168,18 @@ func (u *usageScanner) parse(message []byte) {
 		Choices []struct {
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
+		// Anthropic streaming thinking.
+		ContentBlock *reasoningBlock `json:"content_block"`
+		// Anthropic non-streaming content.
+		Content []reasoningBlock `json:"content"`
+		// OpenAI Responses reasoning items.
+		Item   *reasoningItem  `json:"item"`
+		Output []reasoningItem `json:"output"`
 	}
 	if json.Unmarshal(message, &event) != nil {
 		return
 	}
+	u.parsed = true
 	if event.Model != "" {
 		u.model = event.Model
 	}
@@ -175,6 +199,25 @@ func (u *usageScanner) parse(message []byte) {
 	}
 	if event.Delta != nil && event.Delta.StopReason != "" {
 		u.stop = event.Delta.StopReason
+	}
+	if event.Delta != nil {
+		u.thinkingChars += int64(utf8.RuneCountInString(event.Delta.Thinking))
+		u.signatureBytes += int64(len(event.Delta.Signature))
+	}
+	if event.ContentBlock != nil {
+		u.addBlock(*event.ContentBlock)
+	}
+	for _, block := range event.Content {
+		u.addBlock(block)
+	}
+	if event.Type == "response.output_item.done" && event.Item != nil {
+		u.addItem(*event.Item)
+	}
+	if event.Type == "" {
+		// A non-streaming Responses body lists its output at the top level.
+		for _, item := range event.Output {
+			u.addItem(item)
+		}
 	}
 	if event.Type == "message_stop" {
 		u.done = true
@@ -217,14 +260,57 @@ func (u *usageScanner) add(fields *usageFields) {
 	u.reasoning = max(u.reasoning, fields.OutputTokensDetails.ReasoningTokens, fields.CompletionTokensDetails.ReasoningTokens)
 }
 
+type reasoningBlock struct {
+	Type      string `json:"type"`
+	Thinking  string `json:"thinking"`
+	Signature string `json:"signature"`
+	Data      string `json:"data"`
+}
+
+type reasoningItem struct {
+	Type             string `json:"type"`
+	EncryptedContent string `json:"encrypted_content"`
+	Summary          []struct {
+		Text string `json:"text"`
+	} `json:"summary"`
+}
+
+// addBlock counts one Anthropic thinking or redacted_thinking block. In a
+// stream the block starts empty and its text and signature arrive as deltas.
+func (u *usageScanner) addBlock(block reasoningBlock) {
+	switch block.Type {
+	case "thinking":
+		u.thinkingBlocks++
+		u.thinkingChars += int64(utf8.RuneCountInString(block.Thinking))
+		u.signatureBytes += int64(len(block.Signature))
+	case "redacted_thinking":
+		u.thinkingBlocks++
+		u.redactedBytes += int64(len(block.Data))
+	}
+}
+
+// addItem counts one OpenAI reasoning item, once (from its done event).
+func (u *usageScanner) addItem(item reasoningItem) {
+	if item.Type != "reasoning" {
+		return
+	}
+	u.thinkingBlocks++
+	u.encryptedBytes += int64(len(item.EncryptedContent))
+	for _, part := range item.Summary {
+		u.summaryChars += int64(utf8.RuneCountInString(part.Text))
+	}
+}
+
 func (u *usageScanner) result() usageResult {
 	u.endMessage()
-	if u.input == 0 && u.output == 0 && len(u.whole) > 0 {
+	if !u.parsed && len(u.whole) > 0 {
 		// A non-streaming JSON body, possibly pretty-printed over many lines.
 		u.parse(bytes.TrimSpace(u.whole))
 	}
 	u.whole = nil
-	result := usageResult{output: u.output, reasoning: u.reasoning, stop: u.stop, model: u.model, done: u.done}
+	result := usageResult{output: u.output, reasoning: u.reasoning, stop: u.stop, model: u.model, done: u.done,
+		thinkingBlocks: u.thinkingBlocks, thinkingChars: u.thinkingChars, signatureBytes: u.signatureBytes,
+		redactedBytes: u.redactedBytes, encryptedBytes: u.encryptedBytes, summaryChars: u.summaryChars}
 	if u.anthropic {
 		// Anthropic reports uncached input separately from cache reads and
 		// writes; the row's input_tokens is the whole prompt.

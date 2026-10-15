@@ -19,30 +19,39 @@ import (
 // is always the whole prompt: for Claude it adds cache reads and cache
 // writes to the uncached input, for OpenAI it already includes cached input.
 type IndexRow struct {
-	Timestamp      string `json:"ts"`
-	RequestID      string `json:"request_id"`
-	Kind           string `json:"kind"`
-	RecordedBy     string `json:"recorded_by"`
-	ClientNode     string `json:"client_node"`
-	ClientUser     string `json:"client_user"`
-	ClientIP       string `json:"client_ip,omitempty"`
-	ClientName     string `json:"client_name,omitempty"`
-	UserHash       string `json:"user_hash,omitempty"`
-	Agent          string `json:"agent"`
-	SessionID      string `json:"session_id"`
-	Provider       string `json:"provider,omitempty"`
-	Upstream       string `json:"upstream,omitempty"`
-	Route          string `json:"route,omitempty"`
-	ServedBy       string `json:"served_by,omitempty"`
-	Account        string `json:"account,omitempty"`
-	ServingAccount string `json:"serving_account,omitempty"`
-	Model          string `json:"model,omitempty"`
-	ResponseModel  string `json:"response_model,omitempty"`
-	Method         string `json:"method,omitempty"`
-	Path           string `json:"path,omitempty"`
-	Status         int    `json:"status"`
-	TTFBMs         int64  `json:"ttfb_ms"`
-	DurationMs     int64  `json:"duration_ms"`
+	Timestamp  string `json:"ts"`
+	RequestID  string `json:"request_id"`
+	Kind       string `json:"kind"`
+	RecordedBy string `json:"recorded_by"`
+	ClientNode string `json:"client_node"`
+	ClientUser string `json:"client_user"`
+	ClientIP   string `json:"client_ip,omitempty"`
+	ClientName string `json:"client_name,omitempty"`
+	UserHash   string `json:"user_hash,omitempty"`
+	Agent      string `json:"agent"`
+	SessionID  string `json:"session_id"`
+	// ClientSessionID is the session id the client sent in a header
+	// (x-claude-code-session-id, Codex session or conversation id), for
+	// joining to the client's own trajectory files; ClientTurnID is its
+	// prompt or turn id when a header carries one.
+	ClientSessionID string `json:"client_session_id,omitempty"`
+	ClientTurnID    string `json:"client_turn_id,omitempty"`
+	// SessionGrouping is "fallback" when the request named no session and
+	// was grouped by the router's fallback key, else "client".
+	SessionGrouping string `json:"session_grouping"`
+	Provider        string `json:"provider,omitempty"`
+	Upstream        string `json:"upstream,omitempty"`
+	Route           string `json:"route,omitempty"`
+	ServedBy        string `json:"served_by,omitempty"`
+	Account         string `json:"account,omitempty"`
+	ServingAccount  string `json:"serving_account,omitempty"`
+	Model           string `json:"model,omitempty"`
+	ResponseModel   string `json:"response_model,omitempty"`
+	Method          string `json:"method,omitempty"`
+	Path            string `json:"path,omitempty"`
+	Status          int    `json:"status"`
+	TTFBMs          int64  `json:"ttfb_ms"`
+	DurationMs      int64  `json:"duration_ms"`
 
 	InputTokens       int64  `json:"input_tokens"`
 	CachedInputTokens int64  `json:"cached_input_tokens"`
@@ -50,6 +59,22 @@ type IndexRow struct {
 	OutputTokens      int64  `json:"output_tokens"`
 	ReasoningTokens   int64  `json:"reasoning_tokens"`
 	StopReason        string `json:"stop_reason,omitempty"`
+
+	// Reasoning settings the request asked for, and where the response's
+	// reasoning went: visible thinking text versus opaque signatures,
+	// redacted blocks and encrypted reasoning items (sizes only; nothing is
+	// decrypted).
+	ThinkingType            string `json:"thinking_type,omitempty"`
+	ThinkingDisplay         string `json:"thinking_display,omitempty"`
+	ThinkingBudget          int64  `json:"thinking_budget_tokens,omitempty"`
+	ReasoningEffort         string `json:"reasoning_effort,omitempty"`
+	ReasoningSummary        string `json:"reasoning_summary,omitempty"`
+	ThinkingBlocks          int64  `json:"thinking_blocks"`
+	ThinkingChars           int64  `json:"thinking_chars"`
+	ThinkingSignatureBytes  int64  `json:"thinking_signature_bytes"`
+	RedactedThinkingBytes   int64  `json:"redacted_thinking_bytes"`
+	ReasoningEncryptedBytes int64  `json:"reasoning_encrypted_bytes"`
+	ReasoningSummaryChars   int64  `json:"reasoning_summary_chars"`
 
 	RequestSHA256   string `json:"request_sha256,omitempty"`
 	RequestBytes    int64  `json:"request_bytes"`
@@ -119,24 +144,25 @@ func (w *segmentWriter) newCall(seg *sessionSegment, item *segmentItem) *callRow
 		metaAt:     item.at,
 		touched:    item.at,
 		row: IndexRow{
-			Timestamp:    item.at.UTC().Format(time.RFC3339Nano),
-			RequestID:    str(payload["request_id"]),
-			Kind:         "http",
-			RecordedBy:   w.cfg.Host,
-			ClientNode:   nonEmpty(str(payload["client_node"])),
-			ClientUser:   nonEmpty(str(payload["client_user"])),
-			ClientIP:     str(payload["client_ip"]),
-			ClientName:   str(payload["client_name"]),
-			UserHash:     str(payload["user_hash"]),
-			Agent:        normalizeAgentType(str(payload["agent_type"])),
-			SessionID:    str(payload["session_id"]),
-			Provider:     str(payload["provider"]),
-			Upstream:     str(payload["upstream"]),
-			Route:        str(payload["route"]),
-			Account:      str(payload["account"]),
-			Method:       str(payload["method"]),
-			Path:         str(payload["path"]),
-			LegacySource: w.source,
+			Timestamp:       item.at.UTC().Format(time.RFC3339Nano),
+			RequestID:       str(payload["request_id"]),
+			Kind:            "http",
+			RecordedBy:      w.cfg.Host,
+			ClientNode:      nonEmpty(str(payload["client_node"])),
+			ClientUser:      nonEmpty(str(payload["client_user"])),
+			ClientIP:        str(payload["client_ip"]),
+			ClientName:      str(payload["client_name"]),
+			UserHash:        str(payload["user_hash"]),
+			Agent:           normalizeAgentType(str(payload["agent_type"])),
+			SessionID:       str(payload["session_id"]),
+			SessionGrouping: sessionGrouping(str(payload["session_id"])),
+			Provider:        str(payload["provider"]),
+			Upstream:        str(payload["upstream"]),
+			Route:           str(payload["route"]),
+			Account:         str(payload["account"]),
+			Method:          str(payload["method"]),
+			Path:            str(payload["path"]),
+			LegacySource:    w.source,
 		},
 	}
 }
@@ -147,6 +173,9 @@ func (w *segmentWriter) noteMeta(seg *sessionSegment, item *segmentItem) {
 		return
 	}
 	call := w.newCall(seg, item)
+	headers := headerMap(item.payload["headers"])
+	call.row.ClientSessionID = firstHeader(headers, clientSessionHeaders)
+	call.row.ClientTurnID = firstHeader(headers, clientTurnHeaders)
 	if str(item.payload["transport"]) == "websocket" {
 		// A websocket connection carries many calls; this is their template.
 		call.row.Kind = "websocket"
@@ -186,7 +215,7 @@ func (w *segmentWriter) noteBody(seg *sessionSegment, item *segmentItem, depFram
 	call.row.RequestSHA256 = str(payload["sha256"])
 	call.row.RequestBytes = int64(len(item.body))
 	call.row.RequestEncoding = str(payload["content_encoding"])
-	call.row.Model = modelOf(item.body)
+	applyRequestHead(&call.row, item.body)
 }
 
 // noteWebSocketMessage starts a call at each client message and adds the
@@ -221,7 +250,7 @@ func (w *segmentWriter) noteWebSocketMessage(seg *sessionSegment, item *segmentI
 		call.req.extend(seg, from, to)
 		call.row.RequestSHA256 = str(payload["sha256"])
 		call.row.RequestBytes += int64(len(item.body))
-		call.row.Model = modelOf(item.body)
+		applyRequestHead(&call.row, item.body)
 		w.wsCalls[connection] = call
 		return
 	}
@@ -405,6 +434,12 @@ func (w *segmentWriter) closeCall(call *callRow, websocket bool) {
 	call.row.ReasoningTokens = usage.reasoning
 	call.row.StopReason = usage.stop
 	call.row.ResponseModel = usage.model
+	call.row.ThinkingBlocks = usage.thinkingBlocks
+	call.row.ThinkingChars = usage.thinkingChars
+	call.row.ThinkingSignatureBytes = usage.signatureBytes
+	call.row.RedactedThinkingBytes = usage.redactedBytes
+	call.row.ReasoningEncryptedBytes = usage.encryptedBytes
+	call.row.ReasoningSummaryChars = usage.summaryChars
 	if websocket {
 		call.row.Complete = usage.done
 	}
@@ -483,4 +518,85 @@ func (w *segmentWriter) flushIndexNow() {
 	_, _ = rand.Read(random[:])
 	name := fmt.Sprintf("%s/%s/%s-%d-%d-%s.jsonl.zst", w.cfg.IndexPrefix, now.Format("2006/01/02/15"), w.cfg.Host, os.Getpid(), serial, hex.EncodeToString(random[:]))
 	w.up.putBlob(name, compressed, "application/zstd")
+}
+
+// Headers that carry the client's own session and turn ids, most specific
+// first.
+var (
+	clientSessionHeaders = []string{"X-Claude-Code-Session-Id", "X-Claude-Session-Id", "X-Codex-Session-Id", "Session_id", "Session-Id", "X-Session-Id", "Conversation_id", "X-Conversation-Id", "Openai-Conversation-Id", "Thread-Id", "X-Codex-Parent-Thread-Id", "X-Codex-Window-Id", "X-Subrouter-Session"}
+	// Only ids that name a prompt or turn; per-request ids would mislabel.
+	clientTurnHeaders = []string{"X-Claude-Code-Prompt-Id", "X-Prompt-Id", "X-Codex-Turn-Id", "X-Turn-Id"}
+)
+
+func firstHeader(headers map[string][]string, names []string) string {
+	for _, name := range names {
+		for key, values := range headers {
+			if strings.EqualFold(key, name) && len(values) > 0 && strings.TrimSpace(values[0]) != "" {
+				return strings.TrimSpace(values[0])
+			}
+		}
+	}
+	return ""
+}
+
+// sessionGrouping tells a client-named session from the router's fallback
+// grouping of requests that named none.
+func sessionGrouping(sessionID string) string {
+	switch {
+	case sessionID == "":
+		return "none"
+	case strings.HasPrefix(sessionID, "fallback:"):
+		// session.ExtractID's grouping for requests that name no session.
+		return "fallback"
+	default:
+		return "client"
+	}
+}
+
+// applyRequestHead reads the model and reasoning settings of a request body
+// in one parse.
+func applyRequestHead(row *IndexRow, body []byte) {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return
+	}
+	// Each part decodes on its own, so an unexpected shape in one (a string
+	// "reasoning", a boolean "thinking") never costs the others.
+	var head struct {
+		Model           json.RawMessage `json:"model"`
+		Thinking        json.RawMessage `json:"thinking"`
+		Reasoning       json.RawMessage `json:"reasoning"`
+		ReasoningEffort json.RawMessage `json:"reasoning_effort"`
+		Response        json.RawMessage `json:"response"`
+	}
+	if json.Unmarshal(trimmed, &head) != nil {
+		return
+	}
+	_ = json.Unmarshal(head.Model, &row.Model)
+	if row.Model == "" {
+		var response struct {
+			Model string `json:"model"`
+		}
+		if json.Unmarshal(head.Response, &response) == nil {
+			row.Model = response.Model
+		}
+	}
+	var thinking struct {
+		Type         string `json:"type"`
+		Display      string `json:"display"`
+		BudgetTokens int64  `json:"budget_tokens"`
+	}
+	if json.Unmarshal(head.Thinking, &thinking) == nil {
+		row.ThinkingType, row.ThinkingDisplay, row.ThinkingBudget = thinking.Type, thinking.Display, thinking.BudgetTokens
+	}
+	var reasoning struct {
+		Effort  string `json:"effort"`
+		Summary string `json:"summary"`
+	}
+	if json.Unmarshal(head.Reasoning, &reasoning) == nil {
+		row.ReasoningEffort, row.ReasoningSummary = reasoning.Effort, reasoning.Summary
+	}
+	if row.ReasoningEffort == "" {
+		_ = json.Unmarshal(head.ReasoningEffort, &row.ReasoningEffort)
+	}
 }
