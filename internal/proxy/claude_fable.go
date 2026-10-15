@@ -288,6 +288,26 @@ func stripBedrockUnsupportedFields(body []byte) []byte {
 			changed = true
 		}
 	}
+	// Claude Code also puts output_config on messages; Bedrock refuses it
+	// there with "messages.N.output_config: Extra inputs are not permitted".
+	if raw, ok := payload["messages"]; ok {
+		var messages []map[string]json.RawMessage
+		if json.Unmarshal(raw, &messages) == nil {
+			stripped := false
+			for _, message := range messages {
+				if _, ok := message["output_config"]; ok {
+					delete(message, "output_config")
+					stripped = true
+				}
+			}
+			if stripped {
+				if rebuilt, err := json.Marshal(messages); err == nil {
+					payload["messages"] = rebuilt
+					changed = true
+				}
+			}
+		}
+	}
 	// Bedrock takes thinking.display only as "summarized" or "omitted".
 	if raw, ok := payload["thinking"]; ok {
 		var thinking map[string]json.RawMessage
