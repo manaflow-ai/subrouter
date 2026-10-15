@@ -40,7 +40,7 @@ func (e *ProbeError) Error() string {
 func NewProbeError(statusCode int, status string, header http.Header, body []byte) *ProbeError {
 	envelope := ParseErrorEnvelope(body)
 	if envelope.RequestID == "" {
-		envelope.RequestID = strings.TrimSpace(header.Get("request-id"))
+		envelope.RequestID = BoundedToken(header.Get("request-id"))
 	}
 	return &ProbeError{
 		StatusCode: statusCode, Status: status,
@@ -72,19 +72,21 @@ func ParseErrorEnvelope(body []byte) ErrorEnvelope {
 	}
 	message := strings.Join(strings.Fields(payload.Error.Message), " ")
 	if len(message) > credentialErrorMessageMax {
-		message = message[:credentialErrorMessageMax]
+		message = strings.ToValidUTF8(message[:credentialErrorMessageMax], "")
 	}
 	return ErrorEnvelope{
-		Type:      boundedToken(payload.Error.Type),
+		Type:      BoundedToken(payload.Error.Type),
 		Message:   message,
-		RequestID: boundedToken(payload.RequestID),
+		RequestID: BoundedToken(payload.RequestID),
 	}
 }
 
-func boundedToken(value string) string {
+// BoundedToken trims an identifier (an error type or request id) to 128
+// bytes for logs.
+func BoundedToken(value string) string {
 	value = strings.TrimSpace(value)
 	if len(value) > 128 {
-		value = value[:128]
+		value = strings.ToValidUTF8(value[:128], "")
 	}
 	return value
 }

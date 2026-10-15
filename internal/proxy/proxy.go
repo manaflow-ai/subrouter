@@ -2386,6 +2386,16 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				out[i] = next
 				return
 			}
+			if since, dead := claudeCredentialRevokedSince(r.claudeCostStore(), credential); dead {
+				// Refreshing a dead credential would give it a new fingerprint
+				// and silently return it to routing.
+				next := out[i]
+				next.AuthValid = true
+				next.RevokedSince = since.UTC()
+				next.RevokedKind = r.claudeCostStore().snapshot().Revoked[credential.ID].kind()
+				out[i] = next
+				return
+			}
 			account, details, didRefresh, err := r.claudeStore.RefreshCredentialDetailsIfExpired(sweepCtx, r.client, profile)
 			r.noteCredResult(credential, err)
 			next := out[i]
@@ -4959,6 +4969,14 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 					livenessOnly = true
 				}
 			}
+		}
+		if _, revoked := claudeCredentialRevokedSince(s.claudeCostStore(), account); revoked {
+			// Refreshing a dead credential would give it a new fingerprint
+			// and silently return it to routing.
+			scoreMu.Lock()
+			setZeroScore(scores, scoreByID, schedulerAccountProvider(account.Provider), account.ID)
+			scoreMu.Unlock()
+			continue
 		}
 		if failure, dead := s.AccountRef.terminalCredFailure(account); dead {
 			if s.Logger != nil {
@@ -8370,7 +8388,7 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 					envelope.Message = ""
 				}
 				if envelope.RequestID == "" {
-					envelope.RequestID = response.Header.Get("request-id")
+					envelope.RequestID = agentclaude.BoundedToken(response.Header.Get("request-id"))
 				}
 				s.Logger.Warn("claude account unusable upstream body",
 					"agent", agentType,
@@ -11351,9 +11369,14 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// Record the credential this attempt used: a concurrent re-login
 			// must not be marked dead by a late response. The body is decoded
 			// first, so a compressed error envelope is still classified.
+			deathCredential := accountCredential
+			if selected := a.current(); deathCredential == "" && selected.ID == accountID {
+				deathCredential = selected.CredentialIdentity()
+			}
 			kind := t.server.noteClaudeCredentialResponse(
-				accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential},
-				response.StatusCode, response.Header, peekResponseBodyPrefix(response), t.session, t.path,
+				accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: deathCredential},
+				response.StatusCode, response.Header, decodedUpstreamBody(peekResponseBodyPrefix(response), response.Header),
+				t.session, t.path,
 			)
 			if kind == agentclaude.CredentialDeathOrgOAuthDisallowed && !persistentAuthorizationDenial {
 				persistentAuthorizationDenial = true

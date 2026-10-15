@@ -6,7 +6,6 @@ import (
 	"compress/flate"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -44,7 +43,9 @@ const ClaudeCredentialDeathsPath = "/_subrouter/claude-credential-deaths"
 
 const (
 	claudeCredentialLedgerFile = "claude-credential-deaths.jsonl"
-	claudeCredentialLastOKFile = "claude-credential-last-ok.json"
+	// Not *.json: the account store dir parses every *.json file as an
+	// account record.
+	claudeCredentialLastOKFile = "claude-credential-last-ok.state"
 	// claudeLivenessProbeInterval bounds liveness probes of accounts the
 	// usage sweep otherwise skips (exhausted until a known reset).
 	claudeLivenessProbeInterval = 15 * time.Minute
@@ -267,9 +268,6 @@ func (h *claudeCredentialHealth) flushLastOK(snapshot map[string]time.Time) {
 	}
 }
 
-// claudeLastOKFileShape wraps the map in one named key: the account store
-// dir parses every *.json file as an account record, so account IDs must not
-// be top-level keys there.
 type claudeLastOKFileShape struct {
 	LastOK map[string]time.Time `json:"claude_last_ok"`
 }
@@ -282,12 +280,24 @@ func writeFileAtomic(path string, value any) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	// A unique dot-file temp keeps two workers (during a swap) from writing
+	// one temp file, and keeps it out of the account store's listing.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".claude-last-ok-*")
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	name := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		_ = os.Remove(name)
 		return err
 	}
 	return nil
@@ -410,9 +420,12 @@ func formatOptionalTime(at *time.Time) string {
 }
 
 // noteClaudeCredentialAlive records a successful Messages answer for the
-// account's current credential. When the account was recorded dead (an
-// older credential before a re-login, or this one before its organization
-// was re-enabled), the record is cleared and the recovery logged once.
+// account's current credential. When the account was recorded dead with an
+// older credential (a re-login replaced it), the record is cleared and the
+// recovery logged once. A record for the current credential is never
+// cleared here: a live answer for it can only be one that was in flight
+// when the death was recorded, since dead credentials are not routed or
+// probed.
 func noteClaudeCredentialAlive(costs *claudeCostStore, health *claudeCredentialHealth, account accounts.Account, credentialIdentity func() string, source string) {
 	if health == nil || account.ID == "" {
 		return
@@ -426,10 +439,7 @@ func noteClaudeCredentialAlive(costs *claudeCostStore, health *claudeCredentialH
 		return
 	}
 	identity := credentialIdentity()
-	if identity != "" && state.CredentialFingerprint == claudeCredentialFingerprint(identity) && source == claudeDeathSourceProxy {
-		// A proxy success for the very credential recorded dead can only be
-		// a response that was already in flight; the probe decides recovery
-		// of an unchanged credential.
+	if identity == "" || state.CredentialFingerprint == claudeCredentialFingerprint(identity) {
 		return
 	}
 	prior, cleared := costs.clearDead(account.ID)
@@ -455,15 +465,16 @@ func (s Server) claudeOAuthDeathCandidate(account accounts.Account) bool {
 }
 
 // noteClaudeCredentialResponse classifies a Claude 401/403 answer by its
-// decoded error envelope and records a credential death. It returns the
-// death kind, or "" when the answer is not one.
-func (s Server) noteClaudeCredentialResponse(account accounts.Account, status int, header http.Header, body []byte, session, path string) string {
+// error envelope (decodedBody: already decoded with decodedUpstreamBody) and
+// records a credential death. It returns the death kind, or "" when the
+// answer is not one.
+func (s Server) noteClaudeCredentialResponse(account accounts.Account, status int, header http.Header, decodedBody []byte, session, path string) string {
 	if (status != http.StatusUnauthorized && status != http.StatusForbidden) || !s.claudeOAuthDeathCandidate(account) {
 		return ""
 	}
-	envelope := agentclaude.ParseErrorEnvelope(decodedUpstreamBody(body, header))
+	envelope := agentclaude.ParseErrorEnvelope(decodedBody)
 	if envelope.RequestID == "" {
-		envelope.RequestID = strings.TrimSpace(header.Get("request-id"))
+		envelope.RequestID = agentclaude.BoundedToken(header.Get("request-id"))
 	}
 	kind := agentclaude.ClassifyCredentialDeath(status, envelope.Type, envelope.Message)
 	if kind == "" {
@@ -484,9 +495,11 @@ func (s Server) noteClaudeCredentialResponse(account accounts.Account, status in
 	return kind
 }
 
-// noteClaudeProxySuccess records a successful Claude Messages answer.
+// noteClaudeProxySuccess records a successful Claude Messages answer. It
+// runs on every 2xx, so it skips the auth-mode lookup: an API key never has
+// a dead record, and its last-ok time is harmless.
 func (s Server) noteClaudeProxySuccess(account accounts.Account) {
-	if !s.claudeOAuthDeathCandidate(account) {
+	if account.ID == "" || account.AuthMode == accounts.AuthModeAPIKey {
 		return
 	}
 	costs := s.claudeCosts
@@ -595,7 +608,9 @@ func decodedUpstreamBody(body []byte, header http.Header) []byte {
 		return body
 	}
 	decoded, err := io.ReadAll(io.LimitReader(reader, claudeErrorBodyMax))
-	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) || len(decoded) == 0 {
+	if len(decoded) == 0 || (err != nil && !json.Valid(decoded)) {
+		// A failed decode (for example raw-deflate garbage from a body that
+		// was never compressed) keeps the original bytes.
 		return body
 	}
 	return decoded

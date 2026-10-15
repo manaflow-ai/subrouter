@@ -4398,12 +4398,27 @@ type FableProbeResult struct {
 	StatusCode int
 	Windows    []accounts.UsageWindow
 	Failure    *ProbeError
+	// quotaHeaders is set when the answer carried anthropic-ratelimit-unified-*
+	// headers, which only an authenticated credential gets.
+	quotaHeaders bool
 }
 
-// Alive reports whether the Messages API accepted this credential. A 429
-// is a quota or burst answer that only an authenticated credential gets.
+// Alive reports whether the Messages API accepted this credential: a 2xx,
+// or a 429 that carries the account's unified quota headers. A headerless
+// 429 can come from an edge limit before authentication, so it proves
+// nothing.
 func (r FableProbeResult) Alive() bool {
-	return (r.StatusCode >= 200 && r.StatusCode < 300) || r.StatusCode == http.StatusTooManyRequests
+	return (r.StatusCode >= 200 && r.StatusCode < 300) ||
+		(r.StatusCode == http.StatusTooManyRequests && r.quotaHeaders)
+}
+
+func hasUnifiedQuotaHeaders(header http.Header) bool {
+	for key := range header {
+		if strings.HasPrefix(strings.ToLower(key), "anthropic-ratelimit-unified-") {
+			return true
+		}
+	}
+	return false
 }
 
 // FableProbe sends the Claude Code shaped Messages probe and reports its
@@ -4425,7 +4440,10 @@ func FableProbe(ctx context.Context, client *http.Client, accessToken string) (F
 	}
 	defer res.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))
-	result := FableProbeResult{StatusCode: res.StatusCode, Windows: usageWindowsFromFableHeaders(res.Header, time.Now())}
+	result := FableProbeResult{
+		StatusCode: res.StatusCode, Windows: usageWindowsFromFableHeaders(res.Header, time.Now()),
+		quotaHeaders: hasUnifiedQuotaHeaders(res.Header),
+	}
 	if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
 		failure := NewProbeError(res.StatusCode, res.Status, res.Header, body)
 		if res.StatusCode == http.StatusUnauthorized || ClassifyCredentialDeath(res.StatusCode, failure.ErrorType, failure.Message) != "" {
