@@ -5513,6 +5513,9 @@ func (s Server) proxyHandler() http.Handler {
 			http.Error(w, "session lease required", http.StatusUnauthorized)
 			return
 		}
+		if serveCodexWorkspaceDiscovery(w, r) {
+			return
+		}
 		if requestProvider == accounts.ProviderCodex && codexLivePath(r.URL.Path) && r.URL.Path != "/v1/live" && s.Upstream == nil {
 			callID := strings.TrimPrefix(r.URL.Path, "/v1/live/")
 			assignment, ok := s.Sessions.Get("codex-realtime", sessionID+":"+callID)
