@@ -115,6 +115,7 @@ type SegmentExporter struct {
 	host     string
 	source   string
 	footer   bool
+	err      error
 }
 
 type exportStream struct {
@@ -140,7 +141,7 @@ func NewSegmentExporter(emit func(ExportRecord) error) *SegmentExporter {
 // ReadSegment processes one decompressed segment stream.
 func (x *SegmentExporter) ReadSegment(name string, r io.Reader) error {
 	x.Stats.Segments++
-	x.segment, x.host, x.footer = name, "", false
+	x.segment, x.host, x.footer, x.source = name, "", false, ""
 	x.bases = map[string][]deltaBase{}
 	reader := bufio.NewReaderSize(r, 4<<20)
 	for {
@@ -164,7 +165,7 @@ func (x *SegmentExporter) ReadSegment(name string, r io.Reader) error {
 	if !x.footer {
 		x.Stats.MissingFooters++
 	}
-	return nil
+	return x.err
 }
 
 func (x *SegmentExporter) handleLine(line []byte) error {
@@ -400,7 +401,7 @@ func (x *SegmentExporter) exportBody(body []byte, payload map[string]any) *Expor
 		x.Stats.Mismatched++
 	}
 	switch {
-	case len(body) > 0 && json.Valid(body) && (body[0] == '{' || body[0] == '['):
+	case len(bytes.TrimSpace(body)) > 0 && json.Valid(body) && (bytes.TrimSpace(body)[0] == '{' || bytes.TrimSpace(body)[0] == '['):
 		exported.JSON = append(json.RawMessage(nil), body...)
 	case utf8.Valid(body):
 		text := string(body)
@@ -416,8 +417,8 @@ func (x *SegmentExporter) emit(record ExportRecord) {
 		return
 	}
 	x.Stats.Records++
-	if x.Emit != nil {
-		_ = x.Emit(record)
+	if x.Emit != nil && x.err == nil {
+		x.err = x.Emit(record)
 	}
 }
 
@@ -671,7 +672,7 @@ func ExportCall(row IndexRow, read RangeReader) (CallBodies, error) {
 	// bodies decide.
 	_ = failed
 	out.Verified = out.Request != nil && out.Request.Verified && out.Request.SHA256 == row.RequestSHA256
-	if !websocket && row.ResponseSHA256 != "" {
+	if !websocket && row.ResponseSHA256 != "" && !row.ResponseSplit {
 		out.Verified = out.Verified && out.Response != nil && out.Response.Verified && out.Response.SHA256 == row.ResponseSHA256
 	}
 	return out, nil

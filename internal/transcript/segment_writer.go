@@ -245,6 +245,12 @@ type sessionSegment struct {
 	bodyBytes  int64
 	streams    map[string]*pendingStream
 	sources    map[string]bool
+	// checkpointed is when blocks were last made durable by an interim
+	// commit; final marks the last commit, which adds the seek table.
+	checkpointed time.Time
+	final        bool
+	commitMu     sync.Mutex
+	committedAll bool
 }
 
 func withSegmentDefaults(cfg SegmentConfig) SegmentConfig {
@@ -483,6 +489,8 @@ func (w *segmentWriter) housekeeping() {
 			w.sealSession(seg, "idle")
 		case now.Sub(seg.started) >= w.cfg.MaxSegmentAge:
 			w.sealSession(seg, "age")
+		case now.Sub(seg.checkpointed) >= segmentCheckpoint && (len(seg.raw) > 0 || len(seg.pendingBlock) > 0):
+			w.checkpoint(seg)
 		}
 	}
 	for id, call := range w.calls {
@@ -565,11 +573,22 @@ func (w *segmentWriter) afterWrite(seg *sessionSegment) {
 		w.sealSession(seg, "size")
 	}
 	for w.liveBytes > w.cfg.LiveBytes && len(w.sessions) > 0 {
-		var oldest *sessionSegment
+		// Delta bases are only an optimization: drop the least recently
+		// active session's bases first (its next body is stored whole), and
+		// commit a session early only when no bases are left to drop.
+		var oldest, oldestWithBases *sessionSegment
 		for _, candidate := range w.sessions {
 			if oldest == nil || candidate.lastWrite.Before(oldest.lastWrite) {
 				oldest = candidate
 			}
+			if candidate.deltaBytes > 0 && (oldestWithBases == nil || candidate.lastWrite.Before(oldestWithBases.lastWrite)) {
+				oldestWithBases = candidate
+			}
+		}
+		if oldestWithBases != nil {
+			w.liveBytes -= oldestWithBases.deltaBytes
+			oldestWithBases.deltas, oldestWithBases.deltaBytes = map[string]*deltaChain{}, 0
+			continue
 		}
 		w.sealSession(oldest, "memory")
 	}
@@ -597,7 +616,7 @@ func (w *segmentWriter) segmentFor(item *segmentItem) *sessionSegment {
 	seg = &sessionSegment{
 		key: key, agent: agent, session: session,
 		blob:    fmt.Sprintf("%s/%s/%s/%s/%s/%s.zst", w.cfg.BodiesPrefix, now.UTC().Format("2006/01/02/15"), w.cfg.Host, safeFilename(normalizeAgentType(agent)), safeFilename(session), segID),
-		started: now, lastWrite: now,
+		started: now, lastWrite: now, checkpointed: now,
 		deltas:  map[string]*deltaChain{},
 		streams: map[string]*pendingStream{},
 		sources: map[string]bool{},
@@ -812,6 +831,7 @@ func (w *segmentWriter) addChunk(seg *sessionSegment, item *segmentItem) {
 		seg.streams[item.streamID] = stream
 	}
 	w.noteChunk(seg, item)
+	seg.lastWrite = w.cfg.Now()
 	stream.data = append(stream.data, item.body...)
 	w.liveBytes += int64(len(item.body))
 	seg.bodyBytes += int64(len(item.body))
@@ -954,12 +974,15 @@ func (w *segmentWriter) sealSession(seg *sessionSegment, reason string) {
 		"write_errors":           w.writeErrors.Load(),
 	})
 	w.closeFrame(seg)
-	seg.pendingBlock = append(seg.pendingBlock, seekTable(seg.frames)...)
+	table := seekTable(seg.frames)
+	seg.pendingBlock = append(seg.pendingBlock, table...)
+	w.liveBytes += int64(len(table))
+	seg.final = true
 	w.stageBlock(seg)
 	w.liveBytes -= seg.deltaBytes
 	seg.deltas, seg.deltaBytes = nil, 0
 	delete(w.sessions, seg.key)
-	if reason == "idle" || reason == "close" || reason == "memory" || reason == "sync" {
+	if reason == "idle" || reason == "close" || reason == "sync" {
 		// The session went quiet: calls still open in it will not finish.
 		for id, call := range w.calls {
 			if call.sessionKey == seg.key {
@@ -985,6 +1008,22 @@ func (w *segmentWriter) sealSession(seg *sessionSegment, reason string) {
 		w.onSeal(seg)
 	}
 	w.up.commit(seg, metadata)
+}
+
+// segmentCheckpoint is how often an open segment's events are made durable.
+// Uncommitted blocks vanish if the process dies, and the writer's credential
+// cannot read them back, so an open segment is committed as it stands (whole
+// zstd frames, no seek table yet) at this interval.
+const segmentCheckpoint = 5 * time.Minute
+
+func (w *segmentWriter) checkpoint(seg *sessionSegment) {
+	seg.checkpointed = w.cfg.Now()
+	w.closeFrame(seg)
+	w.stageBlock(seg)
+	if len(seg.blockIDs) == 0 {
+		return
+	}
+	w.up.checkpoint(seg, append([]string(nil), seg.blockIDs...))
 }
 
 // seekTable renders the Zstandard seekable format's seek table: a skippable

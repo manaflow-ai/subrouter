@@ -203,14 +203,31 @@ func transcriptsExport(args []string, verifyOnly bool) error {
 	if err != nil {
 		return err
 	}
-	prefixes, err := datePrefixes("index/v1/", *from, *to)
+	// Index blobs are named by when they were written, up to an hour or so
+	// after the call; read one more day and keep rows by call time.
+	first, last, err := dateRange(*from, *to)
 	if err != nil {
 		return err
+	}
+	prefixes, err := datePrefixes("index/v1/", first.Format("2006-01-02"), last.AddDate(0, 0, 1).Format("2006-01-02"))
+	if err != nil {
+		return err
+	}
+	inRange := func(row transcript.IndexRow) bool {
+		day := row.Timestamp
+		if len(day) >= 10 {
+			day = day[:10]
+		}
+		return day >= first.Format("2006-01-02") && day <= last.Format("2006-01-02")
 	}
 	var rows []transcript.IndexRow
 	for _, prefix := range prefixes {
 		var parts []string
-		if err := client.ListBlobs(ctx, prefix, func(entry transcript.AzureBlobEntry) error {
+		listPrefix := prefix
+		if client.Prefix() != "" {
+			listPrefix = client.Prefix() + "/" + prefix
+		}
+		if err := client.ListBlobs(ctx, listPrefix, func(entry transcript.AzureBlobEntry) error {
 			parts = append(parts, entry.Name)
 			return nil
 		}); err != nil {
@@ -222,7 +239,7 @@ func transcriptsExport(args []string, verifyOnly bool) error {
 				return err
 			}
 			err = transcript.ReadIndexRows(body, func(row transcript.IndexRow) error {
-				if (*session == "" || row.SessionID == *session || transcript.BaseSessionID(row.SessionID) == *session) && (*call == "" || row.RequestID == *call) {
+				if inRange(row) && (*session == "" || row.SessionID == *session || transcript.BaseSessionID(row.SessionID) == *session) && (*call == "" || row.RequestID == *call) {
 					rows = append(rows, row)
 				}
 				return nil
@@ -237,40 +254,45 @@ func transcriptsExport(args []string, verifyOnly bool) error {
 	read := func(blob string, offset, length int64) ([]byte, error) {
 		return client.ReadRange(ctx, blob, offset, length)
 	}
-	results := make([]transcript.CallBodies, len(rows))
-	errs := make([]error, len(rows))
-	var next atomic.Int64
-	var wg sync.WaitGroup
-	for i := 0; i < max(1, *workers); i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				index := int(next.Add(1) - 1)
-				if index >= len(rows) || ctx.Err() != nil {
-					return
-				}
-				results[index], errs[index] = transcript.ExportCall(rows[index], read)
-			}
-		}()
-	}
-	wg.Wait()
+	// Calls are rebuilt in windows, so memory holds one window of bodies.
+	const window = 256
 	var verified, failed, lost int
-	for index, result := range results {
-		switch {
-		case errs[index] != nil:
-			failed++
-			fmt.Fprintf(os.Stderr, "%s: %v\n", rows[index].RequestID, errs[index])
-			continue
-		case rows[index].BodyLost:
-			lost++
-		case result.Verified:
-			verified++
-		default:
-			failed++
+	for start := 0; start < len(rows) && ctx.Err() == nil; start += window {
+		batch := rows[start:min(start+window, len(rows))]
+		results := make([]transcript.CallBodies, len(batch))
+		errs := make([]error, len(batch))
+		var next atomic.Int64
+		var wg sync.WaitGroup
+		for i := 0; i < max(1, *workers); i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					index := int(next.Add(1) - 1)
+					if index >= len(batch) || ctx.Err() != nil {
+						return
+					}
+					results[index], errs[index] = transcript.ExportCall(batch[index], read)
+				}
+			}()
 		}
-		if err := encoder.Encode(result); err != nil {
-			return err
+		wg.Wait()
+		for index, result := range results {
+			switch {
+			case errs[index] != nil:
+				failed++
+				fmt.Fprintf(os.Stderr, "%s: %v\n", batch[index].RequestID, errs[index])
+				continue
+			case batch[index].BodyLost:
+				lost++
+			case result.Verified:
+				verified++
+			default:
+				failed++
+			}
+			if err := encoder.Encode(result); err != nil {
+				return err
+			}
 		}
 	}
 	summary, _ := json.Marshal(map[string]int{"calls": len(rows), "verified": verified, "failed": failed, "body_lost": lost})
@@ -279,6 +301,26 @@ func transcriptsExport(args []string, verifyOnly bool) error {
 		return fmt.Errorf("%d calls did not rebuild exactly", failed)
 	}
 	return nil
+}
+
+func dateRange(from, to string) (time.Time, time.Time, error) {
+	start := time.Now().UTC().Truncate(24 * time.Hour)
+	if from != "" {
+		parsed, err := time.Parse("2006-01-02", from)
+		if err != nil {
+			return start, start, fmt.Errorf("--from: %w", err)
+		}
+		start = parsed
+	}
+	end := start
+	if to != "" {
+		parsed, err := time.Parse("2006-01-02", to)
+		if err != nil {
+			return start, start, fmt.Errorf("--to: %w", err)
+		}
+		end = parsed
+	}
+	return start, end, nil
 }
 
 func datePrefixes(base, from, to string) ([]string, error) {
@@ -407,6 +449,8 @@ func transcriptsRecompress(args []string) error {
 		return err
 	}
 	var deleted, kept atomic.Int64
+	var storedSources []string
+	deleteStored := func() {}
 	started := time.Now()
 	switch {
 	case *localDir != "":
@@ -414,20 +458,27 @@ func transcriptsRecompress(args []string) error {
 		var mu sync.Mutex
 		converter.OnSourceStored = func(source string, ok bool) {
 			mu.Lock()
-			file, found := sources[source]
-			mu.Unlock()
-			if !found || !*deleteSources || !ok {
-				kept.Add(1)
-				return
+			defer mu.Unlock()
+			if ok {
+				storedSources = append(storedSources, source)
 			}
-			info, err := os.Stat(file.path)
-			if err != nil || info.Size() != file.size || !info.ModTime().Equal(file.modTime) {
-				// Appended to after it was read: keep it for the next run.
-				kept.Add(1)
-				return
-			}
-			if os.Remove(file.path) == nil {
-				deleted.Add(1)
+		}
+		// Files go only after Close, which also writes the index rows that
+		// point at their segments.
+		deleteStored = func() {
+			mu.Lock()
+			defer mu.Unlock()
+			for _, source := range storedSources {
+				file := sources[source]
+				info, err := os.Stat(file.path)
+				if !*deleteSources || err != nil || info.Size() != file.size || !info.ModTime().Equal(file.modTime) {
+					// Appended to after it was read: keep it for the next run.
+					kept.Add(1)
+					continue
+				}
+				if os.Remove(file.path) == nil {
+					deleted.Add(1)
+				}
 			}
 		}
 		files, err := quietLegacyFiles(filepath.Join(*localDir, "by-agent"), *quiet, *match)
@@ -485,6 +536,9 @@ func transcriptsRecompress(args []string) error {
 		return errors.New("give --local-dir or --source")
 	}
 	closeErr := converter.Close()
+	if closeErr == nil {
+		deleteStored()
+	}
 	stats := converter.Stats()
 	summary, _ := json.Marshal(map[string]any{
 		"sources": converter.Sources, "source_bytes": converter.SourceBytes,

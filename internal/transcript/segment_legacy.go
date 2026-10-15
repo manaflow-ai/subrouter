@@ -142,9 +142,6 @@ func (c *LegacyConverter) Convert(source string, r io.Reader) error {
 		summary["sha256"] = hex.EncodeToString(sum[:])
 		c.emitStream(id, stream, summary, stream.at)
 	}
-	c.mu.Lock()
-	c.finished[source] = true
-	c.mu.Unlock()
 	for _, seg := range c.w.sessions {
 		if seg.sources[source] {
 			c.w.sealSession(seg, "source")
@@ -157,12 +154,16 @@ func (c *LegacyConverter) Convert(source string, r io.Reader) error {
 		}
 	}
 	c.needBody, c.needResp = map[string][]string{}, map[string][]string{}
-	// A source with no events has nothing pending.
+	// Every segment holding the source is sealed (and counted in pending)
+	// by now; from here settle may report it, or this check does when all
+	// of them already settled.
 	c.mu.Lock()
+	c.finished[source] = true
 	ready := c.pending[source] == 0
 	stored := !c.failed[source] && !c.mismatchBy[source]
 	if ready {
 		delete(c.finished, source)
+		delete(c.pending, source)
 	}
 	c.mu.Unlock()
 	if ready && c.OnSourceStored != nil {
@@ -206,8 +207,7 @@ func copyPayload(payload map[string]any) map[string]any {
 func (c *LegacyConverter) convertLine(source string, line []byte, streams map[string]*legacyStream, order *[]string) {
 	var event Event
 	if err := json.Unmarshal(line, &event); err != nil {
-		// Keep an unparseable line verbatim rather than lose it.
-		c.w.process(&segmentItem{kind: itemEvent, at: time.Now(), eventType: "legacy_unparsed_line", payload: map[string]any{"line": string(bytes.TrimRight(line, "\n"))}})
+		c.keepUnparsed(source, line)
 		return
 	}
 	at, err := time.Parse(time.RFC3339Nano, event.Timestamp)
@@ -224,7 +224,7 @@ func (c *LegacyConverter) convertLine(source string, line []byte, streams map[st
 		encoded, _ := payload["body_base64"].(string)
 		chunk, err := base64.StdEncoding.DecodeString(encoded)
 		if err != nil {
-			c.Mismatched++
+			c.keepUnparsed(source, line)
 			return
 		}
 		stream := streams[streamID]
@@ -248,14 +248,16 @@ func (c *LegacyConverter) convertLine(source string, line []byte, streams map[st
 		sum := sha256.Sum256(stream.data)
 		if hex.EncodeToString(sum[:]) != str(payload["sha256"]) {
 			c.Mismatched++
+			c.mu.Lock()
 			c.mismatchBy[source] = true
+			c.mu.Unlock()
 		}
 		c.emitStream(streamID, stream, copyPayload(payload), at)
 	case payload["body_base64"] != nil:
 		encoded, _ := payload["body_base64"].(string)
 		body, err := base64.StdEncoding.DecodeString(encoded)
 		if err != nil {
-			c.Mismatched++
+			c.keepUnparsed(source, line)
 			return
 		}
 		base := copyPayload(payload)
@@ -362,4 +364,17 @@ func gunzipComplete(data []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return decoded, true
+}
+
+// keepUnparsed stores a line the converter cannot read, verbatim (as text
+// when it is UTF-8), in the source's session segment, and marks the source
+// so its file is kept.
+func (c *LegacyConverter) keepUnparsed(source string, line []byte) {
+	c.Mismatched++
+	c.mu.Lock()
+	c.mismatchBy[source] = true
+	c.mu.Unlock()
+	payload := map[string]any{"agent_type": "legacy", "session_id": source}
+	putBody(payload, bytes.TrimRight(line, "\n"))
+	c.w.process(&segmentItem{kind: itemEvent, at: time.Now(), eventType: "legacy_unparsed_line", payload: payload})
 }

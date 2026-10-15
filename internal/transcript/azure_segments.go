@@ -168,9 +168,10 @@ func (s *AzureBlobSyncer) PutBlob(ctx context.Context, blob string, data []byte,
 	return s.put(ctx, s.blobName(blob), "", headers, data)
 }
 
-// ReadRange reads [offset, offset+length) of a container-relative blob.
+// ReadRange reads [offset, offset+length) of a blob named relative to the
+// client's prefix, as index rows name them.
 func (s *AzureBlobSyncer) ReadRange(ctx context.Context, name string, offset, length int64) ([]byte, error) {
-	req, err := s.newRequest(ctx, http.MethodGet, name, "", map[string]string{
+	req, err := s.newRequest(ctx, http.MethodGet, s.blobName(name), "", map[string]string{
 		"x-ms-range": fmt.Sprintf("bytes=%d-%d", offset, offset+length-1),
 	}, nil, 0)
 	if err != nil {

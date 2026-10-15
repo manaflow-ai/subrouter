@@ -172,7 +172,9 @@ func (w *segmentWriter) noteBody(seg *sessionSegment, item *segmentItem, depFram
 	}
 	direction := str(payload["direction"])
 	if item.eventType == "websocket_message" {
-		w.noteWebSocketMessage(seg, item, frame, frame)
+		// depFrame: a delta-encoded client message needs its chain's first
+		// body to rebuild.
+		w.noteWebSocketMessage(seg, item, depFrame, frame)
 		return
 	}
 	call := w.calls[requestID]
@@ -194,12 +196,20 @@ func (w *segmentWriter) noteWebSocketMessage(seg *sessionSegment, item *segmentI
 	connection := str(payload["request_id"])
 	direction := str(payload["direction"])
 	if direction == "client_to_upstream" {
+		if previous := w.wsCalls[connection]; previous != nil && previous.streamID == str(payload["stream_id"]) {
+			// The end of a client message whose chunks already started it.
+			previous.req.extend(seg, from, to)
+			previous.row.RequestSHA256 = str(payload["sha256"])
+			previous.row.RequestBytes, _ = jsonInt64(payload["bytes"])
+			return
+		}
 		if previous := w.wsCalls[connection]; previous != nil {
 			w.closeCall(previous, true)
 			delete(w.wsCalls, connection)
 		}
 		call := &callRow{sessionKey: seg.key, connection: connection, metaAt: item.at, touched: item.at}
 		if template := w.wsConns()[connection]; template != nil {
+			template.touched = item.at
 			call.row = template.row
 		} else {
 			call.row = IndexRow{Kind: "websocket", RecordedBy: w.cfg.Host, Agent: normalizeAgentType(str(payload["agent_type"])), SessionID: str(payload["session_id"]), ClientNode: UnknownAttribution, ClientUser: UnknownAttribution}
@@ -248,6 +258,14 @@ func (w *segmentWriter) noteChunk(seg *sessionSegment, item *segmentItem) {
 		return
 	}
 	if item.eventType == "websocket_message" {
+		if str(item.payload["direction"]) == "client_to_upstream" {
+			// A client message too large to hold whole starts its call at
+			// its first chunk, so the chunks fall inside the call's range.
+			if call := w.wsCalls[requestID]; call == nil || call.streamID != str(item.payload["stream_id"]) {
+				w.noteWebSocketMessage(seg, &segmentItem{kind: itemChunk, at: item.at, eventType: item.eventType, payload: item.payload}, len(seg.frames), len(seg.frames))
+			}
+			return
+		}
 		if call := w.wsCalls[requestID]; call != nil && str(item.payload["direction"]) == "upstream_to_client" {
 			call.touched = item.at
 			if call.firstByte.IsZero() {

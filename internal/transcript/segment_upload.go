@@ -13,9 +13,10 @@ import (
 // segmentUpload tracks one segment's staged blocks and its commit.
 type segmentUpload struct {
 	// guarded by uploadPool.mu
-	pending    int
-	failed     bool
-	commitTask *uploadTask
+	pending        int
+	failed         bool
+	commitTask     *uploadTask
+	checkpointTask *uploadTask
 	// guarded by uploadPool.rowsMu
 	stored  bool
 	lost    bool
@@ -32,6 +33,7 @@ const (
 	uploadBlock uploadKind = iota
 	uploadCommit
 	uploadBlob
+	uploadCheckpoint
 )
 
 type uploadTask struct {
@@ -42,6 +44,7 @@ type uploadTask struct {
 	data     []byte
 	meta     map[string]string
 	size     int64
+	blockIDs []string
 }
 
 // uploadPool runs block uploads, commits and index writes on a few
@@ -101,6 +104,20 @@ func (p *uploadPool) putBlob(blob string, data []byte, contentType string) {
 	p.push(&uploadTask{kind: uploadBlob, blob: blob, data: data, meta: map[string]string{"content_type": contentType}, size: int64(len(data))})
 }
 
+// checkpoint queues an interim commit of the blocks staged so far.
+func (p *uploadPool) checkpoint(seg *sessionSegment, blockIDs []string) {
+	task := &uploadTask{kind: uploadCheckpoint, seg: seg, upload: seg.upload, blob: seg.blob, blockIDs: blockIDs,
+		meta: map[string]string{"subrouter_format": "segment-v1", "open": "true"}}
+	p.mu.Lock()
+	if seg.upload.pending > 0 {
+		seg.upload.checkpointTask = task
+		p.mu.Unlock()
+		return
+	}
+	p.mu.Unlock()
+	p.push(task)
+}
+
 // commit queues the block list once every block of the segment is staged.
 func (p *uploadPool) commit(seg *sessionSegment, metadata map[string]string) {
 	task := &uploadTask{kind: uploadCommit, seg: seg, upload: seg.upload, blob: seg.blob, meta: metadata}
@@ -152,23 +169,42 @@ func (p *uploadPool) run(task *uploadTask) {
 		if err != nil {
 			task.upload.failed = true
 		}
-		var commit *uploadTask
-		if task.upload.pending == 0 && task.upload.commitTask != nil {
-			commit = task.upload.commitTask
-			task.upload.commitTask = nil
+		var ready []*uploadTask
+		if task.upload.pending == 0 {
+			for _, parked := range []**uploadTask{&task.upload.checkpointTask, &task.upload.commitTask} {
+				if *parked != nil {
+					ready = append(ready, *parked)
+					*parked = nil
+				}
+			}
 		}
 		p.mu.Unlock()
 		if err != nil {
 			p.w.cfg.Logger.Warn("transcript block upload failed", "blob", task.blob, "error", err)
 		}
-		if commit != nil {
-			p.push(commit)
+		for _, next := range ready {
+			p.push(next)
 		}
+	case uploadCheckpoint:
+		p.mu.Lock()
+		failed := task.upload.failed
+		p.mu.Unlock()
+		task.seg.commitMu.Lock()
+		if !failed && !task.seg.committedAll {
+			// A failed checkpoint is not fatal: the final commit stores the
+			// same blocks.
+			_ = p.retry(func(ctx context.Context) error {
+				return p.w.cfg.Uploader.PutBlockList(ctx, task.blob, task.blockIDs, "application/zstd", task.meta)
+			})
+		}
+		task.seg.commitMu.Unlock()
 	case uploadCommit:
 		p.mu.Lock()
 		failed := task.upload.failed
 		p.mu.Unlock()
 		ok := false
+		task.seg.commitMu.Lock()
+		defer task.seg.commitMu.Unlock()
 		if !failed {
 			err := p.retry(func(ctx context.Context) error {
 				return p.w.cfg.Uploader.PutBlockList(ctx, task.blob, task.seg.blockIDs, "application/zstd", task.meta)
@@ -179,6 +215,7 @@ func (p *uploadPool) run(task *uploadTask) {
 				p.w.cfg.Logger.Warn("transcript segment commit failed", "blob", task.blob, "error", err)
 			}
 		}
+		task.seg.committedAll = true
 		if ok {
 			p.committed.Add(1)
 			p.committedBytes.Add(task.seg.compressed)
@@ -306,7 +343,7 @@ func (p *uploadPool) onSettled(seg *sessionSegment, fn func(ok bool)) {
 
 // waitIdle returns when no task is queued or running, or ctx ends.
 func (p *uploadPool) waitIdle(ctx context.Context) {
-	stop := context.AfterFunc(ctx, func() { p.cond.Broadcast() })
+	stop := context.AfterFunc(ctx, p.wake)
 	defer stop()
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -322,13 +359,21 @@ func (p *uploadPool) waitingCommits() bool { return false }
 
 // waitRoom blocks the offline converter while the backlog is full.
 func (p *uploadPool) waitRoom(ctx context.Context) {
-	stop := context.AfterFunc(ctx, func() { p.cond.Broadcast() })
+	stop := context.AfterFunc(ctx, p.wake)
 	defer stop()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for p.full() && ctx.Err() == nil {
 		p.cond.Wait()
 	}
+}
+
+// wake broadcasts under the lock, so a waiter between its check and Wait
+// cannot miss it.
+func (p *uploadPool) wake() {
+	p.mu.Lock()
+	p.cond.Broadcast()
+	p.mu.Unlock()
 }
 
 func (p *uploadPool) stop() {

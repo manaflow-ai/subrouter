@@ -11,6 +11,8 @@ import (
 // completions, and plain JSON bodies.
 type usageScanner struct {
 	carry      []byte
+	whole      []byte
+	wholeFull  bool
 	input      int64
 	inputExtra bool
 	cacheRead  int64
@@ -33,7 +35,23 @@ type usageResult struct {
 // usageCarryMax bounds a partial line kept between chunks.
 const usageCarryMax = 4 << 20
 
+// usageWholeMax bounds a non-streaming JSON response kept for usage.
+const usageWholeMax = 1 << 20
+
 func (u *usageScanner) feed(data []byte) {
+	if len(u.whole) == 0 && !u.wholeFull {
+		// An event stream is read line by line; only a plain JSON body needs
+		// to be kept whole.
+		trimmed := bytes.TrimSpace(data)
+		u.wholeFull = len(trimmed) > 0 && trimmed[0] != '{'
+	}
+	if !u.wholeFull {
+		if len(u.whole)+len(data) <= usageWholeMax {
+			u.whole = append(u.whole, data...)
+		} else {
+			u.whole, u.wholeFull = nil, true
+		}
+	}
 	for len(data) > 0 {
 		newline := bytes.IndexByte(data, '\n')
 		if newline < 0 {
@@ -201,6 +219,11 @@ func (u *usageScanner) add(fields *usageFields) {
 
 func (u *usageScanner) result() usageResult {
 	u.endMessage()
+	if u.input == 0 && u.output == 0 && len(u.whole) > 0 {
+		// A non-streaming JSON body, possibly pretty-printed over many lines.
+		u.parse(bytes.TrimSpace(u.whole))
+	}
+	u.whole = nil
 	result := usageResult{output: u.output, reasoning: u.reasoning, stop: u.stop, model: u.model, done: u.done}
 	if u.anthropic {
 		// Anthropic reports uncached input separately from cache reads and

@@ -51,7 +51,8 @@ func TestSegmentTranscriptsRebuildEveryBodyExactly(t *testing.T) {
 				if err != nil {
 					return
 				}
-				if err := conn.WriteMessage(messageType, append([]byte(`{"echo_bytes":`), []byte(fmt.Sprint(len(body), "}"))...)); err != nil {
+				reply := fmt.Sprintf(`{"type":"response.completed","response":{"model":"gpt-test","status":"completed","usage":{"input_tokens":%d,"output_tokens":7}}}`, len(body))
+				if err := conn.WriteMessage(messageType, []byte(reply)); err != nil {
 					return
 				}
 			}
@@ -158,7 +159,10 @@ func TestSegmentTranscriptsRebuildEveryBodyExactly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	wsMessages := [][]byte{[]byte(`{"type":"response.create","input":["` + strings.Repeat("a", 5000) + `"]}`), []byte(`{"type":"response.create","input":["` + strings.Repeat("a", 5000) + `","next"]}`)}
+	// Large enough that the second message's delta base sits in an earlier
+	// frame than the message itself.
+	wsInput := strings.Repeat("websocket turn history ", 4000)
+	wsMessages := [][]byte{[]byte(`{"type":"response.create","input":["` + wsInput + `"]}`), []byte(`{"type":"response.create","input":["` + wsInput + `","next"]}`)}
 	for _, message := range wsMessages {
 		if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
 			t.Fatal(err)
@@ -227,6 +231,9 @@ func TestSegmentTranscriptsRebuildEveryBodyExactly(t *testing.T) {
 			if row.Path == "/v1/responses" && row.OutputTokens == 0 {
 				t.Fatalf("call %s has no output tokens", row.RequestID)
 			}
+		}
+		if row.Kind == "websocket" && (!row.Complete || row.OutputTokens != 7) {
+			t.Fatalf("websocket call %s complete %v output %d", row.RequestID, row.Complete, row.OutputTokens)
 		}
 		if call.Request.SHA256 == digest(sent[3]) && row.RequestEncoding != "zstd" {
 			t.Fatalf("zstd request recorded with encoding %q", row.RequestEncoding)
