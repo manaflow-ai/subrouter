@@ -216,9 +216,16 @@ func TestStripSubrouterHeaders(t *testing.T) {
 	req.Header.Set("X-Model", "GPT-5.3-Codex-Spark")
 	req.Header.Set("X-Subrouter-No-Retry", "1")
 	req.Header.Set("X-Subrouter-Capacity-Retryable", "1")
+	req.Header.Set("X-Subrouter-Client", "leos-mbp")
+	req.Header.Set("X-Subrouter-Client-Version", "v0.1.174")
 	req.Header.Set("X-Other", "keep")
 
 	StripSubrouterHeaders(req.Header)
+	for _, header := range []string{"X-Subrouter-Client", "X-Subrouter-Client-Version"} {
+		if got := req.Header.Get(header); got != "" {
+			t.Fatalf("%s = %q, want empty", header, got)
+		}
+	}
 	if got := req.Header.Get("X-Subrouter-No-Retry"); got != "" {
 		t.Fatalf("X-Subrouter-No-Retry = %q, want empty", got)
 	}

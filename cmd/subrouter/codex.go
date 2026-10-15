@@ -957,6 +957,9 @@ func codexSubrouterHeaders(userEmail, accountID, model string) string {
 	if client := srClientName(); client != "" {
 		headers = append(headers, `"`+clientNameHeader+`"=`+strconv.Quote(client))
 	}
+	if version := srClientVersion(); version != "" {
+		headers = append(headers, `"`+clientVersionHeader+`"=`+strconv.Quote(version))
+	}
 	if userEmail != "" {
 		headers = append(headers, `"X-Subrouter-User-Email"=`+strconv.Quote(userEmail))
 	}

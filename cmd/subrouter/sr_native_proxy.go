@@ -1313,6 +1313,7 @@ func startProxyRelay(
 	relayHost := listener.Addr().String()
 	reverse := &httputil.ReverseProxy{Transport: transport}
 	defaultClientName := srClientName()
+	clientVersion := srClientVersion()
 	reverse.Rewrite = func(proxyRequest *httputil.ProxyRequest) {
 		proxyRequest.SetURL(target)
 		request := proxyRequest.Out
@@ -1325,6 +1326,12 @@ func startProxyRelay(
 		request.Header.Del(clientNameHeader)
 		if clientName != "" {
 			request.Header.Set(clientNameHeader, clientName)
+		}
+		// The relay is this sr build, so it reports its own version
+		// whatever the tool behind it sent.
+		request.Header.Del(clientVersionHeader)
+		if clientVersion != "" {
+			request.Header.Set(clientVersionHeader, clientVersion)
 		}
 		for _, header := range []string{
 			"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Goog-Api-Key", "X-Auth-Token",
