@@ -36,7 +36,7 @@ func TestSegmentTranscriptsRebuildEveryBodyExactly(t *testing.T) {
 	t.Parallel()
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	upstreamReply := func(n int) []byte {
-		return []byte(fmt.Sprintf("event: response.output_text.delta\ndata: {\"delta\":\"héllo %d ✓\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-test\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":%d}}}\n\n", n, n+1))
+		return []byte(fmt.Sprintf("event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"gAAAAopaque\",\"summary\":[{\"text\":\"plan\"}]}}\n\nevent: response.output_text.delta\ndata: {\"delta\":\"héllo %d ✓\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-test\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":%d}}}\n\n", n, n+1))
 	}
 	var repliesMu sync.Mutex
 	var replies [][]byte
@@ -122,7 +122,7 @@ func TestSegmentTranscriptsRebuildEveryBodyExactly(t *testing.T) {
 	for turn := 0; turn < 4; turn++ {
 		marker := fmt.Sprintf(`"cache_marker_at":%d`, turn)
 		history += fmt.Sprintf(`{"role":"user","content":"turn %d: %s"},`, turn, strings.Repeat("ünïcode ", 200+turn))
-		sent = append(sent, []byte(`{"session_id":"seg-session:0",`+marker+`,"input":[`+history+`{}],"tools":[`+tools+`{}]}`))
+		sent = append(sent, []byte(`{"session_id":"seg-session:0",`+marker+`,"reasoning":{"effort":"xhigh","summary":"auto"},"input":[`+history+`{}],"tools":[`+tools+`{}]}`))
 	}
 	post := func(path string, body []byte, encoding string) {
 		t.Helper()
@@ -232,9 +232,21 @@ func TestSegmentTranscriptsRebuildEveryBodyExactly(t *testing.T) {
 			if row.Path == "/v1/responses" && row.OutputTokens == 0 {
 				t.Fatalf("call %s has no output tokens", row.RequestID)
 			}
+			if row.ReasoningEncryptedBytes != int64(len("gAAAAopaque")) || row.ReasoningSummaryChars != 4 || row.ThinkingBlocks != 1 {
+				t.Fatalf("call %s reasoning = %d encrypted bytes, %d summary chars, %d blocks", row.RequestID, row.ReasoningEncryptedBytes, row.ReasoningSummaryChars, row.ThinkingBlocks)
+			}
+			if row.ServedBy != "" {
+				t.Fatalf("call %s served_by %q from a plain upstream", row.RequestID, row.ServedBy)
+			}
+			if row.SessionGrouping != "client" || (row.Path == "/v1/responses" && row.ClientSessionID != "seg-session:0") {
+				t.Fatalf("call %s path %s kind %s client session %q grouping %q encoding %q", row.RequestID, row.Path, row.Kind, row.ClientSessionID, row.SessionGrouping, row.RequestEncoding)
+			}
 		}
 		if row.Kind == "websocket" && (!row.Complete || row.OutputTokens != 7) {
 			t.Fatalf("websocket call %s complete %v output %d", row.RequestID, row.Complete, row.OutputTokens)
+		}
+		if call.Request.SHA256 == digest(sent[0]) && row.ReasoningEffort != "xhigh" {
+			t.Fatalf("call %s reasoning effort %q", row.RequestID, row.ReasoningEffort)
 		}
 		if call.Request.SHA256 == digest(sent[3]) && row.RequestEncoding != "zstd" {
 			t.Fatalf("zstd request recorded with encoding %q", row.RequestEncoding)
