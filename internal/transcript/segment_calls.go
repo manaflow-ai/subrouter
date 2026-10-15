@@ -523,8 +523,9 @@ func (w *segmentWriter) flushIndexNow() {
 // Headers that carry the client's own session and turn ids, most specific
 // first.
 var (
-	clientSessionHeaders = []string{"X-Claude-Code-Session-Id", "X-Claude-Session-Id", "X-Codex-Session-Id", "Session_id", "Session-Id", "X-Session-Id", "Conversation_id", "X-Conversation-Id", "Openai-Conversation-Id", "X-Codex-Parent-Thread-Id", "X-Codex-Window-Id"}
-	clientTurnHeaders    = []string{"X-Claude-Code-Prompt-Id", "X-Prompt-Id", "X-Codex-Turn-Id", "X-Turn-Id", "X-Client-Request-Id", "X-Request-Id", "Idempotency-Key"}
+	clientSessionHeaders = []string{"X-Claude-Code-Session-Id", "X-Claude-Session-Id", "X-Codex-Session-Id", "Session_id", "Session-Id", "X-Session-Id", "Conversation_id", "X-Conversation-Id", "Openai-Conversation-Id", "Thread-Id", "X-Codex-Parent-Thread-Id", "X-Codex-Window-Id", "X-Subrouter-Session"}
+	// Only ids that name a prompt or turn; per-request ids would mislabel.
+	clientTurnHeaders = []string{"X-Claude-Code-Prompt-Id", "X-Prompt-Id", "X-Codex-Turn-Id", "X-Turn-Id"}
 )
 
 func firstHeader(headers map[string][]string, names []string) string {
@@ -541,10 +542,15 @@ func firstHeader(headers map[string][]string, names []string) string {
 // sessionGrouping tells a client-named session from the router's fallback
 // grouping of requests that named none.
 func sessionGrouping(sessionID string) string {
-	if strings.HasPrefix(sessionID, "fallback:") || strings.HasPrefix(sessionID, "fallback-") {
+	switch {
+	case sessionID == "":
+		return "none"
+	case strings.HasPrefix(sessionID, "fallback:"):
+		// session.ExtractID's grouping for requests that name no session.
 		return "fallback"
+	default:
+		return "client"
 	}
-	return "client"
 }
 
 // applyRequestHead reads the model and reasoning settings of a request body
@@ -554,36 +560,43 @@ func applyRequestHead(row *IndexRow, body []byte) {
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return
 	}
+	// Each part decodes on its own, so an unexpected shape in one (a string
+	// "reasoning", a boolean "thinking") never costs the others.
 	var head struct {
-		Model    string `json:"model"`
-		Thinking *struct {
-			Type         string `json:"type"`
-			Display      string `json:"display"`
-			BudgetTokens int64  `json:"budget_tokens"`
-		} `json:"thinking"`
-		Reasoning *struct {
-			Effort  string `json:"effort"`
-			Summary string `json:"summary"`
-		} `json:"reasoning"`
-		ReasoningEffort string `json:"reasoning_effort"`
-		Response        *struct {
-			Model string `json:"model"`
-		} `json:"response"`
+		Model           json.RawMessage `json:"model"`
+		Thinking        json.RawMessage `json:"thinking"`
+		Reasoning       json.RawMessage `json:"reasoning"`
+		ReasoningEffort json.RawMessage `json:"reasoning_effort"`
+		Response        json.RawMessage `json:"response"`
 	}
 	if json.Unmarshal(trimmed, &head) != nil {
 		return
 	}
-	row.Model = head.Model
-	if row.Model == "" && head.Response != nil {
-		row.Model = head.Response.Model
+	_ = json.Unmarshal(head.Model, &row.Model)
+	if row.Model == "" {
+		var response struct {
+			Model string `json:"model"`
+		}
+		if json.Unmarshal(head.Response, &response) == nil {
+			row.Model = response.Model
+		}
 	}
-	if head.Thinking != nil {
-		row.ThinkingType, row.ThinkingDisplay, row.ThinkingBudget = head.Thinking.Type, head.Thinking.Display, head.Thinking.BudgetTokens
+	var thinking struct {
+		Type         string `json:"type"`
+		Display      string `json:"display"`
+		BudgetTokens int64  `json:"budget_tokens"`
 	}
-	if head.Reasoning != nil {
-		row.ReasoningEffort, row.ReasoningSummary = head.Reasoning.Effort, head.Reasoning.Summary
+	if json.Unmarshal(head.Thinking, &thinking) == nil {
+		row.ThinkingType, row.ThinkingDisplay, row.ThinkingBudget = thinking.Type, thinking.Display, thinking.BudgetTokens
+	}
+	var reasoning struct {
+		Effort  string `json:"effort"`
+		Summary string `json:"summary"`
+	}
+	if json.Unmarshal(head.Reasoning, &reasoning) == nil {
+		row.ReasoningEffort, row.ReasoningSummary = reasoning.Effort, reasoning.Summary
 	}
 	if row.ReasoningEffort == "" {
-		row.ReasoningEffort = head.ReasoningEffort
+		_ = json.Unmarshal(head.ReasoningEffort, &row.ReasoningEffort)
 	}
 }

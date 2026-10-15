@@ -3,6 +3,7 @@ package transcript
 import (
 	"bytes"
 	"encoding/json"
+	"unicode/utf8"
 )
 
 // usageScanner reads token usage, the stop reason and the model out of a
@@ -24,6 +25,9 @@ type usageScanner struct {
 	model      string
 	done       bool
 	anthropic  bool
+	// parsed is set once any message decoded, so the whole-body fallback
+	// never counts the same blocks again.
+	parsed bool
 
 	thinkingBlocks int64
 	thinkingChars  int64
@@ -160,7 +164,6 @@ func (u *usageScanner) parse(message []byte) {
 			IncompleteDetails *struct {
 				Reason string `json:"reason"`
 			} `json:"incomplete_details"`
-			Output []reasoningItem `json:"output"`
 		} `json:"response"`
 		Choices []struct {
 			FinishReason string `json:"finish_reason"`
@@ -176,6 +179,7 @@ func (u *usageScanner) parse(message []byte) {
 	if json.Unmarshal(message, &event) != nil {
 		return
 	}
+	u.parsed = true
 	if event.Model != "" {
 		u.model = event.Model
 	}
@@ -197,7 +201,7 @@ func (u *usageScanner) parse(message []byte) {
 		u.stop = event.Delta.StopReason
 	}
 	if event.Delta != nil {
-		u.thinkingChars += int64(len([]rune(event.Delta.Thinking)))
+		u.thinkingChars += int64(utf8.RuneCountInString(event.Delta.Thinking))
 		u.signatureBytes += int64(len(event.Delta.Signature))
 	}
 	if event.ContentBlock != nil {
@@ -277,7 +281,7 @@ func (u *usageScanner) addBlock(block reasoningBlock) {
 	switch block.Type {
 	case "thinking":
 		u.thinkingBlocks++
-		u.thinkingChars += int64(len([]rune(block.Thinking)))
+		u.thinkingChars += int64(utf8.RuneCountInString(block.Thinking))
 		u.signatureBytes += int64(len(block.Signature))
 	case "redacted_thinking":
 		u.thinkingBlocks++
@@ -293,13 +297,13 @@ func (u *usageScanner) addItem(item reasoningItem) {
 	u.thinkingBlocks++
 	u.encryptedBytes += int64(len(item.EncryptedContent))
 	for _, part := range item.Summary {
-		u.summaryChars += int64(len([]rune(part.Text)))
+		u.summaryChars += int64(utf8.RuneCountInString(part.Text))
 	}
 }
 
 func (u *usageScanner) result() usageResult {
 	u.endMessage()
-	if u.input == 0 && u.output == 0 && len(u.whole) > 0 {
+	if !u.parsed && len(u.whole) > 0 {
 		// A non-streaming JSON body, possibly pretty-printed over many lines.
 		u.parse(bytes.TrimSpace(u.whole))
 	}
