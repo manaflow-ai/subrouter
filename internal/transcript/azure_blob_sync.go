@@ -54,6 +54,8 @@ type AzureBlobSyncer struct {
 	backoff func(attempt int) time.Duration
 	// pace limits how fast transcript bytes leave this machine.
 	pace *uploadPacer
+	// accessTier is the tier segment uploads are written in.
+	accessTier string
 }
 
 type AzureBlobSyncerConfig struct {
@@ -176,7 +178,7 @@ func (s *AzureBlobSyncer) Enabled() bool {
 }
 
 func (s *AzureBlobSyncer) Destination() string {
-	if !s.Enabled() {
+	if s == nil || s.container == "" {
 		return ""
 	}
 	destination := s.endpoint + "/" + s.container
@@ -828,7 +830,7 @@ func (s *AzureBlobSyncer) signature(req *http.Request, size int64) (string, erro
 		"",            // Content-Encoding
 		"",            // Content-Language
 		contentLength, // Content-Length ("" when zero)
-		"",            // Content-MD5
+		req.Header.Get("Content-MD5"),
 		req.Header.Get("Content-Type"),
 		"", // Date (x-ms-date is used instead)
 		"", // If-Modified-Since

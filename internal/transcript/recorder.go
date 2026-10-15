@@ -50,6 +50,10 @@ type Recorder struct {
 	dropped     atomic.Int64
 	lastDropLog atomic.Int64
 	directMu    sync.Mutex
+
+	// seg, when set, replaces the per-session JSONL files with one
+	// delta-encoded segment stream per process (see SegmentFormat).
+	seg *segmentWriter
 }
 
 type recorderOptions struct {
@@ -159,12 +163,98 @@ func newRecorder(dir string, opts recorderOptions) *Recorder {
 	}
 }
 
-func (r *Recorder) Enabled() bool {
-	return r != nil && r.dir != ""
+// NewSegmentRecorder returns a recorder that streams delta-encoded,
+// compressed per-session segments and a call index to cfg.Uploader. It
+// writes nothing to local disk.
+func NewSegmentRecorder(cfg SegmentConfig) (*Recorder, error) {
+	writer, err := newSegmentWriter(cfg, false)
+	if err != nil {
+		return nil, err
+	}
+	return &Recorder{opts: defaultRecorderOptions, seg: writer}, nil
 }
+
+func (r *Recorder) Enabled() bool {
+	return r != nil && (r.dir != "" || r.seg != nil)
+}
+
+// SealSegment commits every open segment and writes the index now, and
+// waits for the uploads.
+func (r *Recorder) SealSegment() {
+	if r.SegmentMode() {
+		r.seg.sync(true)
+	}
+}
+
+// SegmentMode reports whether the recorder writes segments.
+func (r *Recorder) SegmentMode() bool { return r != nil && r.seg != nil }
+
+// SegmentStats reports drops, upload progress and spool size in segment mode.
+func (r *Recorder) SegmentStats() (SegmentStats, bool) {
+	if !r.SegmentMode() {
+		return SegmentStats{}, false
+	}
+	return r.seg.stats(), true
+}
+
+// RecordRequestMeta records a request's metadata and attributes it to the
+// client machine behind remoteAddr. The tailnet lookup happens on the segment
+// writer's goroutine, never on the request's.
+func (r *Recorder) RecordRequestMeta(agentType, sessionID, remoteAddr string, payload map[string]any) {
+	if !r.Enabled() {
+		return
+	}
+	enriched := withSession(agentType, sessionID, payload)
+	if r.seg != nil {
+		r.seg.enqueue(&segmentItem{kind: itemMeta, eventType: "subrouter_meta", payload: enriched, remoteAddr: remoteAddr})
+		return
+	}
+	if host := addressHost(remoteAddr); host != "" {
+		enriched["client_ip"] = host
+	}
+	r.write(agentType, sessionID, Event{Timestamp: now(), Type: "subrouter_meta", Payload: enriched})
+}
+
+// RecordRequestBody records one whole request body. In segment mode the body
+// is decoded from contentEncoding and stored as a delta against the previous
+// requests of its session; the recorder takes ownership of body. Otherwise it
+// is written as base64 chunks plus a summary, as before.
+func (r *Recorder) RecordRequestBody(agentType, sessionID, eventType, direction, streamID string, body []byte, contentEncoding string, payload map[string]any) {
+	if !r.Enabled() {
+		return
+	}
+	if r.seg != nil {
+		enriched := withSession(agentType, sessionID, payload)
+		enriched["direction"] = direction
+		enriched["stream_id"] = streamID
+		r.seg.enqueue(&segmentItem{kind: itemBody, eventType: eventType, payload: enriched, body: body, delta: true, contentEncoding: contentEncoding})
+		return
+	}
+	hasher := sha256.New()
+	chunks := 0
+	var offset int64
+	for rest := body; len(rest) > 0; {
+		chunk := rest
+		if len(chunk) > legacyChunkBytes {
+			chunk = rest[:legacyChunkBytes]
+		}
+		_, _ = hasher.Write(chunk)
+		r.RecordPayloadChunk(agentType, sessionID, eventType, direction, streamID, chunks, offset, chunk, payload)
+		chunks++
+		offset += int64(len(chunk))
+		rest = rest[len(chunk):]
+	}
+	r.RecordPayloadSummary(agentType, sessionID, eventType, direction, streamID, offset, hex.EncodeToString(hasher.Sum(nil)), chunks, payload)
+}
+
+const legacyChunkBytes = 64 * 1024
 
 func (r *Recorder) RecordMeta(agentType, sessionID string, payload map[string]any) {
 	if !r.Enabled() {
+		return
+	}
+	if r.seg != nil {
+		r.seg.enqueue(&segmentItem{kind: itemEvent, eventType: "subrouter_meta", payload: withSession(agentType, sessionID, payload)})
 		return
 	}
 	r.write(agentType, sessionID, Event{
@@ -176,6 +266,14 @@ func (r *Recorder) RecordMeta(agentType, sessionID string, payload map[string]an
 
 func (r *Recorder) RecordPayload(agentType, sessionID, eventType, direction string, body []byte, payload map[string]any) {
 	if !r.Enabled() {
+		return
+	}
+	if r.seg != nil {
+		enriched := withSession(agentType, sessionID, payload)
+		enriched["direction"] = direction
+		// A client's websocket messages repeat its earlier ones the way HTTP
+		// request bodies do, so they are delta-encoded too.
+		r.seg.enqueue(&segmentItem{kind: itemBody, eventType: eventType, payload: enriched, body: append([]byte(nil), body...), delta: direction == "client_to_upstream"})
 		return
 	}
 	sum := sha256.Sum256(body)
@@ -193,6 +291,13 @@ func (r *Recorder) RecordPayload(agentType, sessionID, eventType, direction stri
 
 func (r *Recorder) RecordPayloadChunk(agentType, sessionID, eventType, direction, streamID string, chunkIndex int, offset int64, body []byte, payload map[string]any) {
 	if !r.Enabled() {
+		return
+	}
+	if r.seg != nil {
+		enriched := withSession(agentType, sessionID, payload)
+		enriched["direction"] = direction
+		enriched["stream_id"] = streamID
+		r.seg.enqueue(&segmentItem{kind: itemChunk, eventType: eventType, payload: enriched, body: append([]byte(nil), body...), streamID: streamID, offset: offset})
 		return
 	}
 	sum := sha256.Sum256(body)
@@ -222,6 +327,10 @@ func (r *Recorder) RecordPayloadSummary(agentType, sessionID, eventType, directi
 	enriched["body_chunked"] = true
 	enriched["bytes"] = bytesRead
 	enriched["sha256"] = sha256Hex
+	if r.seg != nil {
+		r.seg.enqueue(&segmentItem{kind: itemSummary, eventType: eventType, payload: enriched, streamID: streamID})
+		return
+	}
 	enriched["chunks"] = chunks
 	r.write(agentType, sessionID, Event{
 		Timestamp: now(),
@@ -261,6 +370,10 @@ func (r *Recorder) Flush() error {
 	if !r.Enabled() {
 		return nil
 	}
+	if r.seg != nil {
+		r.seg.sync(false)
+		return nil
+	}
 	r.mu.Lock()
 	finishing := r.evicted
 	r.evicted = nil
@@ -288,6 +401,9 @@ func (r *Recorder) Flush() error {
 func (r *Recorder) Close() error {
 	if !r.Enabled() {
 		return nil
+	}
+	if r.seg != nil {
+		return r.seg.close()
 	}
 	r.mu.Lock()
 	if r.closed {
@@ -327,6 +443,9 @@ func (r *Recorder) Close() error {
 func (r *Recorder) DroppedEvents() int64 {
 	if r == nil {
 		return 0
+	}
+	if r.seg != nil {
+		return r.seg.droppedQueue.Load() + r.seg.droppedBacklog.Load()
 	}
 	return r.dropped.Load()
 }
