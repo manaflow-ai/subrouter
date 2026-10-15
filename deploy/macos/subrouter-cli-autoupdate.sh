@@ -103,6 +103,27 @@ semver_newer() {
   [ "${#lp[@]}" -gt "${#rp[@]}" ]
 }
 
+# supports_update_auto succeeds when the installed CLI has `update --auto`
+# (#623). The probe only reads help text, and SUBROUTER_NO_AUTO_UPDATE keeps the
+# probe itself from starting a background update.
+supports_update_auto() {
+  [ -x "$INSTALL_DIR/subrouter" ] || return 1
+  SUBROUTER_NO_AUTO_UPDATE=1 "$INSTALL_DIR/subrouter" update --help </dev/null 2>/dev/null \
+    | grep -q -- 'update --auto'
+}
+
+# A CLI that can update itself does it better than this script: `update
+# --auto` verifies the staged binary, keeps a backup, waits for the daemon to
+# be idle, health-checks it and restores on failure, and quietly skips a team
+# host, a package-manager install or a newer build. Hand over to it, and keep
+# the install.sh path below only to bring an older CLI onto a release that has
+# it.
+if supports_update_auto; then
+  log "running $INSTALL_DIR/subrouter update --auto (details in ~/.subrouter/logs/auto-update.log)"
+  "$INSTALL_DIR/subrouter" update --auto </dev/null
+  exit
+fi
+
 latest_tag="$(resolve_latest_tag)"
 [ -n "$latest_tag" ] || { log "could not resolve latest release tag"; exit 1; }
 
