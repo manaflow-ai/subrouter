@@ -391,7 +391,7 @@ func serve(args []string) error {
 	transcriptSegmentAge := flags.Duration("transcript-segment-max-age", time.Hour, "seal a transcript segment at this age")
 	transcriptSegmentIdle := flags.Duration("transcript-segment-idle", 10*time.Minute, "seal a transcript segment after this long without events")
 	transcriptConvertLegacy := flags.Bool("transcript-convert-legacy", true, "in segments format, convert raw per-session transcript files in --transcripts to segments, upload them, and delete each file after a verified upload")
-	transcriptAzureTier := flags.String("transcript-azure-tier", "Cool", "access tier for uploaded transcript segments (Hot, Cool, Cold)")
+	transcriptAzureTier := flags.String("transcript-azure-tier", "Cool", "access tier for uploaded transcript segments (Hot or Cool)")
 	transcriptAzureURL := flags.String("transcript-azure-url", "", "optional Azure blob container URL (https://<account>.blob.core.windows.net/<container>[/<prefix>]) for background transcript sync; defaults to SUBROUTER_TRANSCRIPT_AZURE_URL")
 	srSwitchInterval := defaultSRSwitchInterval
 	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for refreshing OAuth usage scores used by routing; non-positive disables scheduled refresh")

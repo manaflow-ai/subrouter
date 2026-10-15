@@ -178,7 +178,8 @@ func quietLegacySources(root string, quiet time.Duration, maxBytes int64) ([]*le
 			}
 			return err
 		}
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+		// "._" files are macOS AppleDouble metadata on non-Apple volumes.
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") || strings.HasPrefix(entry.Name(), "._") {
 			return nil
 		}
 		info, err := entry.Info()

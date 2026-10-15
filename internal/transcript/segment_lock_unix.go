@@ -1,4 +1,4 @@
-//go:build unix
+//go:build darwin || linux || freebsd || openbsd || netbsd || dragonfly
 
 package transcript
 

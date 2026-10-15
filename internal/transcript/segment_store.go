@@ -21,6 +21,10 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+// segmentUploadTimeout bounds one segment upload, so a stalled connection
+// cannot stop the store (and with it compression and the spool's drain).
+const segmentUploadTimeout = 20 * time.Minute
+
 // SegmentUploader stores a compressed segment durably. UploadSegment returns
 // only after the stored object is verified to hold exactly the local bytes;
 // the local file is deleted after that.
@@ -120,7 +124,7 @@ func (s *segmentStore) pass(ctx context.Context, work bool) {
 	if !work {
 		return
 	}
-	for _, path := range s.list("sealed", ".jsonl") {
+	for _, path := range s.list("sealed", rawSegmentExt) {
 		if ctx.Err() != nil {
 			return
 		}
@@ -185,7 +189,11 @@ func (s *segmentStore) compress(ctx context.Context, path string) error {
 		return nil
 	}
 	release := func() { _ = os.Rename(claimed, path) }
-	segID := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	segID := strings.TrimSuffix(filepath.Base(path), rawSegmentExt)
+	if err := os.MkdirAll(filepath.Join(s.w.root, "upload"), 0o700); err != nil {
+		release()
+		return err
+	}
 	target := filepath.Join(s.w.root, "upload", segID+".jsonl.zst")
 	tmp := target + ".tmp-" + strconv.Itoa(os.Getpid())
 	info, err := compressSegmentFile(ctx, claimed, tmp, s.w.cfg.CompressLevel, s.w.cfg.WindowSize)
@@ -334,7 +342,10 @@ func (s *segmentStore) upload(ctx context.Context, path string) error {
 	if !ok {
 		return nil
 	}
-	if err := s.w.cfg.Uploader.UploadSegment(ctx, claimed, info); err != nil {
+	uploadCtx, cancel := context.WithTimeout(ctx, segmentUploadTimeout)
+	err = s.w.cfg.Uploader.UploadSegment(uploadCtx, claimed, info)
+	cancel()
+	if err != nil {
 		_ = os.Rename(claimed, path)
 		return err
 	}
@@ -356,13 +367,16 @@ func (s *segmentStore) recoverOrphans() {
 		if !entry.IsDir() || dir == s.w.live {
 			continue
 		}
+		if pid, err := strconv.Atoi(strings.SplitN(entry.Name(), "-", 2)[0]); err == nil && (pid == os.Getpid() || processAlive(pid)) {
+			continue
+		}
 		release, ok := tryLockLiveDir(dir)
 		if !ok {
 			continue
 		}
 		files, _ := os.ReadDir(dir)
 		for _, file := range files {
-			if strings.HasSuffix(file.Name(), ".jsonl") {
+			if strings.HasSuffix(file.Name(), rawSegmentExt) {
 				_ = os.Rename(filepath.Join(dir, file.Name()), filepath.Join(s.w.root, "sealed", file.Name()))
 			}
 		}

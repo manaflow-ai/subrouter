@@ -73,8 +73,8 @@ const (
 	defaultSegmentMaxBytes   = 256 << 20
 	defaultSegmentMaxAge     = time.Hour
 	defaultSegmentIdleSeal   = 10 * time.Minute
-	defaultSegmentQueueBytes = 512 << 20
-	defaultDeltaBaseBytes    = 1 << 30
+	defaultSegmentQueueBytes = 256 << 20
+	defaultDeltaBaseBytes    = 256 << 20
 	// DefaultSegmentWindowSize is the zstd window for sealed segments. 128 MiB
 	// is the largest window the stock zstd CLI decodes without --long or
 	// --memory, so `zstd -d` works on a segment as is.
@@ -89,6 +89,15 @@ const (
 	whoisNegativeTTL   = time.Minute
 	whoisTimeout       = 2 * time.Second
 )
+
+// rawSegmentExt names live and sealed (uncompressed) segments. It is not
+// .jsonl on purpose: the jsonl-format syncers of an older worker sharing the
+// directory upload and prune every *.jsonl file they find.
+const rawSegmentExt = ".segment"
+
+// requestBodyZstd decodes zstd request bodies; DecodeAll is safe for
+// concurrent use and the memory cap bounds a decompression bomb.
+var requestBodyZstd, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(requestBodyDecodeLimit))
 
 // UnknownAttribution is recorded when a client cannot be named.
 const UnknownAttribution = "unknown"
@@ -422,6 +431,15 @@ func (w *segmentWriter) process(item *segmentItem) {
 	case itemMeta:
 		w.attribute(item)
 	case itemBody:
+		// Open first: a body's sequence number and delta chain belong to the
+		// segment it is written to.
+		if w.file == nil {
+			if err := w.openSegment(item.at); err != nil {
+				w.writeErrors.Add(1)
+				w.cfg.Logger.Warn("transcript segment open failed", "error", err)
+				return
+			}
+		}
 		w.encodeBody(item)
 	}
 	w.writeEvent(item.at, item.eventType, item.payload)
@@ -594,12 +612,11 @@ func decodeContentEncoding(body []byte, encoding string) ([]byte, error) {
 	var reader io.Reader
 	switch encoding {
 	case "zstd":
-		decoder, err := zstd.NewReader(bytes.NewReader(body), zstd.WithDecoderMaxMemory(requestBodyDecodeLimit))
+		decoded, err := requestBodyZstd.DecodeAll(body, nil)
 		if err != nil {
 			return nil, err
 		}
-		defer decoder.Close()
-		reader = decoder
+		return decoded, nil
 	case "gzip", "x-gzip":
 		gz, err := gzip.NewReader(bytes.NewReader(body))
 		if err != nil {
@@ -719,7 +736,10 @@ func (w *segmentWriter) openSegment(at time.Time) error {
 	var random [3]byte
 	_, _ = rand.Read(random[:])
 	w.segID = fmt.Sprintf("%s-%s-%d-%d-%s", now.UTC().Format("20060102T150405Z"), w.cfg.Host, os.Getpid(), w.processSerial, hex.EncodeToString(random[:]))
-	path := filepath.Join(w.live, w.segID+".jsonl")
+	if err := os.MkdirAll(w.live, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(w.live, w.segID+rawSegmentExt)
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -765,8 +785,9 @@ func (w *segmentWriter) seal(reason string) {
 		w.writeErrors.Add(1)
 	}
 	_ = w.file.Close()
-	livePath := filepath.Join(w.live, w.segID+".jsonl")
-	sealedPath := filepath.Join(w.root, "sealed", w.segID+".jsonl")
+	livePath := filepath.Join(w.live, w.segID+rawSegmentExt)
+	sealedPath := filepath.Join(w.root, "sealed", w.segID+rawSegmentExt)
+	_ = os.MkdirAll(filepath.Dir(sealedPath), 0o700)
 	if err := os.Rename(livePath, sealedPath); err != nil {
 		w.writeErrors.Add(1)
 		w.cfg.Logger.Warn("transcript segment seal failed", "segment", w.segID, "error", err)
@@ -785,6 +806,7 @@ func (w *segmentWriter) seal(reason string) {
 }
 
 func (w *segmentWriter) resetSegmentState() {
+	w.segSeq = 0
 	w.deltas = map[string]*deltaChain{}
 	w.deltaBytes = 0
 	w.pending = map[string]*pendingStream{}

@@ -82,6 +82,7 @@ type requestBodyCapture struct {
 	encoding  string
 	streamID  string
 
+	mu       sync.Mutex
 	buf      []byte
 	hasher   hash.Hash
 	offset   int64
@@ -108,6 +109,9 @@ func (c *requestBodyCapture) payload() map[string]any {
 
 func (c *requestBodyCapture) Read(p []byte) (int, error) {
 	n, err := c.ReadCloser.Read(p)
+	// The transport may Close the body while a Read is still running.
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if n > 0 {
 		chunk := p[:n]
 		_, _ = c.hasher.Write(chunk)
@@ -126,18 +130,20 @@ func (c *requestBodyCapture) Read(p []byte) (int, error) {
 	}
 	if err == io.EOF {
 		c.sawEOF = true
-		c.finish()
+		c.finishLocked()
 	}
 	return n, err
 }
 
 func (c *requestBodyCapture) Close() error {
 	err := c.ReadCloser.Close()
-	c.finish()
+	c.mu.Lock()
+	c.finishLocked()
+	c.mu.Unlock()
 	return err
 }
 
-func (c *requestBodyCapture) finish() {
+func (c *requestBodyCapture) finishLocked() {
 	c.finished.Do(func() {
 		payload := c.payload()
 		if !c.sawEOF {
@@ -159,13 +165,16 @@ func (c *requestBodyCapture) finish() {
 // It returns the request id for the response, or "" when nothing is
 // recorded.
 func (s Server) recordBedrockGatewayRequest(r *http.Request, upstreamPath string, body []byte) (agentType, sessionID, requestID string) {
-	if s.Transcripts == nil || !s.Transcripts.Enabled() {
+	if !s.Transcripts.SegmentMode() {
 		return "", "", ""
 	}
 	agentType = "claude"
 	sessionID = session.ExtractRoutingID(r)
 	if sessionID == "" {
 		sessionID = "bedrock-gateway"
+	}
+	if !transcriptWorthRecording(sessionID) {
+		return "", "", ""
 	}
 	requestID = nextTranscriptRequestID()
 	metadata := map[string]any{
@@ -226,7 +235,7 @@ func (s Server) handleTranscriptStats(w http.ResponseWriter, _ *http.Request) {
 // client receives. Nothing is recorded when the route declines and writes
 // nothing, because the pool path that follows records the request itself.
 func (s Server) serveRecorded(w http.ResponseWriter, r *http.Request, agentType, sessionID, route string, serve func(http.ResponseWriter, *http.Request) bool) bool {
-	if s.Transcripts == nil || !s.Transcripts.Enabled() || !transcriptWorthRecording(sessionID) || r.Body == nil {
+	if !s.Transcripts.SegmentMode() || !transcriptWorthRecording(sessionID) || r.Body == nil {
 		return serve(w, r)
 	}
 	var body []byte
@@ -234,18 +243,25 @@ func (s Server) serveRecorded(w http.ResponseWriter, r *http.Request, agentType,
 	if r.GetBody != nil {
 		var reader io.ReadCloser
 		if reader, err = r.GetBody(); err == nil {
-			body, err = io.ReadAll(reader)
+			body, err = io.ReadAll(io.LimitReader(reader, replayablePostMaxBodyBytes+1))
 			_ = reader.Close()
 		}
 	} else {
-		body, err = io.ReadAll(r.Body)
-		_ = r.Body.Close()
+		body, err = io.ReadAll(io.LimitReader(r.Body, replayablePostMaxBodyBytes+1))
+		// Put back exactly what was read, followed by anything past the
+		// limit, so the route sees the body it would have seen.
+		rest := r.Body
 		restored := body
-		r.Body = io.NopCloser(bytes.NewReader(restored))
-		r.ContentLength = int64(len(restored))
-		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(restored)), nil }
+		r.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(restored), rest), rest}
+		if int64(len(restored)) <= replayablePostMaxBodyBytes && err == nil {
+			r.ContentLength = int64(len(restored))
+			r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(restored)), nil }
+		}
 	}
-	if err != nil {
+	if err != nil || int64(len(body)) > replayablePostMaxBodyBytes {
 		return serve(w, r)
 	}
 	capture := &transcriptResponseWriter{

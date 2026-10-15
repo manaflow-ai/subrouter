@@ -120,6 +120,8 @@ func newServeTranscriptRecorder(options serveTranscriptOptions) (*transcript.Rec
 		backlog := config
 		backlog.Dir = filepath.Join(options.dir, "segments-backlog")
 		backlog.Uploader = config.Uploader
+		backlog.DeltaBaseBytes = 128 << 20
+		backlog.WhoIs = nil
 		go transcript.RunLegacySpoolConversion(context.Background(), transcript.LegacySpoolOptions{
 			Dir:      options.dir,
 			Quiet:    15 * time.Minute,

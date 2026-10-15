@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -308,7 +309,26 @@ func deltaKeyFor(eventType string, payload map[string]any) string {
 	agent, _ := payload["agent_type"].(string)
 	session, _ := payload["session_id"].(string)
 	direction, _ := payload["direction"].(string)
-	return agent + "\x00" + session + "\x00" + eventType + "\x00" + direction
+	return jsonSafe(agent) + "\x00" + jsonSafe(session) + "\x00" + jsonSafe(eventType) + "\x00" + jsonSafe(direction)
+}
+
+// jsonSafe maps each invalid UTF-8 byte to U+FFFD, as encoding/json does, so
+// the writer's key matches the key the reader derives from decoded JSON.
+func jsonSafe(value string) string {
+	if utf8.ValidString(value) {
+		return value
+	}
+	var builder strings.Builder
+	for i := 0; i < len(value); {
+		r, size := utf8.DecodeRuneInString(value[i:])
+		if r == utf8.RuneError && size == 1 {
+			builder.WriteString("\uFFFD")
+		} else {
+			builder.WriteString(value[i : i+size])
+		}
+		i += size
+	}
+	return builder.String()
 }
 
 // deltaBasesPerKey bounds how many earlier bodies of one chain a delta may

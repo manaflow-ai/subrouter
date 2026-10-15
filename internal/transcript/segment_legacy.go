@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -31,6 +32,7 @@ type LegacyConverter struct {
 	OnSealed func(info SegmentInfo, completedSources []string) error
 
 	completed []string
+	failed    bool
 	// SourceBytes and Sources count what was read.
 	SourceBytes int64
 	Sources     int
@@ -56,12 +58,22 @@ func NewLegacyConverter(ctx context.Context, cfg SegmentConfig) (*LegacyConverte
 func (c *LegacyConverter) Segments() []SegmentInfo { return c.sealedInfos }
 
 func (c *LegacyConverter) sealed(path string) error {
+	if c.failed {
+		// A segment already failed: sources that ended in it are not stored,
+		// so no later segment may report them (or anything) as completed.
+		return errLegacyConversionFailed
+	}
 	info, compressedPath, err := c.w.store.compressSync(c.ctx, path)
 	if err != nil {
+		c.failed = true
 		return err
 	}
 	if c.w.cfg.Uploader != nil {
-		if err := c.w.cfg.Uploader.UploadSegment(c.ctx, compressedPath, info); err != nil {
+		uploadCtx, cancel := context.WithTimeout(c.ctx, segmentUploadTimeout)
+		err := c.w.cfg.Uploader.UploadSegment(uploadCtx, compressedPath, info)
+		cancel()
+		if err != nil {
+			c.failed = true
 			return err
 		}
 		_ = os.Remove(compressedPath)
@@ -85,6 +97,9 @@ type legacyStream struct {
 
 // Convert reads one legacy JSONL source to its end.
 func (c *LegacyConverter) Convert(source string, r io.Reader) error {
+	if c.failed || c.w.lastErr != nil {
+		return errors.Join(errLegacyConversionFailed, c.w.lastErr)
+	}
 	c.Sources++
 	streams := map[string]*legacyStream{}
 	var order []string
@@ -93,6 +108,9 @@ func (c *LegacyConverter) Convert(source string, r io.Reader) error {
 	for {
 		if err := c.ctx.Err(); err != nil {
 			return err
+		}
+		if c.w.lastErr != nil {
+			return c.w.lastErr
 		}
 		line, readErr := reader.ReadBytes('\n')
 		c.SourceBytes += int64(len(line))
@@ -127,8 +145,13 @@ func (c *LegacyConverter) Convert(source string, r io.Reader) error {
 	return c.w.lastErr
 }
 
+var errLegacyConversionFailed = errors.New("an earlier segment of this conversion failed")
+
 // Close seals the last segment.
 func (c *LegacyConverter) Close() error {
+	if c.failed || c.w.lastErr != nil {
+		return errors.Join(errLegacyConversionFailed, c.w.lastErr)
+	}
 	c.w.seal("close")
 	c.w.flushBuffer()
 	return c.w.lastErr
@@ -278,7 +301,7 @@ func newOfflineSegmentWriter(cfg SegmentConfig) (*segmentWriter, error) {
 // compressSync compresses one sealed file in the caller's goroutine.
 func (s *segmentStore) compressSync(ctx context.Context, sealedPath string) (SegmentInfo, string, error) {
 	segID := filepath.Base(sealedPath)
-	segID = segID[:len(segID)-len(".jsonl")]
+	segID = strings.TrimSuffix(segID, rawSegmentExt)
 	target := filepath.Join(s.w.root, "upload", segID+".jsonl.zst")
 	info, err := compressSegmentFile(ctx, sealedPath, target, s.w.cfg.CompressLevel, s.w.cfg.WindowSize)
 	if err != nil {
