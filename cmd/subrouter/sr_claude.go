@@ -2365,6 +2365,9 @@ func proxyClaudeLaunchSettingsWithRetry(baseURL, proxyToken, configDir, retryHea
 	if client := srClientName(); client != "" {
 		customHeaders += "\n" + clientNameHeader + ": " + client
 	}
+	if version := srClientVersion(); version != "" {
+		customHeaders += "\n" + clientVersionHeader + ": " + version
+	}
 	if accountID != "" {
 		customHeaders += "\nX-Subrouter-Account-ID: " + accountID
 	} else if preferredAccountID != "" {

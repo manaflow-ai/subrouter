@@ -55,6 +55,7 @@ func TestMain(m *testing.M) {
 	// Launch-config tests compare exact header sets; the client name is
 	// host-specific, so it is off unless a test sets it.
 	srClientName = func() string { return "" }
+	srClientVersion = func() string { return "" }
 	os.Exit(m.Run())
 }
 

@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/manaflow-ai/subrouter/internal/buildversion"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
 
@@ -41,3 +42,16 @@ func shortClientHostName(host string) string {
 const clientNameHeader = proxy.ClientNameHeader
 
 func normalizeClientName(value string) string { return proxy.NormalizeClientName(value) }
+
+// clientVersionHeader carries this sr build's version to the subrouter
+// server, which counts it in /_subrouter/traffic client_versions and strips
+// it before proxying upstream.
+const clientVersionHeader = proxy.ClientVersionHeader
+
+// srClientVersion is the version sr reports in clientVersionHeader, or "" to
+// send none. It is a variable so tests get a stable value.
+var srClientVersion = defaultSRClientVersion
+
+func defaultSRClientVersion() string {
+	return proxy.NormalizeClientVersion(buildversion.Version())
+}
