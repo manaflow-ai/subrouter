@@ -59,9 +59,15 @@ func newServeTranscriptRecorder(options serveTranscriptOptions) (*transcript.Rec
 	if err != nil {
 		return nil, false, fmt.Errorf("transcript container: %w", err)
 	}
+	host := strings.TrimSpace(options.host)
+	if host == "" {
+		// An environment setting, like the container URL, so a worker config
+		// that names it still starts an older binary on rollback.
+		host = strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_HOST"))
+	}
 	recorder, err := transcript.NewSegmentRecorder(transcript.SegmentConfig{
 		Uploader:      client,
-		Host:          options.host,
+		Host:          host,
 		MaxSegmentAge: options.maxSegmentAge,
 		IdleSeal:      options.idleSeal,
 		IndexFlush:    options.indexFlush,
