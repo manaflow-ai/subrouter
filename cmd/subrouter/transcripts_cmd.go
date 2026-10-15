@@ -55,7 +55,7 @@ func newServeTranscriptRecorder(options serveTranscriptOptions) (*transcript.Rec
 	if strings.TrimSpace(options.dir) != "" {
 		slog.Warn("--transcripts is ignored: transcripts stream to the blob container", "container", storeURL)
 	}
-	client, err := transcriptStoreClient(storeURL)
+	client, err := transcriptStoreClient(storeURL, false)
 	if err != nil {
 		return nil, false, fmt.Errorf("transcript container: %w", err)
 	}
@@ -105,19 +105,24 @@ func whoisFunc(resolver proxy.TokenUsageWhoIs) transcript.WhoIsFunc {
 
 // transcriptStoreClient opens the container with the SAS or account key from
 // the environment. Secrets come from files, never argv.
-func transcriptStoreClient(containerURL string) (*transcript.AzureBlobSyncer, error) {
+func transcriptStoreClient(containerURL string, read bool) (*transcript.AzureBlobSyncer, error) {
 	sas, err := secretFromEnvironment("SUBROUTER_TRANSCRIPT_AZURE_SAS", "SUBROUTER_TRANSCRIPT_AZURE_SAS_FILE")
 	if err != nil {
 		return nil, err
 	}
 	key := ""
-	if sas == "" {
-		// The account key variables are shared with the raw-file syncer and
-		// may name another account; a SAS, scoped to this container, wins.
+	if sas == "" || read {
+		// Writers prefer the SAS: the account key variables are shared with
+		// the raw-file syncer and may name another account (the team worker
+		// carries the old account's key). Readers prefer a key when there is
+		// one, because the writer's SAS cannot read or list.
 		key, err = secretFromEnvironment("SUBROUTER_TRANSCRIPT_AZURE_KEY", "SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE")
 		if err != nil {
 			return nil, err
 		}
+	}
+	if key != "" {
+		sas = ""
 	}
 	return transcript.NewAzureBlobClient(transcript.AzureBlobClientConfig{
 		Destination:       containerURL,
@@ -204,7 +209,7 @@ func transcriptsExport(args []string, verifyOnly bool) error {
 	if containerURL == "" {
 		return errors.New("give segment files or --container")
 	}
-	client, err := transcriptStoreClient(containerURL)
+	client, err := transcriptStoreClient(containerURL, true)
 	if err != nil {
 		return err
 	}
@@ -432,7 +437,7 @@ func transcriptsRecompress(args []string) error {
 		if containerURL == "" {
 			return errors.New("--container is required unless --dry-run")
 		}
-		client, err := transcriptStoreClient(containerURL)
+		client, err := transcriptStoreClient(containerURL, false)
 		if err != nil {
 			return err
 		}

@@ -487,12 +487,12 @@ func (w *segmentWriter) run() {
 	}
 }
 
-// housekeeping seals idle and old segments, closes abandoned calls, and
-// writes the index on schedule.
 // housekeepingInterval is the longest the writer goes between time-based
 // checks while it is busy.
 const housekeepingInterval = 5 * time.Second
 
+// housekeeping seals idle and old segments, closes abandoned calls, and
+// writes the index on schedule.
 func (w *segmentWriter) housekeeping() {
 	now := w.cfg.Now()
 	w.lastHousekeeping = now
