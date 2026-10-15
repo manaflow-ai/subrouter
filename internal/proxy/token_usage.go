@@ -1881,21 +1881,23 @@ func (s Server) handleTokenUsage(w http.ResponseWriter, r *http.Request) {
 // account, model, and client label. It is intended for the private team
 // diagnostics surface; it contains counters only, never prompts or bodies.
 type DeviceUsageRow struct {
-	Provider              string           `json:"provider"`
-	AccountID             string           `json:"account_id"`
-	Model                 string           `json:"model"`
-	Client                string           `json:"client"`
-	FirstHour             string           `json:"first_hour"`
-	LastHour              string           `json:"last_hour"`
-	Requests              int64            `json:"requests"`
-	RequestsWithoutUsage  int64            `json:"requests_without_usage"`
-	InputTokens           int64            `json:"input_tokens"`
-	CachedInputTokens     int64            `json:"cached_input_tokens"`
-	CacheWriteInputTokens int64            `json:"cache_write_input_tokens"`
-	OutputTokens          int64            `json:"output_tokens"`
-	ReasoningOutputTokens int64            `json:"reasoning_output_tokens"`
-	AccountSwitches       int64            `json:"account_switches,omitempty"`
-	UpstreamErrors        map[string]int64 `json:"upstream_errors,omitempty"`
+	Provider                 string           `json:"provider"`
+	AccountID                string           `json:"account_id"`
+	Model                    string           `json:"model"`
+	Client                   string           `json:"client"`
+	FirstHour                string           `json:"first_hour"`
+	LastHour                 string           `json:"last_hour"`
+	Requests                 int64            `json:"requests"`
+	RequestsWithoutUsage     int64            `json:"requests_without_usage"`
+	InputTokens              int64            `json:"input_tokens"`
+	CachedInputTokens        int64            `json:"cached_input_tokens"`
+	CacheWriteInputTokens    int64            `json:"cache_write_input_tokens"`
+	OutputTokens             int64            `json:"output_tokens"`
+	ReasoningOutputTokens    int64            `json:"reasoning_output_tokens"`
+	AccountSwitches          int64            `json:"account_switches,omitempty"`
+	AccountSwitchInputTokens int64            `json:"account_switch_input_tokens,omitempty"`
+	AccountSwitchesInRequest int64            `json:"account_switches_in_request,omitempty"`
+	UpstreamErrors           map[string]int64 `json:"upstream_errors,omitempty"`
 }
 
 type deviceUsageKey struct {
@@ -1925,6 +1927,8 @@ func aggregateDeviceUsage(rows []TokenUsageRow) []DeviceUsageRow {
 		item.OutputTokens += row.OutputTokens
 		item.ReasoningOutputTokens += row.ReasoningOutputTokens
 		item.AccountSwitches += row.AccountSwitches
+		item.AccountSwitchInputTokens += row.AccountSwitchInputTokens
+		item.AccountSwitchesInRequest += row.AccountSwitchesInRequest
 		for label, count := range row.UpstreamErrors {
 			if item.UpstreamErrors == nil {
 				item.UpstreamErrors = map[string]int64{}
@@ -1970,6 +1974,14 @@ func (s Server) handleDeviceUsage(w http.ResponseWriter, r *http.Request) {
 	since, err := parseTokenUsageSince(r.URL.Query().Get("since"), now)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if s.TokenUsage == nil {
+		writeJSON(w, struct {
+			Since       string           `json:"since"`
+			GeneratedAt string           `json:"generated_at"`
+			Rows        []DeviceUsageRow `json:"rows"`
+		}{Since: since.Format(time.RFC3339), GeneratedAt: now.Format(time.RFC3339), Rows: []DeviceUsageRow{}})
 		return
 	}
 	rows, err := s.TokenUsage.Rows(since)
