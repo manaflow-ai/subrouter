@@ -263,7 +263,7 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
 		}
 	}
 
-	fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, account.Token)
+	fableWindows, probeErr := r.claudeFableProbe(ctx, client, account)
 	if probeErr == nil {
 		if err == nil {
 			r.rememberClaudeSupplemental(account, fableWindows)

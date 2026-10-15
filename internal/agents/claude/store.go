@@ -4372,29 +4372,85 @@ func FetchFableUsageWindows(ctx context.Context, client *http.Client, accessToke
 	// quota (observed live 2026-07-04: a fresh Max 20x account with 0.0
 	// utilization 429'd the bare probe but answered 200 with unified headers,
 	// including 7d_oi, once the request carried the Claude Code shape).
-	req, err := newFableProbeRequest(ctx, accessToken)
+	result, err := FableProbe(ctx, client, accessToken)
 	if err != nil {
 		return nil, err
 	}
-	res, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 64<<10))
-	windows := usageWindowsFromFableHeaders(res.Header, time.Now())
-	if len(windows) > 0 {
-		return windows, nil
+	if len(result.Windows) > 0 {
+		return result.Windows, nil
 	}
 	// A headerless 429 is a transient burst or bot-shape rejection, never an
 	// authoritative quota signal (the taxonomy that governs the proxy's own
 	// exhaustion marking). Synthesizing 100% here falsely cooked every
 	// account's fable pool and pushed all Fable traffic to Bedrock/API key.
 	// Return no windows so the caller keeps the last known state.
-	if res.StatusCode == http.StatusUnauthorized {
-		return nil, fmt.Errorf("fable probe failed: %s", res.Status)
+	if result.Failure != nil {
+		return nil, result.Failure
 	}
 	return nil, nil
+}
+
+// FableProbeResult is one Messages probe answer. Failure is set for a 401,
+// and for a 403 whose body is a credential death (see
+// ClassifyCredentialDeath); other statuses keep the probe's historical
+// "no windows, no error" meaning.
+type FableProbeResult struct {
+	StatusCode int
+	Windows    []accounts.UsageWindow
+	Failure    *ProbeError
+	// quotaHeaders is set when the answer carried anthropic-ratelimit-unified-*
+	// headers, which only an authenticated credential gets.
+	quotaHeaders bool
+}
+
+// Alive reports whether the Messages API accepted this credential: a 2xx,
+// or a 429 that carries the account's unified quota headers. A headerless
+// 429 can come from an edge limit before authentication, so it proves
+// nothing.
+func (r FableProbeResult) Alive() bool {
+	return (r.StatusCode >= 200 && r.StatusCode < 300) ||
+		(r.StatusCode == http.StatusTooManyRequests && r.quotaHeaders)
+}
+
+func hasUnifiedQuotaHeaders(header http.Header) bool {
+	for key := range header {
+		if strings.HasPrefix(strings.ToLower(key), "anthropic-ratelimit-unified-") {
+			return true
+		}
+	}
+	return false
+}
+
+// FableProbe sends the Claude Code shaped Messages probe and reports its
+// status, its quota headers, and the provider's error envelope on failure.
+func FableProbe(ctx context.Context, client *http.Client, accessToken string) (FableProbeResult, error) {
+	if accessToken == "" {
+		return FableProbeResult{}, nil
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	req, err := newFableProbeRequest(ctx, accessToken)
+	if err != nil {
+		return FableProbeResult{}, err
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return FableProbeResult{}, err
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))
+	result := FableProbeResult{
+		StatusCode: res.StatusCode, Windows: usageWindowsFromFableHeaders(res.Header, time.Now()),
+		quotaHeaders: hasUnifiedQuotaHeaders(res.Header),
+	}
+	if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
+		failure := NewProbeError(res.StatusCode, res.Status, res.Header, body)
+		if res.StatusCode == http.StatusUnauthorized || ClassifyCredentialDeath(res.StatusCode, failure.ErrorType, failure.Message) != "" {
+			result.Failure = failure
+		}
+	}
+	return result, nil
 }
 
 func usageWindowsFromFableHeaders(header http.Header, now time.Time) []accounts.UsageWindow {

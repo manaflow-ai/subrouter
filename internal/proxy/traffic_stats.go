@@ -47,8 +47,11 @@ type TrafficStats struct {
 	responseOth atomic.Uint64
 	proxy5xx    atomic.Uint64
 	upstream5xx atomic.Uint64
-	failuresMu  sync.Mutex
-	failures    []TrafficFailure
+	// clientAborts counts proxy-generated 5xx written after the client had
+	// already gone; they are in no response class.
+	clientAborts atomic.Uint64
+	failuresMu   sync.Mutex
+	failures     []TrafficFailure
 }
 
 // TrafficFailure is a bounded diagnostic sample for a failed client request.
@@ -74,16 +77,20 @@ func NewTrafficStats(now time.Time) *TrafficStats {
 
 // TrafficSnapshot is the /_subrouter/traffic payload.
 type TrafficSnapshot struct {
-	StartedAt     string            `json:"started_at,omitempty"`
-	UptimeSeconds int64             `json:"uptime_seconds"`
-	Version       string            `json:"version"`
-	Requests      uint64            `json:"requests"`
-	Responses     TrafficByClass    `json:"responses"`
-	Proxy5xx      uint64            `json:"proxy_5xx"`
-	Upstream5xx   uint64            `json:"upstream_5xx"`
-	Streams       StreamDropSummary `json:"stream_drops"`
-	Failures      []TrafficFailure  `json:"failures,omitempty"`
-	Admission     admissionSnapshot `json:"admission,omitempty"`
+	StartedAt     string         `json:"started_at,omitempty"`
+	UptimeSeconds int64          `json:"uptime_seconds"`
+	Version       string         `json:"version"`
+	Requests      uint64         `json:"requests"`
+	Responses     TrafficByClass `json:"responses"`
+	Proxy5xx      uint64         `json:"proxy_5xx"`
+	Upstream5xx   uint64         `json:"upstream_5xx"`
+	// ClientAborts is requests the client cancelled before subrouter could
+	// answer; the error the proxy then writes reaches nobody and is not a
+	// proxy failure.
+	ClientAborts uint64            `json:"client_aborts"`
+	Streams      StreamDropSummary `json:"stream_drops"`
+	Failures     []TrafficFailure  `json:"failures,omitempty"`
+	Admission    admissionSnapshot `json:"admission,omitempty"`
 	// CodexCapacity is the live Codex capacity marks (accounts hashed) and
 	// what the capacity retry has done in this process.
 	CodexCapacity *codexCapacityTraffic `json:"codex_capacity,omitempty"`
@@ -126,6 +133,7 @@ func (t *TrafficStats) Snapshot(drops *StreamDropStats, now time.Time) TrafficSn
 	}
 	snapshot.Proxy5xx = t.proxy5xx.Load()
 	snapshot.Upstream5xx = t.upstream5xx.Load()
+	snapshot.ClientAborts = t.clientAborts.Load()
 	t.failuresMu.Lock()
 	snapshot.Failures = append([]TrafficFailure(nil), t.failures...)
 	t.failuresMu.Unlock()
@@ -275,9 +283,15 @@ func (t *TrafficStats) trafficCounted(next http.Handler) http.Handler {
 					status = http.StatusOK
 				}
 			}
-			t.observe(status, writer.upstream)
-			if status >= 500 {
-				t.recordFailure(record, status, time.Now())
+			switch {
+			case status >= 500 && !writer.upstream && errors.Is(r.Context().Err(), context.Canceled):
+				// The client hung up first; the proxy's error went nowhere.
+				t.clientAborts.Add(1)
+			default:
+				t.observe(status, writer.upstream)
+				if status >= 500 {
+					t.recordFailure(record, status, time.Now())
+				}
 			}
 			if recovered != nil {
 				panic(recovered)
