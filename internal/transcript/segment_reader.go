@@ -500,6 +500,11 @@ func normalizeNumbers(value any) any {
 }
 
 func headerMap(value any) map[string][]string {
+	// The writer sees headers as recorded (map[string][]string); a reader
+	// sees them decoded from JSON.
+	if headers, ok := value.(map[string][]string); ok {
+		return headers
+	}
 	raw, ok := value.(map[string]any)
 	if !ok {
 		return nil
