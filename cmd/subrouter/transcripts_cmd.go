@@ -110,9 +110,14 @@ func transcriptStoreClient(containerURL string) (*transcript.AzureBlobSyncer, er
 	if err != nil {
 		return nil, err
 	}
-	key, err := secretFromEnvironment("SUBROUTER_TRANSCRIPT_AZURE_KEY", "SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE")
-	if err != nil {
-		return nil, err
+	key := ""
+	if sas == "" {
+		// The account key variables are shared with the raw-file syncer and
+		// may name another account; a SAS, scoped to this container, wins.
+		key, err = secretFromEnvironment("SUBROUTER_TRANSCRIPT_AZURE_KEY", "SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE")
+		if err != nil {
+			return nil, err
+		}
 	}
 	return transcript.NewAzureBlobClient(transcript.AzureBlobClientConfig{
 		Destination:       containerURL,

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/klauspost/compress/zstd"
@@ -351,4 +352,84 @@ func (s *fakeBlobStore) blobs() map[string][]byte {
 		out[name] = data
 	}
 	return out
+}
+
+// TestSegmentTranscriptsCommitIdleSessionsUnderSteadyTraffic keeps one
+// session busy without pause and checks that another, idle session is still
+// committed and indexed on time: time-based work must not wait for the
+// writer to go quiet.
+func TestSegmentTranscriptsCommitIdleSessionsUnderSteadyTraffic(t *testing.T) {
+	t.Parallel()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":1}}}\n\n"))
+	}))
+	defer upstream.Close()
+	upstreamURL, _ := url.Parse(upstream.URL)
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newFakeBlobStore(t)
+	defer store.server.Close()
+	client, err := transcript.NewAzureBlobClient(transcript.AzureBlobClientConfig{Destination: store.server.URL + "/calls", SASToken: "sv=test", MaxBytesPerSecond: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder, err := transcript.NewSegmentRecorder(transcript.SegmentConfig{Uploader: client, Host: "test-router", IdleSeal: 300 * time.Millisecond, IndexFlush: 300 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recorder.Close()
+	subrouter := httptest.NewServer(Server{
+		Upstream:     upstreamURL,
+		Accounts:     []accounts.Account{{ID: "a@example.com", AuthMode: accounts.AuthModeOAuth, Token: "a-token"}},
+		Sessions:     sessions,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1 << 20,
+		Transcripts:  recorder,
+	}.Handler())
+	defer subrouter.Close()
+	post := func(sessionID string) {
+		req, _ := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{"session_id":"`+sessionID+`","input":"hi"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Codex-Window-ID", sessionID)
+		response, err := http.DefaultClient.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+		}
+	}
+	post("quiet:0")
+	stop := make(chan struct{})
+	busyDone := make(chan struct{})
+	go func() {
+		defer close(busyDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				post("busy:0")
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-busyDone
+	}()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		var quietSegment, index bool
+		for name := range store.blobs() {
+			quietSegment = quietSegment || strings.Contains(name, "/quiet/")
+			index = index || strings.HasPrefix(name, "calls/index/v1/")
+		}
+		if quietSegment && index {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("idle session was not committed and indexed while another session stayed busy; blobs: %v", len(store.blobs()))
 }
