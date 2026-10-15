@@ -35,7 +35,6 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 	"github.com/manaflow-ai/subrouter/internal/tailnet"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
-	"github.com/manaflow-ai/subrouter/internal/transcript"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 )
@@ -216,6 +215,8 @@ func runForProgram(program string, args []string) error {
 		return probe(args[1:])
 	case "accounts":
 		return listAccounts()
+	case "transcripts":
+		return runTranscriptsCommand(args[1:])
 	case "codex":
 		return codex(args[1:])
 	case "cx":
@@ -384,6 +385,13 @@ func serve(args []string) error {
 	transcriptLocalRetention := flags.Duration("transcript-local-retention", 0, "delete local transcript files older than this after successful GCS sync; 0 disables")
 	transcriptMaxLocalBytesRaw := flags.String("transcript-max-local-bytes", "0", "max bytes to keep in the local transcript spool after successful GCS sync; supports KiB/MiB/GiB suffixes; 0 disables")
 	transcriptAzureRate := flags.String("transcript-azure-max-bytes-per-second", "2MiB", "cap on Azure transcript upload throughput; supports KiB/MiB/GiB suffixes; 0 disables the cap")
+	transcriptFormat := flags.String("transcript-format", "", "transcript layout: segments (one delta-encoded, compressed stream per process, uploaded as block blobs; the single-tenant default) or jsonl (one raw file per session; the multi-tenant default)")
+	transcriptHost := flags.String("transcript-host", "", "host name recorded in transcript segments and their blob paths; default the machine host name")
+	transcriptSegmentBytesRaw := flags.String("transcript-segment-max-bytes", "256MiB", "seal a transcript segment at this raw size")
+	transcriptSegmentAge := flags.Duration("transcript-segment-max-age", time.Hour, "seal a transcript segment at this age")
+	transcriptSegmentIdle := flags.Duration("transcript-segment-idle", 10*time.Minute, "seal a transcript segment after this long without events")
+	transcriptConvertLegacy := flags.Bool("transcript-convert-legacy", true, "in segments format, convert raw per-session transcript files in --transcripts to segments, upload them, and delete each file after a verified upload")
+	transcriptAzureTier := flags.String("transcript-azure-tier", "Cool", "access tier for uploaded transcript segments (Hot, Cool, Cold)")
 	transcriptAzureURL := flags.String("transcript-azure-url", "", "optional Azure blob container URL (https://<account>.blob.core.windows.net/<container>[/<prefix>]) for background transcript sync; defaults to SUBROUTER_TRANSCRIPT_AZURE_URL")
 	srSwitchInterval := defaultSRSwitchInterval
 	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for refreshing OAuth usage scores used by routing; non-positive disables scheduled refresh")
@@ -865,6 +873,33 @@ func serve(args []string) error {
 	errorEvents := proxy.NewErrorEventLog(filepath.Join(filepath.Dir(*sessionPath), "error-events.jsonl"), slog.Default())
 	go errorEvents.Run(tokenUsageCtx)
 
+	transcriptAzureKey, err := secretFromEnvironment("SUBROUTER_TRANSCRIPT_AZURE_KEY", "SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE")
+	if err != nil {
+		return fmt.Errorf("transcript azure key: %w", err)
+	}
+	transcriptAzureMaxBytesPerSecond, err := parseByteSize(*transcriptAzureRate)
+	if err != nil {
+		return fmt.Errorf("transcript-azure-max-bytes-per-second: %w", err)
+	}
+	if transcriptAzureMaxBytesPerSecond == 0 {
+		// The syncer reads zero as "use the default", so an explicit 0 from the
+		// operator has to say "no cap" in the syncer's own terms.
+		transcriptAzureMaxBytesPerSecond = -1
+	}
+	transcriptSegmentBytes, err := parseByteSize(*transcriptSegmentBytesRaw)
+	if err != nil {
+		return fmt.Errorf("transcript-segment-max-bytes: %w", err)
+	}
+	transcriptRecorder, transcriptSegmentMode, err := newServeTranscriptRecorder(serveTranscriptOptions{
+		dir: *transcriptDir, format: *transcriptFormat, multiTenant: *multiTenant, host: *transcriptHost,
+		maxSegmentBytes: transcriptSegmentBytes, maxSegmentAge: *transcriptSegmentAge, idleSeal: *transcriptSegmentIdle,
+		maxLocalBytes: transcriptMaxLocalBytes, azureDestination: transcriptAzureDestination, azureKey: transcriptAzureKey,
+		azureSAS: strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_SAS")), azureTier: *transcriptAzureTier,
+		azureRate: transcriptAzureMaxBytesPerSecond, whois: tokenUsageWhoIs, convertLegacy: *transcriptConvertLegacy,
+	})
+	if err != nil {
+		return err
+	}
 	server := proxy.Server{
 		StreamDrops:              &proxy.StreamDropStats{},
 		TokenUsage:               tokenUsage,
@@ -919,59 +954,21 @@ func serve(args []string) error {
 		ClaudeOverloadReroute:         claudeOverloadReroute,
 		ClaudeOverloadRetry:           claudeOverloadRetry,
 		FableBedrockPrimary:           fableBedrockEnabled,
-		Transcripts:                   transcript.NewRecorder(*transcriptDir),
+		Transcripts:                   transcriptRecorder,
 	}
 	if err := server.ValidateCredentialUpstreams(); err != nil {
 		return err
 	}
-	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
-		SourceDir:      *transcriptDir,
-		Destination:    *transcriptGCSURI,
-		Interval:       *transcriptGCSSyncInterval,
-		Timeout:        *transcriptGCSSyncTimeout,
-		LocalRetention: *transcriptLocalRetention,
-		MaxLocalBytes:  transcriptMaxLocalBytes,
-		Logger:         slog.Default(),
-	})
-	if transcriptGCSSyncer.Enabled() {
-		go transcriptGCSSyncer.Run(context.Background())
-	}
-	transcriptAzureKey, err := secretFromEnvironment("SUBROUTER_TRANSCRIPT_AZURE_KEY", "SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE")
-	if err != nil {
-		return fmt.Errorf("transcript azure key: %w", err)
-	}
-	transcriptAzureMaxBytesPerSecond, err := parseByteSize(*transcriptAzureRate)
-	if err != nil {
-		return fmt.Errorf("transcript-azure-max-bytes-per-second: %w", err)
-	}
-	if transcriptAzureMaxBytesPerSecond == 0 {
-		// The syncer reads zero as "use the default", so an explicit 0 from the
-		// operator has to say "no cap" in the syncer's own terms.
-		transcriptAzureMaxBytesPerSecond = -1
-	}
-	transcriptAzureSyncer := transcript.NewAzureBlobSyncer(transcript.AzureBlobSyncerConfig{
-		MaxBytesPerSecond: transcriptAzureMaxBytesPerSecond,
-		SourceDir:         *transcriptDir,
-		Destination:       transcriptAzureDestination,
-		AccountKey:        transcriptAzureKey,
-		SASToken:          strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_SAS")),
-		Interval:          *transcriptGCSSyncInterval,
-		Timeout:           *transcriptGCSSyncTimeout,
-		LocalRetention:    *transcriptLocalRetention,
-		MaxLocalBytes:     transcriptMaxLocalBytes,
-		Logger:            slog.Default(),
-	})
-	if transcriptAzureSyncer.Enabled() {
-		slog.Info("transcript azure sync enabled", "destination", transcriptAzureSyncer.Destination(), "interval", (*transcriptGCSSyncInterval).String())
-		go transcriptAzureSyncer.Run(context.Background())
-	} else if transcriptAzureDestination != "" {
-		// A destination that produces no syncer means the credential is missing
-		// or the URL is malformed. Saying so at startup is the difference
-		// between a broken pipeline and a silent one, which is how the last
-		// transcript sync stopped without anyone noticing.
-		slog.Warn("transcript azure sync is configured but not usable",
-			"destination", transcriptAzureDestination,
-			"fix", "set SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE (or SUBROUTER_TRANSCRIPT_AZURE_SAS) and check the container URL")
+	if !transcriptSegmentMode {
+		if err := startLegacyTranscriptSync(legacyTranscriptSyncOptions{
+			dir: *transcriptDir, gcsURI: *transcriptGCSURI, interval: *transcriptGCSSyncInterval, timeout: *transcriptGCSSyncTimeout,
+			retention: *transcriptLocalRetention, maxLocalBytes: transcriptMaxLocalBytes, azureDestination: transcriptAzureDestination,
+			azureKey: transcriptAzureKey, azureRate: transcriptAzureMaxBytesPerSecond,
+		}); err != nil {
+			return err
+		}
+	} else if strings.TrimSpace(*transcriptGCSURI) != "" {
+		slog.Warn("--transcript-gcs-uri only applies to --transcript-format jsonl; segments upload to Azure")
 	}
 	if autoSwitchScoresEnabled {
 		fetchScores := func(ctx context.Context, candidates []accounts.Account) ([]selectacct.Score, int) {
