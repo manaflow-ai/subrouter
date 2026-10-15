@@ -434,4 +434,3 @@ func fileMD5(path string) ([]byte, int64, error) {
 	}
 	return hash.Sum(nil), n, nil
 }
-
