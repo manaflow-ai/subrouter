@@ -21,14 +21,12 @@ import (
 
 // functionalCanaryTestLister prints every unittest id in the functional
 // canary suite, relative to its module, so the Go test can run each one as a
-// parallel subtest instead of the whole suite serially. A second column marks
-// cases that observe the runner's shared lease directory and must run alone.
+// parallel subtest instead of the whole suite serially.
 const functionalCanaryTestLister = `
 import importlib.util, sys, unittest
 spec = importlib.util.spec_from_file_location("functional_canary_tests", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-exclusive = module.SHARED_LEASE_DIRECTORY_TESTS
 def walk(suite):
     for item in suite:
         if isinstance(item, unittest.TestSuite):
@@ -36,7 +34,7 @@ def walk(suite):
         else:
             yield item
 for test in walk(unittest.defaultTestLoader.loadTestsFromModule(module)):
-    print(test.id().split(".", 1)[1], "exclusive" if test._testMethodName in exclusive else "parallel")
+    print(test.id().split(".", 1)[1])
 `
 
 func TestLaunchAgentFunctionalCanaryRunner(t *testing.T) {
@@ -55,18 +53,16 @@ func TestLaunchAgentFunctionalCanaryRunner(t *testing.T) {
 	}
 	// Each case spawns its own runner processes, uses its own temporary
 	// directory, and takes run leases keyed by those private paths, so cases
-	// are independent and can run concurrently. Cases that snapshot the
-	// shared lease directory run to completion before any parallel case
-	// resumes, which happens only after this function returns.
-	for _, line := range lines {
-		name, mode, ok := strings.Cut(line, " ")
-		if !ok || (mode != "exclusive" && mode != "parallel") {
-			t.Fatalf("unexpected functional canary test listing line %q", line)
+	// are independent and can run concurrently. No case may assert on the
+	// runner's shared per-user lease directory as a whole: every runner on
+	// the machine writes there, including other tests in this package and
+	// test runs in other checkouts, so nothing here can make it run alone.
+	for _, name := range lines {
+		if name == "" || strings.ContainsAny(name, " \t") {
+			t.Fatalf("unexpected functional canary test listing line %q", name)
 		}
 		t.Run(name, func(t *testing.T) {
-			if mode == "parallel" {
-				t.Parallel()
-			}
+			t.Parallel()
 			command := exec.Command(python, script, name)
 			configureTestProcessGroup(command)
 			var output bytes.Buffer
