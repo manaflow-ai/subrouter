@@ -186,6 +186,7 @@ func runForProgram(program string, args []string) error {
 		printVersion(versionOut, program)
 		return nil
 	}
+	maybeStartAutoUpdate(program, args)
 	switch args[0] {
 	case "update":
 		return runUpdateCommand(program, args[1:])

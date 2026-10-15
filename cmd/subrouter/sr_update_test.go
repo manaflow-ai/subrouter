@@ -40,6 +40,8 @@ type updateFixture struct {
 	running    string
 	restarts   int
 	upgrades   []string
+	// active is what the fake daemon's drain-status reports in flight.
+	active int
 }
 
 type fakeUpdateController struct{ f *updateFixture }
@@ -137,6 +139,12 @@ func newUpdateFixture(t *testing.T, installed string) *updateFixture {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "version": running})
 	})
+	mux.HandleFunc("/_subrouter/drain-status", func(w http.ResponseWriter, _ *http.Request) {
+		f.mu.Lock()
+		active := f.active
+		f.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "active_proxy_requests": active})
+	})
 	f.server = httptest.NewServer(mux)
 	t.Cleanup(f.server.Close)
 
@@ -169,10 +177,14 @@ func newUpdateFixture(t *testing.T, installed string) *updateFixture {
 			f.restartFromDisk()
 			return nil
 		},
-		now:         time.Now,
-		out:         f.out,
-		in:          strings.NewReader(""),
-		programName: "sr",
+		now:           time.Now,
+		out:           f.out,
+		in:            strings.NewReader(""),
+		programName:   "sr",
+		autoStampPath: filepath.Join(home, ".subrouter", "auto-update.json"),
+		autoLogPath:   filepath.Join(home, ".subrouter", "logs", "auto-update.log"),
+		idleSamples:   2,
+		idleInterval:  time.Millisecond,
 	}
 	return f
 }
