@@ -113,11 +113,14 @@ func TestKnownExhaustionDoesNotStarveOtherHealthyAccounts(t *testing.T) {
 	if scored != 1 {
 		t.Fatalf("scored=%d, want one healthy account to refresh", scored)
 	}
-	if got := transport.count(exhausted.Token); got != 0 {
-		t.Fatalf("exhausted account made %d upstream calls while other account was healthy", got)
-	}
 	if got := transport.count(healthy.Token); got == 0 {
 		t.Fatal("healthy account was not refreshed")
+	}
+	// The exhausted Claude account gets only the sparse credential liveness
+	// probe (one per claudeLivenessProbeInterval), never a usage refresh.
+	server.scoreAccounts(context.Background(), accountsList)
+	if got := transport.count(exhausted.Token); got != 1 {
+		t.Fatalf("exhausted account made %d upstream calls while other account was healthy, want one liveness probe", got)
 	}
 }
 
