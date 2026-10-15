@@ -5886,6 +5886,9 @@ func (s Server) proxyHandler() http.Handler {
 		proxyRequest.URL = cloneURL(r.URL)
 		proxyRequest.URL.Path = s.pathForUpstream(proxyRequest.URL.Path, account)
 		proxyRequest.URL.RawPath = ""
+		if requestProvider == accounts.ProviderCodex {
+			ensureCodexCatalogClientVersion(proxyRequest, account)
+		}
 		session.StripSubrouterHeaders(proxyRequest.Header)
 		proxyRequest.Header.Del("X-Subrouter-Preferred-Account-ID")
 		// Every outbound attempt (retries, replays, fallbacks, catalog pages)
@@ -9616,6 +9619,29 @@ func codexModelCatalogRequest(r *http.Request) bool {
 		return false
 	}
 	return r.URL.Path == "/models" || r.URL.Path == "/v1/models"
+}
+
+// codexDefaultCatalogClientVersion stands in for the client_version query
+// parameter when a caller lists Codex models without one. Codex itself always
+// sends it; curl, health monitors and OpenAI SDK clients do not.
+const codexDefaultCatalogClientVersion = "0.162.0"
+
+// ensureCodexCatalogClientVersion adds client_version to a model list bound
+// for the ChatGPT Codex backend. chatgpt.com/backend-api/codex/models requires
+// it and answers 400 "client_version Field required" without it, while the
+// OpenAI API /v1/models that an API-key account reaches takes no such
+// parameter, so only OAuth-bound requests are changed. A caller's own value is
+// kept.
+func ensureCodexCatalogClientVersion(r *http.Request, account accounts.Account) {
+	if r == nil || r.URL == nil || r.Method != http.MethodGet || account.AuthMode != accounts.AuthModeOAuth || r.URL.Path != "/models" {
+		return
+	}
+	query := r.URL.Query()
+	if strings.TrimSpace(query.Get("client_version")) != "" {
+		return
+	}
+	query.Set("client_version", codexDefaultCatalogClientVersion)
+	r.URL.RawQuery = query.Encode()
 }
 
 // codexCatalogCallerAccount maps an unpinned catalog request to the pool
