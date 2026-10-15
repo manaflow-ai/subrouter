@@ -2991,6 +2991,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc(ErrorEventsPath, s.requireAdmin(s.handleErrorEvents))
 	mux.HandleFunc(AccountStatePath, s.requireAdmin(s.handleAccountState))
 	mux.HandleFunc(ClaudeCredentialDeathsPath, s.requireAdmin(s.handleClaudeCredentialDeaths))
+	mux.HandleFunc("/_subrouter/device-usage", s.requireAdmin(s.handleDeviceUsage))
 	mux.HandleFunc("/_subrouter/", http.NotFound)
 	if s.Bedrock != nil && !s.RequireSessionLease {
 		mux.Handle("/bedrock/", s.bedrockHandler())

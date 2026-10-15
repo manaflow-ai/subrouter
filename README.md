@@ -195,6 +195,7 @@ POST /_subrouter/account-status
 GET /_subrouter/account-import
 POST /_subrouter/account-import
 GET /_subrouter/usage-status
+GET /_subrouter/device-usage
 GET /_subrouter/sessions
 GET /_subrouter/dashboard
 GET /_subrouter/transcripts
@@ -1060,6 +1061,16 @@ curl -s -H "Authorization: Bearer $SUBROUTER_ADMIN_TOKEN" \
 ```
 
 `since` takes a duration (`24h`, the default) or an RFC3339 time, and reaches back at most 30 days. The reply is `{"since", "generated_at", "rows": [...]}`, one row per hour, provider, `account_id`, model, and client, with `requests`, `requests_without_usage`, `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, and `reasoning_output_tokens`. The endpoint needs admin access.
+
+For a team rollup by computer and connected account, use the private
+`/_subrouter/device-usage` endpoint with the same `since` parameter. It
+aggregates the retained rows by provider, serving account, model, and client
+label and returns first/last hour, request and token totals, account switches,
+and upstream errors. `X-Subrouter-Client` is the client label; the `sr`
+launchers use the machine's short host name by default, or
+`SUBROUTER_CLIENT_NAME` when a team wants a stable enrolled label. This view
+contains counters only and is admin-gated; it does not store or return
+prompts, completions, credentials, or raw IP addresses.
 
 Rows also carry these fields, each left out when zero, so older logs and older readers still work:
 
