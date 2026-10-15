@@ -16,6 +16,21 @@ func claudeFableModel(model string) bool {
 	return strings.Contains(strings.ToLower(model), "fable")
 }
 
+// claudeBedrockFallbackModel reports whether a Claude request for this model
+// may use the fallback chain: Fable always, every model once a Bedrock model
+// is configured for all of them.
+func (s Server) claudeBedrockFallbackModel(model string) bool {
+	return claudeFableModel(model) || s.ClaudeBedrockModelID != ""
+}
+
+// claudeBedrockModelID is the Bedrock inference profile the chain uses.
+func (s Server) claudeBedrockModelID() string {
+	if s.ClaudeBedrockModelID != "" {
+		return s.ClaudeBedrockModelID
+	}
+	return bedrockFableModelID
+}
+
 // claudeFableEnabled reports whether a Fable fallback route is configured (the
 // Bedrock gateway or a dedicated Anthropic API key). Fable routing order is
 // subscription pool first, then Bedrock, then the API key; this only gates the

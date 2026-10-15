@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -69,6 +70,10 @@ func (s Server) bedrockHandler() http.Handler {
 		}
 		if cfg.GatewayToken != "" && !bedrockGatewayTokenOK(r, cfg.GatewayToken) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if ok, reason := s.ClaudeBedrockBudget.Allow(r.Context()); !ok {
+			http.Error(w, "bedrock gateway refused: "+reason, http.StatusServiceUnavailable)
 			return
 		}
 
@@ -200,6 +205,10 @@ func withoutDisabledThinking(body []byte) []byte {
 // recorded like the /bedrock/* gateway path.
 func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*http.Response, error) {
 	cfg := s.Bedrock
+	if ok, reason := s.ClaudeBedrockBudget.Allow(ctx); !ok {
+		return nil, fmt.Errorf("claude bedrock fallback refused: %s", reason)
+	}
+	modelID := s.claudeBedrockModelID()
 	// Bedrock's Anthropic schema rejects OAuth-only request fields with a 400
 	// ("context_management: Extra inputs are not permitted"), which used to
 	// push every context-editing Claude Code request straight to the API key.
@@ -234,7 +243,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	if stream {
 		endpoint = "invoke-with-response-stream"
 	}
-	path := "/model/" + bedrockFableModelID + "/" + endpoint
+	path := "/model/" + modelID + "/" + endpoint
 	var resp *http.Response
 	var sourceName, region string
 	started := time.Now()
@@ -246,9 +255,9 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if s.Logger != nil {
-				s.Logger.Warn("bedrock throttled", "model", bedrockFableModelID, "path", path, "bedrock_source", sourceName, "region", region)
+				s.Logger.Warn("bedrock throttled", "model", modelID, "path", path, "bedrock_source", sourceName, "region", region)
 			}
-			cfg.onThrottle(sourceName, region, bedrockFableModelID)
+			cfg.onThrottle(sourceName, region, modelID)
 		}
 		if !stream || resp.StatusCode != http.StatusOK {
 			break
@@ -482,16 +491,17 @@ func (s Server) recordClaudeFableBedrockCost(started time.Time, region string, s
 	if cfg == nil || cfg.CostLogPath == "" {
 		return
 	}
+	modelID := s.claudeBedrockModelID()
 	record := bedrockCostRecord{
 		Timestamp:  started.UTC().Format(time.RFC3339),
-		Model:      bedrockFableModelID,
+		Model:      modelID,
 		Region:     region,
 		Status:     status,
 		DurationMs: time.Since(started).Milliseconds(),
 	}
 	if haveUsage {
 		record.Usage = usage
-		record.CostUSD = usage.costUSD(bedrockFableModelID)
+		record.CostUSD = usage.costUSD(modelID)
 	}
 	appendBedrockCostRecord(cfg.CostLogPath, record)
 }

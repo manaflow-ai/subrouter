@@ -423,6 +423,9 @@ func serve(args []string) error {
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
 	bedrockProfiles := flags.String("bedrock-profiles", "", "comma-separated AWS profiles for the Bedrock gateway; defaults to SUBROUTER_BEDROCK_PROFILES or discovered awN profiles")
 	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
+	claudeBedrockModel := flags.String("claude-bedrock-model", "", "Bedrock inference profile that serves every Claude model the subscription pool cannot serve (needs --bedrock and --claude-bedrock-budget-url); defaults to SUBROUTER_CLAUDE_BEDROCK_MODEL; empty keeps the fallback Fable-only")
+	claudeBedrockBudgetURL := flags.String("claude-bedrock-budget-url", "", "spend ledger (GET, JSON remainingUsd) that must admit each Claude Bedrock call; bearer token from SUBROUTER_CLAUDE_BEDROCK_BUDGET_TOKEN_FILE; defaults to SUBROUTER_CLAUDE_BEDROCK_BUDGET_URL")
+	claudeBedrockBudgetReserve := flags.Float64("claude-bedrock-budget-reserve-usd", 500, "remaining ledger balance in USD below which Claude Bedrock calls stop")
 	fableBedrockPrimary := flags.Bool("fable-bedrock-primary", false, "route Claude Fable to Bedrock first (before the subscription pool); defaults to SUBROUTER_FABLE_BEDROCK_PRIMARY")
 	cloudConfigPath := flags.String("cloud-config", "", "cmux.com team credential config; defaults to ~/.config/subrouter/cloud.json")
 	cloudBaseURL := flags.String("cloud-base-url", "", "override the cmux.com API origin loaded from the cloud config")
@@ -826,6 +829,39 @@ func serve(args []string) error {
 		slog.Info("bedrock gateway enabled", "regions", strings.Join(regions, ","), "auth", token != "", "autobump", *bedrockAutoBump, "profiles", strings.Join(bedrockSourceNames(sources), ","))
 	}
 
+	claudeBedrockModelID := strings.TrimSpace(*claudeBedrockModel)
+	if claudeBedrockModelID == "" {
+		claudeBedrockModelID = strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_BEDROCK_MODEL"))
+	}
+	budgetURL := strings.TrimSpace(*claudeBedrockBudgetURL)
+	if budgetURL == "" {
+		budgetURL = strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_BEDROCK_BUDGET_URL"))
+	}
+	var claudeBedrockBudget *proxy.ClaudeBedrockBudget
+	if budgetURL != "" {
+		budgetToken, err := secretFromEnvironment("SUBROUTER_CLAUDE_BEDROCK_BUDGET_TOKEN", "SUBROUTER_CLAUDE_BEDROCK_BUDGET_TOKEN_FILE")
+		if err != nil {
+			return fmt.Errorf("claude bedrock budget token: %w", err)
+		}
+		claudeBedrockBudget = &proxy.ClaudeBedrockBudget{
+			URL:        budgetURL,
+			Token:      func() (string, error) { return budgetToken, nil },
+			ReserveUSD: *claudeBedrockBudgetReserve,
+			Client:     &http.Client{Transport: outboundTransport, Timeout: 15 * time.Second},
+		}
+	}
+	if claudeBedrockModelID != "" {
+		// Every Claude model can now spend on Bedrock, so an uncapped
+		// account is a configuration error, not a default.
+		if bedrockConfig == nil {
+			return errors.New("--claude-bedrock-model needs --bedrock")
+		}
+		if claudeBedrockBudget == nil {
+			return errors.New("--claude-bedrock-model needs --claude-bedrock-budget-url")
+		}
+		slog.Info("claude bedrock fallback enabled for every model", "model", claudeBedrockModelID, "budget_url", budgetURL, "reserve_usd", *claudeBedrockBudgetReserve)
+	}
+
 	// Tailnet authentication is for self-hosted servers whose port is already
 	// restricted to a tailnet by ACL. It is deliberately incompatible with
 	// multi-tenant mode: a shared cloud deployment authenticates tenants, not
@@ -939,6 +975,8 @@ func serve(args []string) error {
 		MaxBodyBytes:             *maxBodyBytes,
 		Bedrock:                  bedrockConfig,
 		ClaudeFableAPIKey:        fableAPIKey,
+		ClaudeBedrockModelID:     claudeBedrockModelID,
+		ClaudeBedrockBudget:      claudeBedrockBudget,
 		// SUBROUTER_FABLE_CACHE_1H_OFF=1 disables the ephemeral->1h
 		// cache_control TTL upgrade on the Bedrock path.
 		ClaudeFableCacheTTLUpgradeOff: envTrue("SUBROUTER_FABLE_CACHE_1H_OFF"),

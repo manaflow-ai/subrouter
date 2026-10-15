@@ -198,6 +198,14 @@ type Server struct {
 	// ONLY to Fable; Opus/Sonnet/etc. continue to use the OAuth pool and never
 	// touch this key.
 	ClaudeFableAPIKey string
+	// ClaudeBedrockModelID, when set, opens the Fable fallback chain to every
+	// Claude model: a Messages call the subscription pool cannot serve goes
+	// to Bedrock as this inference profile, whatever model it asked for.
+	// Empty keeps the chain Fable-only.
+	ClaudeBedrockModelID string
+	// ClaudeBedrockBudget, when set, must admit each Bedrock call of the
+	// chain and of the /bedrock/* gateway. Nil means no cap.
+	ClaudeBedrockBudget *ClaudeBedrockBudget
 
 	// ClaudeFableCacheTTLUpgradeOff disables the Bedrock-path rewrite of bare
 	// ephemeral cache_control blocks to the 1-hour TTL (see
@@ -5711,7 +5719,7 @@ func (s Server) proxyHandler() http.Handler {
 			requestPoolModel = claudePoolModel(requestModel)
 			retryPoolModel = requestPoolModel
 			fableFallbackConfigured = !noRetry && !autonomousRetry && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
-				s.claudeFableEnabled() && claudeFableModel(requestModel) &&
+				s.claudeFableEnabled() && s.claudeBedrockFallbackModel(requestModel) &&
 				r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
 		}
 		// Bedrock-primary: when enabled, serve Fable straight from Bedrock before
