@@ -20,8 +20,7 @@ import (
 type ClaudeBedrockBudget struct {
 	// URL answers GET with JSON carrying remainingUsd.
 	URL string
-	// Token returns the bearer token, read again for every refresh so a
-	// rotated token file takes effect without a restart.
+	// Token returns the bearer token for each ledger read.
 	Token func() (string, error)
 	// ReserveUSD is the remaining balance below which the fallback stops.
 	ReserveUSD float64
@@ -42,7 +41,7 @@ type ClaudeBedrockBudget struct {
 
 const (
 	claudeBedrockBudgetRefresh = time.Minute
-	claudeBedrockBudgetStale   = 10 * time.Minute
+	claudeBedrockBudgetStale   = 5 * time.Minute
 )
 
 func (b *ClaudeBedrockBudget) clock() time.Time {
@@ -70,17 +69,11 @@ func (b *ClaudeBedrockBudget) Allow(ctx context.Context) (bool, string) {
 	now := b.clock()
 	if now.Sub(b.attemptedAt) >= refresh {
 		b.attemptedAt = now
-		// Only one caller refreshes; the rest use the last read meanwhile.
-		// The very first read has nothing to fall back on, so it keeps the
-		// lock and the other callers wait for it.
-		first := b.readAt.IsZero()
-		if !first {
-			b.mu.Unlock()
-		}
+		// Only one caller refreshes; the rest use the last read meanwhile,
+		// and are refused until a first read has succeeded.
+		b.mu.Unlock()
 		remaining, err := b.read(ctx)
-		if !first {
-			b.mu.Lock()
-		}
+		b.mu.Lock()
 		if err == nil {
 			b.remaining, b.readAt, b.lastErr = remaining, b.clock(), nil
 		} else {

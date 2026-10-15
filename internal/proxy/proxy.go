@@ -5596,7 +5596,7 @@ func (s Server) proxyHandler() http.Handler {
 		// touching the subscription pool. A non-2xx or unreachable Bedrock restores
 		// the body and falls through to the normal pool path (which still carries
 		// its own Bedrock/API-key fallback), so this never hard-fails Fable.
-		if preferredAccountID == "" && s.FableBedrockPrimary && fableFallbackConfigured && s.Bedrock != nil && s.Bedrock.configured() {
+		if preferredAccountID == "" && s.FableBedrockPrimary && fableFallbackConfigured && claudeFableModel(requestModel) && s.Bedrock != nil && s.Bedrock.configured() {
 			if s.serveClaudeFableBedrockPrimary(w, r) {
 				return
 			}
@@ -10964,7 +10964,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				schedulerAccountProvider(t.provider), accountID, t.poolModel, time.Now(),
 			); blocked {
 				tried[accountID] = struct{}{}
-				next, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
+				next, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil && claudeFableModel(t.poolModel), false)
 				if pickErr != nil {
 					return nil, pickErr
 				}
@@ -11024,7 +11024,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if admissionRejected(err) && a.replayable() && req.Context().Err() == nil &&
 			attempt < maxAttempts && t.server != nil {
 			tried[accountID] = struct{}{}
-			next, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
+			next, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil && claudeFableModel(t.poolModel), false)
 			if pickErr == nil {
 				if nextReq, replayErr := a.replay(replayReq, &next); replayErr == nil {
 					if t.logger != nil {
@@ -11059,9 +11059,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				}
 			}
 		}
-		// Every account the request could move to is paused or full too.
-		// Nothing reached an upstream, so the fallback chain can serve it.
-		if admissionRejected(err) && a.replayable() && req.Context().Err() == nil {
+		// Every account the request could move to is paused after a rate
+		// limit too. Nothing reached an upstream, so the fallback chain can
+		// serve it. A full queue is a burst on accounts that still have quota:
+		// it keeps its 503 so the client retries onto the subscriptions.
+		if errors.Is(err, errAdmissionPaused) && a.replayable() && req.Context().Err() == nil {
 			if fallback, ok := t.fableFallbackResponse(response, accountID, "admission_rejected"); ok {
 				return fallback, nil
 			}
@@ -11455,7 +11457,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		nextAccount, pickErr := compatibilityNext, compatibilityPickErr
 		if !modelUnsupported {
-			nextAccount, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, !claudeExtraUsageRetried)
+			nextAccount, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil && claudeFableModel(t.poolModel), !claudeExtraUsageRetried)
 		}
 		if pickErr != nil {
 			if t.logger != nil {
