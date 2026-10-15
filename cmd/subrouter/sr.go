@@ -2949,6 +2949,8 @@ func claudeAvailabilityReset(row srUsageRow) (int64, bool) {
 	return reset, found
 }
 
+// claudeCreditCooldownActive reports whether a Claude API-credit row is held
+// out until its next bounded probe.
 func claudeCreditCooldownActive(row srUsageRow) bool {
 	return usageProvider(row) == accounts.ProviderClaude && row.creditsExhaustedUntil.After(time.Now())
 }

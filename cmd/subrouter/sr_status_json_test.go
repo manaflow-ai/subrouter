@@ -92,6 +92,8 @@ func TestSRStatusUsableMatchesTextMarkers(t *testing.T) {
 	}
 }
 
+// TestSRStatusClaudeCreditCooldownIsTemporary keeps capacity state separate
+// from credential health in both text and machine-readable status.
 func TestSRStatusClaudeCreditCooldownIsTemporary(t *testing.T) {
 	row := srUsageRow{
 		email:                 "claude-key",
