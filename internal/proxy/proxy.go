@@ -253,6 +253,9 @@ type Server struct {
 	// revoked OAuth credentials (claude_credit_state.go). Nil disables
 	// credit pacing; keys then route in their ordinary tier.
 	claudeCosts *claudeCostStore
+	// claudeHealthFallback tracks Claude credential deaths for a server
+	// without an AccountRef; with one, the ref's tracker is used.
+	claudeHealthFallback *claudeCredentialHealth
 	// FableBedrockPrimary, when true, routes Claude Fable requests to AWS Bedrock
 	// FIRST, before the subscription pool, instead of using Bedrock only as a
 	// fallback. It only takes effect when the Bedrock gateway is configured; a
@@ -510,6 +513,9 @@ type AccountRef struct {
 	// this ref (see claudeCostStore), so background sweeps can skip
 	// credentials Anthropic has revoked whether or not Handler ran first.
 	claudeCosts atomic.Pointer[claudeCostStore]
+	// claudeHealthTracker keeps the Claude credential death ledger and
+	// liveness probe schedule (claude_credential_health.go).
+	claudeHealthTracker atomic.Pointer[claudeCredentialHealth]
 }
 
 func (r *AccountRef) qwenRoot() string {
@@ -1176,6 +1182,9 @@ type AccountUsageStatus struct {
 	// credential with "has been revoked"; the account is out of routing
 	// until it is re-added.
 	RevokedSince time.Time `json:"revoked_since,omitzero"`
+	// RevokedKind names the death: "revoked" (401 token revoked) or
+	// "org_oauth_disallowed" (403, OAuth no longer allowed for the org).
+	RevokedKind string `json:"revoked_kind,omitempty"`
 	// ResetAdvice is set when the reset-credit spender, running in warn
 	// mode, would redeem a credit on this account now (see
 	// --reset-credit-autospend).
@@ -2377,6 +2386,16 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				out[i] = next
 				return
 			}
+			if since, dead := claudeCredentialRevokedSince(r.claudeCostStore(), credential); dead {
+				// Refreshing a dead credential would give it a new fingerprint
+				// and silently return it to routing.
+				next := out[i]
+				next.AuthValid = true
+				next.RevokedSince = since.UTC()
+				next.RevokedKind = r.claudeCostStore().snapshot().Revoked[credential.ID].kind()
+				out[i] = next
+				return
+			}
 			account, details, didRefresh, err := r.claudeStore.RefreshCredentialDetailsIfExpired(sweepCtx, r.client, profile)
 			r.noteCredResult(credential, err)
 			next := out[i]
@@ -2395,6 +2414,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				// polling it only adds noise and a misleading throttle flag.
 				// A re-login changes the credential and resumes polling.
 				next.RevokedSince = since.UTC()
+				next.RevokedKind = r.claudeCostStore().snapshot().Revoked[account.ID].kind()
 				out[i] = next
 				return
 			}
@@ -2921,6 +2941,15 @@ func (s Server) Handler() http.Handler {
 	} else if s.claudeCosts != nil && s.AccountRef != nil {
 		s.AccountRef.claudeCosts.CompareAndSwap(nil, s.claudeCosts)
 	}
+	if s.AccountRef == nil && s.claudeHealthFallback == nil {
+		// The ledger lives next to the cost state that holds the dead overlay.
+		dir := ""
+		if s.claudeCosts != nil && s.claudeCosts.path != "" {
+			dir = filepath.Dir(s.claudeCosts.path)
+		}
+		s.claudeHealthFallback = newClaudeCredentialHealth(dir, s.Logger)
+	}
+	s.claudeHealth().setLogger(s.Logger)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
 	mux.HandleFunc("/internal/v1/session-leases/", s.requireSessionLeaseAdmin(s.handleSessionLease))
@@ -2956,6 +2985,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/token-usage", s.requireAdmin(s.handleTokenUsage))
 	mux.HandleFunc(ErrorEventsPath, s.requireAdmin(s.handleErrorEvents))
 	mux.HandleFunc(AccountStatePath, s.requireAdmin(s.handleAccountState))
+	mux.HandleFunc(ClaudeCredentialDeathsPath, s.requireAdmin(s.handleClaudeCredentialDeaths))
 	mux.HandleFunc("/_subrouter/", http.NotFound)
 	if s.Bedrock != nil && !s.RequireSessionLease {
 		mux.Handle("/bedrock/", s.bedrockHandler())
@@ -4918,6 +4948,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			continue
 		}
 		reverifyClaudeQuota := false
+		livenessOnly := false
 		if s.SchedulerRef != nil {
 			currentScore := current.ScoreFor(schedulerAccountProvider(account.Provider), account.ID)
 			if _, blocked := knownAccountWideQuotaReset(currentScore, time.Now()); blocked {
@@ -4928,9 +4959,24 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 					// The provider has already supplied every binding account-wide
 					// reset time. Preserve the measured state without a new probe.
 					// A re-login invalidates the score timestamp and bypasses this.
-					continue
+					// A Claude credential can still die while it waits for its
+					// reset, so it gets a sparse liveness probe that never
+					// touches its score.
+					if account.Provider != accounts.ProviderClaude ||
+						!s.AccountRef.claudeHealth().claimLivenessProbe(account.ID, time.Now()) {
+						continue
+					}
+					livenessOnly = true
 				}
 			}
+		}
+		if _, revoked := claudeCredentialRevokedSince(s.claudeCostStore(), account); revoked {
+			// Refreshing a dead credential would give it a new fingerprint
+			// and silently return it to routing.
+			scoreMu.Lock()
+			setZeroScore(scores, scoreByID, schedulerAccountProvider(account.Provider), account.ID)
+			scoreMu.Unlock()
+			continue
 		}
 		if failure, dead := s.AccountRef.terminalCredFailure(account); dead {
 			if s.Logger != nil {
@@ -4980,10 +5026,14 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 				scoreMu.Unlock()
 				return
 			}
+			if livenessOnly {
+				s.AccountRef.probeClaudeLiveness(sweepCtx, client, refreshed)
+				return
+			}
 			var windows []accounts.UsageWindow
 			var fresh bool
 			if reverifyClaudeQuota {
-				windows, err = agentclaude.FetchFableUsageWindows(sweepCtx, client, refreshed.Token)
+				windows, err = s.AccountRef.claudeFableProbe(sweepCtx, client, refreshed)
 				fresh = err == nil && fableProbeHasPrimaryWindows(windows)
 				if err == nil && !fresh {
 					return
@@ -8224,6 +8274,9 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 	// anthropic-ratelimit-unified-status=rejected is also unusable, because the
 	// account is depleted (served via overage) and Claude Code hard-blocks the
 	// user on that header even though the request "succeeded".
+	if provider == accounts.ProviderClaude && accountID != "" && response.StatusCode >= 200 && response.StatusCode < 300 {
+		s.noteClaudeProxySuccess(account)
+	}
 	claudeUnusable := provider == accounts.ProviderClaude && accountID != "" &&
 		(claudeAccountUnusableStatus(response.StatusCode) || claudeResponseRejectedForPool(response.Header, poolModel))
 	inspectClaudeCredit := provider == accounts.ProviderClaude && accountID != "" &&
@@ -8284,10 +8337,14 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 	if inspectUsageLimit || inspectCredentialFailure || inspectModelCompatibility || inspectKimiUnauthorized || claudeUnusable || inspectClaudeCredit {
 		loggedBody := false
 		inspect = func(body []byte) {
-			if claudeUnusable && response.StatusCode == http.StatusUnauthorized {
-				s.noteClaudeRevoked(account, response.StatusCode, body)
+			decoded := body
+			if claudeUnusable {
+				decoded = decodedUpstreamBody(body, response.Header)
 			}
-			if claudeUnusable && response.StatusCode == http.StatusForbidden && persistentAuthorizationDenialJSON(body) {
+			if claudeUnusable && (response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) {
+				s.noteClaudeCredentialResponse(account, response.StatusCode, response.Header, decoded, sessionID, path)
+			}
+			if claudeUnusable && response.StatusCode == http.StatusForbidden && persistentAuthorizationDenialJSON(decoded) {
 				s.markPersistentAuthorizationDenial(account)
 			}
 			if inspectClaudeCredit && claudeCreditExhaustedMessage(body) {
@@ -8325,14 +8382,29 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 			// completion, or an unrelated 4xx/5xx) must not have its body logged.
 			if claudeUnusable && claudeAccountUnusableStatus(response.StatusCode) && !loggedBody && s.Logger != nil {
 				loggedBody = true
+				// Only the error envelope's type, bounded message, and request
+				// id are logged, from the decoded body; never the raw bytes.
+				envelope := agentclaude.ParseErrorEnvelope(decoded)
+				if response.StatusCode == http.StatusTooManyRequests {
+					// A rate-limit message is not account evidence; the headers
+					// above carry its reset.
+					envelope.Message = ""
+				}
+				if envelope.RequestID == "" {
+					envelope.RequestID = agentclaude.BoundedToken(response.Header.Get("request-id"))
+				}
 				s.Logger.Warn("claude account unusable upstream body",
 					"agent", agentType,
 					"session", sessionID,
 					"account", accountID,
 					"path", path,
 					"status", response.StatusCode,
-					"persistent_authorization_denial", response.StatusCode == http.StatusForbidden && persistentAuthorizationDenialJSON(body),
-					"credential_denial", response.StatusCode == http.StatusUnauthorized && credentialUnauthorizedJSON(body))
+					"content_encoding", response.Header.Get("Content-Encoding"),
+					"error_type", envelope.Type,
+					"error_message", envelope.Message,
+					"request_id", envelope.RequestID,
+					"persistent_authorization_denial", response.StatusCode == http.StatusForbidden && persistentAuthorizationDenialJSON(decoded),
+					"credential_denial", response.StatusCode == http.StatusUnauthorized && credentialUnauthorizedJSON(decoded))
 			}
 		}
 	}
@@ -11295,6 +11367,25 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				usageLimited, exhausted = true, true
 			}
 		}
+		if t.server != nil && t.provider == accounts.ProviderClaude && !modelUnsupported &&
+			(response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) {
+			// Record the credential this attempt used: a concurrent re-login
+			// must not be marked dead by a late response. The body is decoded
+			// first, so a compressed error envelope is still classified.
+			deathCredential := accountCredential
+			if selected := a.current(); deathCredential == "" && selected.ID == accountID {
+				deathCredential = selected.CredentialIdentity()
+			}
+			kind := t.server.noteClaudeCredentialResponse(
+				accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: deathCredential},
+				response.StatusCode, response.Header, decodedUpstreamBody(peekResponseBodyPrefix(response), response.Header),
+				t.session, t.path,
+			)
+			if kind == agentclaude.CredentialDeathOrgOAuthDisallowed && !persistentAuthorizationDenial {
+				persistentAuthorizationDenial = true
+				usageLimited, exhausted = true, true
+			}
+		}
 		if t.provider == accounts.ProviderClaude && response.StatusCode == http.StatusTooManyRequests &&
 			usageLimited && !exhausted && !credentialFailure && claudeUnifiedStatus(response.Header) == "" &&
 			claudeTransient429Retries < claudeTransient429MaxRetries && attempt < maxAttempts && a.consume() {
@@ -11392,12 +11483,6 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
 			})
 		} else if t.server != nil && credentialFailure && !modelUnsupported {
-			if t.provider == accounts.ProviderClaude {
-				// Record the credential this attempt used: a concurrent re-login
-				// must not be marked revoked by a late response.
-				t.server.noteClaudeRevoked(accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential},
-					response.StatusCode, peekResponseBodyPrefix(response))
-			}
 			// Bind auth rejection to the exact credential identity captured for
 			// this attempt. A concurrent key rotation must make this late response
 			// harmless rather than cooking the repaired account generation.

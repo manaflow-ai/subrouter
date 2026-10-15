@@ -324,8 +324,11 @@ type srUsageRow struct {
 	creditsExhaustedUntil time.Time
 	// credit is a Claude API key's grant state; revokedSince marks a Claude
 	// OAuth credential Anthropic revoked.
-	credit           *proxy.ClaudeCreditStatus
-	revokedSince     time.Time
+	credit       *proxy.ClaudeCreditStatus
+	revokedSince time.Time
+	// revokedKind is the server's death kind: "revoked" or
+	// "org_oauth_disallowed".
+	revokedKind      string
 	apiKeySpend      *accounts.APIKeyUsageSnapshot
 	apiKeyHint       string
 	usageThrottled   bool
@@ -3627,6 +3630,16 @@ func usageGridClaudeCreditCell(row srUsageRow) usageGridCell {
 	return usageGridCell{Text: text, Style: style}
 }
 
+// revokedLabel names a dead Claude credential for the table: "revoked" for
+// a revoked OAuth token, "org disabled" when the organization no longer
+// allows OAuth.
+func revokedLabel(row srUsageRow) string {
+	if row.revokedKind == "org_oauth_disallowed" {
+		return "org disabled"
+	}
+	return "revoked"
+}
+
 // usageGridClaudeDetailCell keeps long Claude-only notes out of the core
 // routing columns. The table gives this cell the final compact column, so
 // credits and revoked credentials remain readable without widening Use or
@@ -3634,7 +3647,7 @@ func usageGridClaudeCreditCell(row srUsageRow) usageGridCell {
 func usageGridClaudeDetailCell(row srUsageRow) usageGridCell {
 	if !row.revokedSince.IsZero() {
 		return usageGridCell{
-			Text:  "revoked " + row.revokedSince.UTC().Format("01-02 15:04Z"),
+			Text:  revokedLabel(row) + " " + row.revokedSince.UTC().Format("01-02 15:04Z"),
 			Style: ansiRed,
 		}
 	}
@@ -3963,7 +3976,7 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 
 func usageGridState(row srUsageRow) string {
 	if usageProvider(row) == accounts.ProviderClaude && !row.revokedSince.IsZero() {
-		return "revoked"
+		return revokedLabel(row)
 	}
 	if usageProvider(row) == accounts.ProviderClaude {
 		if row.cooked {

@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
 
 func TestEvaluateCanaryGate(t *testing.T) {
@@ -64,5 +66,17 @@ func TestTrafficWindowSinceTreatsLowerCountsAsRestart(t *testing.T) {
 	}
 	if got := (trafficWindow{Requests: 20}).since(base); got != (trafficWindow{Requests: 20}) {
 		t.Fatalf("restart delta = %+v", got)
+	}
+}
+
+// The v0.1.173 abort, replayed: 16 of 534 candidate requests were clients
+// hanging up mid-request. Counted apart from proxy 5xx, they are reported
+// and never trip the gate.
+func TestCanaryGateIgnoresClientAborts(t *testing.T) {
+	candidate := trafficWindowOf(proxy.TrafficSnapshot{Requests: 534, ClientAborts: 16})
+	incumbent := trafficWindowOf(proxy.TrafficSnapshot{Requests: 3117, Proxy5xx: 28, Responses: proxy.TrafficByClass{Class5xx: 28}})
+	got := evaluateCanaryGate(gateInput{Candidate: &candidate, Incumbent: &incumbent, Elapsed: 10 * time.Minute, Dwell: 10 * time.Minute}, defaultGateThresholds())
+	if got.Action != gatePromote || !strings.Contains(got.Reason, "client aborts 16") {
+		t.Fatalf("gate = %+v, want a promote that reports the 16 client aborts", got)
 	}
 }
