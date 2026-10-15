@@ -1146,15 +1146,19 @@ type AccountStatus struct {
 
 type AccountUsageStatus struct {
 	AccountStatus
-	Active            bool     `json:"active,omitempty"`
-	KeyFingerprint    string   `json:"key_fingerprint,omitempty"`
-	AssignedSessions  int      `json:"assigned_sessions,omitempty"`
-	SessionsKnown     bool     `json:"sessions_known,omitempty"`
-	PlanType          string   `json:"plan_type,omitempty"`
-	ProviderHealth    string   `json:"provider_health,omitempty"`
-	ProviderModels    *int     `json:"provider_models,omitempty"`
-	ProviderEndpoints []string `json:"provider_endpoints,omitempty"`
-	QuotaStatus       string   `json:"quota_status,omitempty"`
+	Active            bool       `json:"active,omitempty"`
+	KeyFingerprint    string     `json:"key_fingerprint,omitempty"`
+	AssignedSessions  int        `json:"assigned_sessions,omitempty"`
+	ActiveSessions    int        `json:"active_sessions,omitempty"`
+	RecentSessions    int        `json:"recent_sessions,omitempty"`
+	FirstSessionAt    *time.Time `json:"first_session_at,omitempty"`
+	LastSessionAt     *time.Time `json:"last_session_at,omitempty"`
+	SessionsKnown     bool       `json:"sessions_known,omitempty"`
+	PlanType          string     `json:"plan_type,omitempty"`
+	ProviderHealth    string     `json:"provider_health,omitempty"`
+	ProviderModels    *int       `json:"provider_models,omitempty"`
+	ProviderEndpoints []string   `json:"provider_endpoints,omitempty"`
+	QuotaStatus       string     `json:"quota_status,omitempty"`
 	// UsageThrottled means the provider's telemetry endpoint declined this
 	// observation with a transient 429. It says nothing about account quota and
 	// must never be used as a quota exhaustion decision.
@@ -3292,7 +3296,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			}
 			s.updateSchedulerFromUsageStatusesAtScoreRevision(r.Context(), statuses, scoreRevision)
 		}
-		writeJSON(w, s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses))))))))
+		writeJSON(w, s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses)))))))))
 		return
 	}
 	accounts := s.accountListContext(r.Context())
@@ -3310,7 +3314,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	out = s.withKeyedProviderHealth(r.Context(), out)
-	writeJSON(w, s.withCodexCapacityMarks(s.withClaudeCostTiers(withWeeklyCooked(s.withSessionCounts(s.withRequestTimeExhaustionWindows(out))))))
+	writeJSON(w, s.withCodexCapacityMarks(s.withClaudeCostTiers(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(out)))))))
 }
 
 func (s Server) handleQwenConsoleImport(w http.ResponseWriter, r *http.Request) {
@@ -3401,6 +3405,61 @@ func (s Server) withSessionCounts(statuses []AccountUsageStatus) []AccountUsageS
 		if out[i].Provider == accounts.ProviderKimi || out[i].Provider == accounts.ProviderAntigravity ||
 			(out[i].Provider == accounts.ProviderGrok && out[i].AuthMode == accounts.AuthModeOAuth) {
 			out[i].Active = out[i].AssignedSessions > 0
+		}
+	}
+	return out
+}
+
+const recentSessionActivityWindow = 24 * time.Hour
+
+// withSessionActivity adds bounded, assignment-level metadata to the private
+// usage view. It deliberately reports timestamps for retained sticky
+// assignments rather than request bodies, user emails, or session IDs.
+func (s Server) withSessionActivity(statuses []AccountUsageStatus) []AccountUsageStatus {
+	if s.Sessions == nil {
+		return statuses
+	}
+	now := time.Now().UTC()
+	type aggregate struct {
+		active int
+		recent int
+		first  time.Time
+		last   time.Time
+	}
+	aggregates := map[string]aggregate{}
+	for _, assignment := range s.Sessions.All() {
+		provider := providerForStoredSession(assignment.AgentType)
+		key := selectacct.ScoreKey(provider, assignment.AccountID)
+		item := aggregates[key]
+		if s.activeSession(assignment.AgentType, assignment.SessionID) {
+			item.active++
+		}
+		if !assignment.UpdatedAt.IsZero() && now.Sub(assignment.UpdatedAt) <= recentSessionActivityWindow {
+			item.recent++
+		}
+		if item.first.IsZero() || (!assignment.CreatedAt.IsZero() && assignment.CreatedAt.Before(item.first)) {
+			item.first = assignment.CreatedAt
+		}
+		if assignment.UpdatedAt.After(item.last) {
+			item.last = assignment.UpdatedAt
+		}
+		aggregates[key] = item
+	}
+	out := append([]AccountUsageStatus(nil), statuses...)
+	for i := range out {
+		item, ok := aggregates[selectacct.ScoreKey(accountProviderFor(out[i].Provider), out[i].ID)]
+		if !ok {
+			continue
+		}
+		out[i].ActiveSessions = item.active
+		out[i].RecentSessions = item.recent
+		if !item.first.IsZero() {
+			first := item.first
+			out[i].FirstSessionAt = &first
+		}
+		if !item.last.IsZero() {
+			last := item.last
+			out[i].LastSessionAt = &last
 		}
 	}
 	return out
