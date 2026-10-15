@@ -148,7 +148,57 @@ test_falls_back_when_binary_missing() {
   teardown
 }
 
+# daemon_plist <ProgramArguments...>: a daemon LaunchAgent in the sandbox HOME.
+daemon_plist() {
+  mkdir -p "$ROOT/home/Library/LaunchAgents"
+  {
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>\n'
+    printf '<key>Label</key><string>ai.manaflow.subrouter</string>\n<key>ProgramArguments</key><array>\n'
+    local arg
+    for arg in "$@"; do printf '<string>%s</string>\n' "$arg"; done
+    printf '</array></dict></plist>\n'
+  } >"$ROOT/home/Library/LaunchAgents/ai.manaflow.subrouter.plist"
+}
+
+# The daemon LaunchAgent runs this CLI (directly, or as a supervisor's worker
+# through a symlink), so update --auto replaces it: hand over.
+test_delegates_when_daemon_runs_the_cli() {
+  setup
+  fake_sr "$AUTO_HELP"
+  daemon_plist "$ROOT/install/subrouter" serve --addr 127.0.0.1:1
+  run_updater
+  grep -qx 'update --auto NO_AUTO=' "$ROOT/sr.log" && [ ! -e "$ROOT/install.log" ]
+  check "daemon runs the CLI: hands over to update --auto" $?
+  teardown
+
+  setup
+  fake_sr "$AUTO_HELP"
+  ln -s "$ROOT/install/subrouter" "$ROOT/worker-link"
+  daemon_plist /usr/local/bin/subrouter supervise "--worker-bin=$ROOT/worker-link"
+  run_updater
+  grep -qx 'update --auto NO_AUTO=' "$ROOT/sr.log" && [ ! -e "$ROOT/install.log" ]
+  check "supervisor worker is the CLI: hands over to update --auto" $?
+  teardown
+}
+
+# The daemon runs another binary, which update --auto would replace instead
+# of this CLI, so the CLI stays on install.sh.
+test_falls_back_when_daemon_runs_another_binary() {
+  setup
+  fake_sr "$AUTO_HELP"
+  daemon_plist "$ROOT/install/subrouter" supervise --worker-bin "$ROOT/other/subrouter-worker"
+  run_updater
+  check "other daemon binary: updater exits 0" $?
+  ! grep -q 'update --auto' "$ROOT/sr.log"
+  check "other daemon binary: never runs update --auto" $?
+  [ -s "$ROOT/install.log" ]
+  check "other daemon binary: updates the CLI through install.sh" $?
+  teardown
+}
+
 test_delegates_to_update_auto
+test_delegates_when_daemon_runs_the_cli
+test_falls_back_when_daemon_runs_another_binary
 test_falls_back_without_auto
 test_falls_back_when_update_is_unknown
 test_falls_back_when_binary_missing
