@@ -136,6 +136,7 @@ func (s Server) bedrockHandler() http.Handler {
 			if haveUsage {
 				record.Usage = usage
 				record.CostUSD = usage.costUSD(model)
+				s.ClaudeBedrockBudget.Record(record.CostUSD)
 			}
 			appendBedrockCostRecord(cfg.CostLogPath, record)
 		}
@@ -486,11 +487,14 @@ func stripBedrockUnsupportedTools(body []byte) ([]byte, int) {
 }
 
 func (s Server) recordClaudeFableBedrockCost(started time.Time, region string, status int, usage bedrockUsage, haveUsage bool) {
+	modelID := s.claudeBedrockModelID()
+	if haveUsage {
+		s.ClaudeBedrockBudget.Record(usage.costUSD(modelID))
+	}
 	cfg := s.Bedrock
 	if cfg == nil || cfg.CostLogPath == "" {
 		return
 	}
-	modelID := s.claudeBedrockModelID()
 	record := bedrockCostRecord{
 		Timestamp:  started.UTC().Format(time.RFC3339),
 		Model:      modelID,

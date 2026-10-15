@@ -32,14 +32,25 @@ type ClaudeBedrockBudget struct {
 	Client     *http.Client
 	now        func() time.Time
 
-	mu          sync.Mutex
+	mu sync.Mutex
+	// recent is the router's own Bedrock spend the ledger may not show yet.
+	recent      []claudeBedrockSpend
 	remaining   float64
 	readAt      time.Time
 	attemptedAt time.Time
 	lastErr     error
 }
 
+type claudeBedrockSpend struct {
+	at  time.Time
+	usd float64
+}
+
 const (
+	// claudeBedrockLedgerLag is how long a Bedrock call can be missing from
+	// the ledger. Chatmux prices AWS's counts by whole hour, ten minutes after
+	// the hour ends, so a call can wait up to 70 minutes to show there.
+	claudeBedrockLedgerLag     = 75 * time.Minute
 	claudeBedrockBudgetRefresh = time.Minute
 	claudeBedrockBudgetStale   = 5 * time.Minute
 )
@@ -85,8 +96,12 @@ func (b *ClaudeBedrockBudget) Allow(ctx context.Context) (bool, string) {
 	if b.readAt.IsZero() || now.Sub(b.readAt) > stale {
 		return false, fmt.Sprintf("budget ledger unreadable: %v", b.lastErr)
 	}
-	if b.remaining < b.ReserveUSD {
-		return false, fmt.Sprintf("budget remaining $%.2f is below the $%.2f reserve", b.remaining, b.ReserveUSD)
+	// The router's spend inside the lag window counts against the balance
+	// too. Spend the ledger already shows is counted twice for a while,
+	// which errs toward stopping early.
+	remaining := b.remaining - b.recentSpend(now)
+	if remaining < b.ReserveUSD {
+		return false, fmt.Sprintf("budget remaining $%.2f (ledger $%.2f less recent router spend) is below the $%.2f reserve", remaining, b.remaining, b.ReserveUSD)
 	}
 	return true, ""
 }
@@ -131,4 +146,29 @@ func (b *ClaudeBedrockBudget) read(ctx context.Context) (float64, error) {
 		return 0, fmt.Errorf("budget ledger answer has no remainingUsd")
 	}
 	return *payload.RemainingUSD, nil
+}
+
+// Record adds one Bedrock call's estimated cost to the recent spend.
+func (b *ClaudeBedrockBudget) Record(usd float64) {
+	if b == nil || usd <= 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.recent = append(b.recent, claudeBedrockSpend{at: b.clock(), usd: usd})
+}
+
+// recentSpend sums the spend inside the lag window and drops older entries.
+// The caller holds mu.
+func (b *ClaudeBedrockBudget) recentSpend(now time.Time) float64 {
+	keep := b.recent[:0]
+	total := 0.0
+	for _, spend := range b.recent {
+		if now.Sub(spend.at) <= claudeBedrockLedgerLag {
+			keep = append(keep, spend)
+			total += spend.usd
+		}
+	}
+	b.recent = keep
+	return total
 }
