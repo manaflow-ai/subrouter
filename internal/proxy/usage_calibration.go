@@ -60,11 +60,6 @@ type calibrationObservation struct {
 	Counters            []calibrationCounters `json:"counters"`
 }
 
-type calibrationSeen struct {
-	generation string
-	at         time.Time
-}
-
 // UsageCalibrationRecorder collects private evidence only. It never changes
 // routing and exposes no HTTP endpoint. Call Run once for the worker lifetime.
 type UsageCalibrationRecorder struct {
@@ -73,7 +68,7 @@ type UsageCalibrationRecorder struct {
 	startedAt  time.Time
 	mu         sync.Mutex
 	counters   map[calibrationCounterKey]calibrationCounters
-	seen       map[string]calibrationSeen
+	seen       map[string]time.Time
 	sequence   uint64
 	dropped    uint64
 	incomplete bool
@@ -82,7 +77,7 @@ type UsageCalibrationRecorder struct {
 }
 
 func NewUsageCalibrationRecorder(dir string) *UsageCalibrationRecorder {
-	return &UsageCalibrationRecorder{dir: dir, epoch: rand.Text(), startedAt: time.Now(), counters: map[calibrationCounterKey]calibrationCounters{}, seen: map[string]calibrationSeen{}, queue: make(chan []byte, usageCalibrationQueueSize)}
+	return &UsageCalibrationRecorder{dir: dir, epoch: rand.Text(), startedAt: time.Now(), counters: map[calibrationCounterKey]calibrationCounters{}, seen: map[string]time.Time{}, queue: make(chan []byte, usageCalibrationQueueSize)}
 }
 
 func (r *AccountRef) SetUsageCalibrationRecorder(recorder *UsageCalibrationRecorder) {
@@ -180,7 +175,7 @@ func (c *UsageCalibrationRecorder) observe(status AccountUsageStatus, generation
 	key := calibrationAccountKey(string(status.Provider), status.ID)
 	c.mu.Lock()
 	previous, exists := c.seen[key]
-	if exists && previous.generation == generation && !status.UsageFetchedAt.After(previous.at) {
+	if exists && !status.UsageFetchedAt.After(previous) {
 		c.mu.Unlock()
 		return
 	}
@@ -189,7 +184,7 @@ func (c *UsageCalibrationRecorder) observe(status AccountUsageStatus, generation
 		c.mu.Unlock()
 		return
 	}
-	c.seen[key] = calibrationSeen{generation, status.UsageFetchedAt}
+	c.seen[key] = status.UsageFetchedAt
 	c.sequence++
 	observation := calibrationObservation{
 		SchemaVersion: 1, Purpose: "quota_token_calibration", WorkerEpoch: c.epoch, Sequence: c.sequence,

@@ -7,9 +7,10 @@ enable this collector.
 
 Each accepted, new account-wide provider observation records:
 
-- Provider, plan label, opaque account hash, account-set generation, and a random
-  worker epoch. The generation changes with account additions/removals or
-  credential rotations; comparing different generations is unsafe.
+- Provider, plan label, opaque account hash, per-account credential generation,
+  and a random worker epoch. A credential rotation changes that account's
+  generation; unrelated accounts do not invalidate its intervals. Comparing
+  different generations is unsafe.
 - Provider observation time separately from the time counters were sampled.
 - Subscription-window name, used percent, duration, and absolute reset time.
   Model-specific and paid-extra windows are excluded. Unknown reset times stay
@@ -26,8 +27,8 @@ It does not persist email, account/client/device names, sources, credentials,
 request bodies, response bodies, or session identifiers. Account hashes and
 aggregate usage are still private metadata, not anonymized public data.
 
-Repeated cached observations are deduplicated by account, generation, and
-provider observation time. Stale, throttled, empty, and model-only observations
+Repeated cached observations are deduplicated by account and provider
+observation time, including across generation changes. Stale, throttled, empty, and model-only observations
 do not create samples. Each sample uses the exact credential-bound window
 cache entry at that timestamp, excluding merged last-good values and readings
 from before the worker's counter epoch. This uses the existing usage-sweep and score-refresh

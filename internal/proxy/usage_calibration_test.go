@@ -98,11 +98,44 @@ func TestUsageCalibrationDeduplicatesFreshWindowsAndExcludesFallback(t *testing.
 	c.observe(status, "g1")
 	calibrationNext(t, c)
 	c.observe(status, "g2")
+	if len(c.queue) != 0 {
+		t.Fatal("generation change re-emitted an unchanged cached observation")
+	}
+	status.UsageFetchedAt = status.UsageFetchedAt.Add(time.Minute)
+	c.observe(status, "g2")
 	if calibrationNext(t, c).AccountGeneration != "g2" {
 		t.Fatal("generation change lost")
 	}
 	if NewUsageCalibrationRecorder("").epoch == c.epoch {
 		t.Fatal("worker epoch reused")
+	}
+}
+
+func TestUsageCalibrationUnrelatedCredentialRotationKeepsAccountEpoch(t *testing.T) {
+	c := calibrationTestRecorder("")
+	ref := cacheTestAccountRef(t, &usageRoundTripper{responses: []*http.Response{usageOKResponse()}})
+	status := ref.UsageStatuses(context.Background())[0]
+	ref.mu.Lock()
+	ref.accounts = append(ref.accounts, accounts.Account{ID: "unrelated", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "other-fixture-token"})
+	ref.mu.Unlock()
+	ref.SetUsageCalibrationRecorder(c)
+	ref.persistUsageStatusSnapshot([]AccountUsageStatus{status})
+	first := calibrationNext(t, c)
+	ref.mu.Lock()
+	ref.accounts[1].Token = "rotated-fixture-token"
+	ref.mu.Unlock()
+	key := status.ID + "\x00" + string(status.Provider)
+	ref.usageWindowsMu.Lock()
+	entry := ref.usageWindows[key]
+	entry.at = entry.at.Add(time.Minute)
+	ref.usageWindows[key] = entry
+	ref.usageWindowsMu.Unlock()
+	status.UsageFetchedAt = entry.at
+	status.UsageFresh = true
+	ref.persistUsageStatusSnapshot([]AccountUsageStatus{status})
+	second := calibrationNext(t, c)
+	if first.AccountGeneration != second.AccountGeneration {
+		t.Fatal("unrelated account invalidated this account's interval")
 	}
 }
 

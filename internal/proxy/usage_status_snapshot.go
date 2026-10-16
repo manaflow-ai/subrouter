@@ -216,7 +216,7 @@ func (r *AccountRef) persistUsageStatusSnapshot(statuses []AccountUsageStatus) {
 		}
 		if recorder := r.calibrationRecorder.Load(); recorder != nil {
 			status.Provider = provider
-			r.observeUsageCalibration(recorder, status, account, accountKey)
+			r.observeUsageCalibration(recorder, status, account, usageStatusCredentialKey(account))
 		}
 		status.UsageFresh = false
 		status.Error = ""
