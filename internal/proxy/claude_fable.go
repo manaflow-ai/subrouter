@@ -308,11 +308,20 @@ func stripBedrockUnsupportedFields(body []byte) []byte {
 			}
 		}
 	}
-	// Bedrock takes thinking.display only as "summarized" or "omitted".
+	// Bedrock takes thinking.display only as "summarized" or "omitted", and
+	// refuses thinking.type "disabled" for Fable ("is not supported for this
+	// model"). Without output_config, which it refuses too, there is no
+	// supported way to ask for no thinking, so a disabled block is dropped and
+	// the model's default applies.
 	if raw, ok := payload["thinking"]; ok {
 		var thinking map[string]json.RawMessage
 		if json.Unmarshal(raw, &thinking) == nil {
-			if display, ok := thinking["display"]; ok {
+			var kind string
+			_ = json.Unmarshal(thinking["type"], &kind)
+			if kind == "disabled" {
+				delete(payload, "thinking")
+				changed = true
+			} else if display, ok := thinking["display"]; ok {
 				var value string
 				_ = json.Unmarshal(display, &value)
 				if value != "summarized" && value != "omitted" {
