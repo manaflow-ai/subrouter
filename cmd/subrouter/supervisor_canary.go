@@ -48,8 +48,11 @@ type canaryRollout struct {
 	previous  string
 	baseID    string
 	base      trafficWindow
-	gate      *gateDecision
-	gateAt    time.Time
+	// candidateBase excludes requests served while the candidate was starting
+	// before the router made it selectable.
+	candidateBase trafficWindow
+	gate          *gateDecision
+	gateAt        time.Time
 	// healthFailures counts consecutive failed readiness checks of the
 	// candidate, and healthError is the last one's error.
 	healthFailures int
@@ -171,6 +174,9 @@ func (s *supervisor) startCanary(weight int, steps []int, dwell time.Duration) e
 	}
 	if incumbentTraffic != nil {
 		rollout.base = trafficWindowOf(*incumbentTraffic)
+	}
+	if candidateTraffic != nil {
+		rollout.candidateBase = trafficWindowOf(*candidateTraffic)
 	}
 	s.canary = rollout
 	go s.monitorWorker(next)
@@ -327,6 +333,7 @@ func (d supervisorRolloutDriver) observe() (gateInput, bool) {
 	}
 	candidateID := d.rollout.candidate.id
 	baseID, base := d.rollout.baseID, d.rollout.base
+	candidateBase := d.rollout.candidateBase
 	d.s.upgradeMu.Unlock()
 
 	var input gateInput
@@ -345,7 +352,7 @@ func (d supervisorRolloutDriver) observe() (gateInput, bool) {
 	}
 	d.s.upgradeMu.Unlock()
 	if snapshot, err := d.s.generationTraffic(candidateID); err == nil {
-		window := trafficWindowOf(*snapshot)
+		window := trafficWindowOf(*snapshot).since(candidateBase)
 		input.Candidate = &window
 	}
 	incumbentID := d.s.router.Active().ID
