@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -295,13 +296,12 @@ func TestClaudeForcedAccount429DoesNotFailOver(t *testing.T) {
 
 func TestReplayablePostTransient429StopsBeforeWalkingPool(t *testing.T) {
 	const accountCount = replayablePostMaxAttempts * 2
-	upstreamHits := 0
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		upstreamHits++
-		if upstreamHits%replayablePostMaxAttempts == 0 {
-			http.Error(w, "request timeout", http.StatusRequestTimeout)
-			return
-		}
+	var upstreamMu sync.Mutex
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamMu.Lock()
+		auths = append(auths, r.Header.Get("Authorization"))
+		upstreamMu.Unlock()
 		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "allowed_warning")
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, realisticAnthropic429Body)
@@ -342,11 +342,21 @@ func TestReplayablePostTransient429StopsBeforeWalkingPool(t *testing.T) {
 
 	handler.ServeHTTP(response, req)
 
+	upstreamMu.Lock()
+	defer upstreamMu.Unlock()
 	if response.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want transient 429; body=%s", response.Code, response.Body.String())
 	}
-	if want := claudeTransient429MaxRetries + 2; upstreamHits != want {
-		t.Fatalf("upstream hits = %d, want %d (initial attempt, short retries, one alternate)", upstreamHits, want)
+	if want := claudeTransient429MaxRetries + 2; len(auths) != want {
+		t.Fatalf("upstream hits = %d, want %d (initial attempt, short retries, one alternate)", len(auths), want)
+	}
+	for i := 1; i <= claudeTransient429MaxRetries; i++ {
+		if auths[i] != auths[0] {
+			t.Fatalf("transient retry %d used %q, want original account %q", i, auths[i], auths[0])
+		}
+	}
+	if auths[len(auths)-1] == auths[0] {
+		t.Fatalf("last attempt used %q, want one alternate account", auths[0])
 	}
 }
 
