@@ -860,12 +860,18 @@ func serve(args []string) error {
 			tokenUsageWhoIs = resolver
 		}
 	}
-	tokenUsage := proxy.NewTokenUsageRecorder(filepath.Join(filepath.Dir(*sessionPath), "token-usage.jsonl"), tokenUsageWhoIs)
+	var usageCalibration *proxy.UsageCalibrationRecorder
+	if !*multiTenant {
+		usageCalibration = proxy.NewUsageCalibrationRecorder(filepath.Join(filepath.Dir(*sessionPath), "usage-calibration"))
+		accountRef.SetUsageCalibrationRecorder(usageCalibration)
+	}
+	tokenUsage := proxy.NewTokenUsageRecorder(filepath.Join(filepath.Dir(*sessionPath), "token-usage.jsonl"), tokenUsageWhoIs, proxy.WithUsageCalibrationRecorder(usageCalibration))
 	// Not activeGenerationCtx: a retiring worker still finishes its streams,
 	// and their usage must keep flushing until the process exits.
 	tokenUsageCtx, stopTokenUsage := context.WithCancel(context.Background())
 	defer stopTokenUsage()
 	tokenUsage.RunFlushLoop(tokenUsageCtx)
+	go usageCalibration.Run(tokenUsageCtx)
 	// Same lifetime as token usage: a retiring worker still records the
 	// failures of the streams it finishes.
 	errorEvents := proxy.NewErrorEventLog(filepath.Join(filepath.Dir(*sessionPath), "error-events.jsonl"), slog.Default())

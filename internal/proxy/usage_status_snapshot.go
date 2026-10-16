@@ -214,6 +214,10 @@ func (r *AccountRef) persistUsageStatusSnapshot(statuses []AccountUsageStatus) {
 		if !ok {
 			continue
 		}
+		if recorder := r.calibrationRecorder.Load(); recorder != nil {
+			status.Provider = provider
+			recorder.observe(status, accountKey)
+		}
 		status.UsageFresh = false
 		status.Error = ""
 		rows = append(rows, durableUsageStatusSnapshotRow{

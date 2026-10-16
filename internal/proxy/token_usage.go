@@ -1049,9 +1049,10 @@ type TokenUsageWhoIs interface {
 // from overwriting each other. The file is compacted to one row per key, and
 // pruned to 30 days, at startup and on every hour rollover.
 type TokenUsageRecorder struct {
-	path  string
-	now   func() time.Time
-	whois TokenUsageWhoIs
+	path        string
+	now         func() time.Time
+	whois       TokenUsageWhoIs
+	calibration *UsageCalibrationRecorder
 
 	mu    sync.Mutex
 	hours map[int64]*tokenUsageHour
@@ -1259,6 +1260,7 @@ func (t *TokenUsageRecorder) recordTurn(provider, accountID, model, client strin
 	pending := hour.pending[key]
 	pending.add(counts)
 	hour.pending[key] = pending
+	t.calibration.record(key, counts)
 }
 
 // tokenUsageSessionModelKey scopes a session key to one model, since each

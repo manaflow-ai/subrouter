@@ -472,6 +472,7 @@ type AccountRef struct {
 	qwenConsoleRoot                    string
 	apiKeyUpstreams                    map[accounts.Provider]string
 
+	calibrationRecorder  atomic.Pointer[UsageCalibrationRecorder]
 	usageStatusMu        sync.Mutex
 	usageStatusPersistMu sync.Mutex
 	usageStatusCache     []AccountUsageStatus
