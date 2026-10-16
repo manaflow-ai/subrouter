@@ -28,7 +28,9 @@ aggregate usage are still private metadata, not anonymized public data.
 
 Repeated cached observations are deduplicated by account, generation, and
 provider observation time. Stale, throttled, empty, and model-only observations
-do not create samples. This uses the existing usage-sweep and score-refresh
+do not create samples. Each sample uses the exact credential-bound window
+cache entry at that timestamp, excluding merged last-good values and readings
+from before the worker's counter epoch. This uses the existing usage-sweep and score-refresh
 persistence seam and makes no extra provider calls.
 
 The directory is mode 0700 and data files are mode 0600. The existing
