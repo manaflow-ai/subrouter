@@ -271,6 +271,10 @@ type Server struct {
 	// normal pool path, which keeps its own Bedrock/API-key fallback. Applies
 	// ONLY to Fable; other Claude models are unaffected.
 	FableBedrockPrimary bool
+	// ClaudeBedrockPrimary extends FableBedrockPrimary to every Claude model.
+	// It is set only with ClaudeBedrockModelID, so the budget gate always
+	// applies; a refused or failed Bedrock call falls through to the pool.
+	ClaudeBedrockPrimary bool
 	// tenantAccountImportAuthorized is set only on a server reached after the
 	// MultiTenant router has validated its tenant key. Global remote imports
 	// require a configured admin token instead.
@@ -5726,7 +5730,7 @@ func (s Server) proxyHandler() http.Handler {
 		// touching the subscription pool. A non-2xx or unreachable Bedrock restores
 		// the body and falls through to the normal pool path (which still carries
 		// its own Bedrock/API-key fallback), so this never hard-fails Fable.
-		if preferredAccountID == "" && s.FableBedrockPrimary && fableFallbackConfigured && claudeFableModel(requestModel) && s.Bedrock != nil && s.Bedrock.configured() {
+		if preferredAccountID == "" && (s.ClaudeBedrockPrimary || s.FableBedrockPrimary && claudeFableModel(requestModel)) && fableFallbackConfigured && s.Bedrock != nil && s.Bedrock.configured() {
 			if s.serveRecorded(w, r, agentTypeForProviderSession(agentType, requestProvider), sessionID, "fable-bedrock-primary", s.serveClaudeFableBedrockPrimary) {
 				return
 			}

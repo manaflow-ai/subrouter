@@ -427,6 +427,7 @@ func serve(args []string) error {
 	claudeBedrockBudgetURL := flags.String("claude-bedrock-budget-url", "", "spend ledger (GET, JSON remainingUsd) that must admit each Claude Bedrock call; bearer token from SUBROUTER_CLAUDE_BEDROCK_BUDGET_TOKEN_FILE; defaults to SUBROUTER_CLAUDE_BEDROCK_BUDGET_URL")
 	claudeBedrockBudgetReserve := flags.Float64("claude-bedrock-budget-reserve-usd", 500, "remaining ledger balance in USD below which Claude Bedrock calls stop")
 	fableBedrockPrimary := flags.Bool("fable-bedrock-primary", false, "route Claude Fable to Bedrock first (before the subscription pool); defaults to SUBROUTER_FABLE_BEDROCK_PRIMARY")
+	claudeBedrockPrimary := flags.Bool("claude-bedrock-primary", false, "route every Claude model to Bedrock first (before the subscription pool), served as --claude-bedrock-model under its budget; defaults to SUBROUTER_CLAUDE_BEDROCK_PRIMARY")
 	cloudConfigPath := flags.String("cloud-config", "", "cmux.com team credential config; defaults to ~/.config/subrouter/cloud.json")
 	cloudBaseURL := flags.String("cloud-base-url", "", "override the cmux.com API origin loaded from the cloud config")
 	cloudCredentialSource := flags.String("cloud-credential-source", "", "override the credential source loaded from the cloud config: team, local, or legacy")
@@ -861,6 +862,13 @@ func serve(args []string) error {
 		}
 		slog.Info("claude bedrock fallback enabled for every model", "model", claudeBedrockModelID, "budget_url", budgetURL, "reserve_usd", *claudeBedrockBudgetReserve)
 	}
+	claudeBedrockPrimaryEnabled := *claudeBedrockPrimary || envTrue("SUBROUTER_CLAUDE_BEDROCK_PRIMARY")
+	if claudeBedrockPrimaryEnabled {
+		if claudeBedrockModelID == "" {
+			return errors.New("--claude-bedrock-primary needs --claude-bedrock-model")
+		}
+		slog.Info("claude bedrock primary enabled for every model", "model", claudeBedrockModelID)
+	}
 
 	// Tailnet authentication is for self-hosted servers whose port is already
 	// restricted to a tailnet by ACL. It is deliberately incompatible with
@@ -986,6 +994,7 @@ func serve(args []string) error {
 		ClaudeOverloadReroute:         claudeOverloadReroute,
 		ClaudeOverloadRetry:           claudeOverloadRetry,
 		FableBedrockPrimary:           fableBedrockEnabled,
+		ClaudeBedrockPrimary:          claudeBedrockPrimaryEnabled,
 		Transcripts:                   transcriptRecorder,
 	}
 	if err := server.ValidateCredentialUpstreams(); err != nil {
