@@ -30,6 +30,20 @@ func TestTranslateMuseClaudeRequest(t *testing.T) {
 	}
 }
 
+func TestClaudeMuseArgsDefaultToHighEffort(t *testing.T) {
+	args := claudeMuseArgs(nil, "http://127.0.0.1:1234", "X-Subrouter-Agent: claude-muse")
+	if len(args) < 2 || args[0] != "--settings" {
+		t.Fatalf("args = %#v", args)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal([]byte(args[1]), &settings); err != nil {
+		t.Fatal(err)
+	}
+	if settings["effortLevel"] != "high" {
+		t.Fatalf("effortLevel = %#v, want high", settings["effortLevel"])
+	}
+}
+
 func TestTranslateMuseResponse(t *testing.T) {
 	body := []byte(`{"id":"resp_1","model":"muse-wonder-1.0","output":[{"type":"message","content":[{"type":"output_text","text":"ready"}]},{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"path\":\"a.go\"}"}],"usage":{"input_tokens":10,"output_tokens":4,"input_tokens_details":{"cached_tokens":6}}}`)
 	translated, err := translateMuseResponse(body)

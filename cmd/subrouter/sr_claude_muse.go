@@ -101,6 +101,7 @@ func claudeMuseArgs(args []string, baseURL, customHeaders string) []string {
 	hook := "/usr/bin/curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- " + shellQuote(baseURL+"/hooks/pre-compact") + " >/dev/null"
 	settings, err := json.Marshal(map[string]any{
 		"disableAutoMode": "disable",
+		"effortLevel":     "high",
 		"permissions": map[string]any{
 			"disableAutoMode": "disable",
 			"defaultMode":     "default",
