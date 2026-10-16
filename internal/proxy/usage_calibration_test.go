@@ -21,6 +21,12 @@ func calibrationStatus() AccountUsageStatus {
 	}
 }
 
+func calibrationTestRecorder(dir string) *UsageCalibrationRecorder {
+	c := NewUsageCalibrationRecorder(dir)
+	c.startedAt = time.Time{} // Historical synthetic observations are intentional.
+	return c
+}
+
 func calibrationNext(t *testing.T, c *UsageCalibrationRecorder) calibrationObservation {
 	t.Helper()
 	select {
@@ -42,7 +48,7 @@ func calibrationNext(t *testing.T, c *UsageCalibrationRecorder) calibrationObser
 }
 
 func TestUsageCalibrationCountersSurviveHourlyRollover(t *testing.T) {
-	c := NewUsageCalibrationRecorder("")
+	c := calibrationTestRecorder("")
 	now := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)
 	usage := NewTokenUsageRecorder("", nil, WithUsageCalibrationRecorder(c), WithTokenUsageClock(func() time.Time { return now }))
 	usage.Record("claude", "private@example.com", "model", "private-device", tokenUsage{InputTokens: 100, CachedInputTokens: 80, CacheWriteInputTokens: 5, OutputTokens: 20}, true)
@@ -69,7 +75,7 @@ func TestUsageCalibrationCountersSurviveHourlyRollover(t *testing.T) {
 }
 
 func TestUsageCalibrationDeduplicatesFreshWindowsAndExcludesFallback(t *testing.T) {
-	c := NewUsageCalibrationRecorder("")
+	c := calibrationTestRecorder("")
 	status := calibrationStatus()
 	c.observe(status, "g1")
 	calibrationNext(t, c)
@@ -101,7 +107,7 @@ func TestUsageCalibrationDeduplicatesFreshWindowsAndExcludesFallback(t *testing.
 }
 
 func TestUsageCalibrationPersistenceHook(t *testing.T) {
-	c := NewUsageCalibrationRecorder("")
+	c := calibrationTestRecorder("")
 	ref := cacheTestAccountRef(t, &usageRoundTripper{responses: []*http.Response{usageOKResponse()}})
 	ref.SetUsageCalibrationRecorder(c)
 	statuses := ref.UsageStatuses(context.Background())
@@ -114,8 +120,41 @@ func TestUsageCalibrationPersistenceHook(t *testing.T) {
 	}
 }
 
+func TestUsageCalibrationRejectsRestoredAndMergedOrRotatedReadings(t *testing.T) {
+	real := NewUsageCalibrationRecorder("")
+	real.observe(calibrationStatus(), "old")
+	if len(real.queue) != 0 {
+		t.Fatal("observation preceding counter epoch was accepted")
+	}
+	c := calibrationTestRecorder("")
+	ref := cacheTestAccountRef(t, &usageRoundTripper{responses: []*http.Response{usageOKResponse()}})
+	status := ref.UsageStatuses(context.Background())[0]
+	account := ref.All()[0]
+	key := account.ID + "\x00" + string(accountProviderOrCodex(account))
+	ref.usageWindowsMu.Lock()
+	entry := ref.usageWindows[key]
+	entry.at = entry.at.Add(time.Minute)
+	status.UsageFetchedAt = entry.at
+	entry.credentialKey = "obsolete-credential"
+	ref.usageWindows[key] = entry
+	ref.usageWindowsMu.Unlock()
+	ref.observeUsageCalibration(c, status, account, "g")
+	if len(c.queue) != 0 {
+		t.Fatal("credential rotation was not fenced")
+	}
+	ref.usageWindowsMu.Lock()
+	entry.credentialKey = usageWindowsCredentialKey(account)
+	entry.windows = []accounts.UsageWindow{{Name: "model-only", Feature: "specific-model", UsedPercent: 10}}
+	ref.usageWindows[key] = entry
+	ref.usageWindowsMu.Unlock()
+	ref.observeUsageCalibration(c, status, account, "g")
+	if len(c.queue) != 0 {
+		t.Fatal("old merged account-wide windows were treated as newly fetched")
+	}
+}
+
 func TestUsageCalibrationBoundsAndDrops(t *testing.T) {
-	c := NewUsageCalibrationRecorder("")
+	c := calibrationTestRecorder("")
 	status := calibrationStatus()
 	for i := 0; i < usageCalibrationQueueSize+1; i++ {
 		status.UsageFetchedAt = status.UsageFetchedAt.Add(time.Minute)

@@ -13,6 +13,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 const (
@@ -68,6 +70,7 @@ type calibrationSeen struct {
 type UsageCalibrationRecorder struct {
 	dir        string
 	epoch      string
+	startedAt  time.Time
 	mu         sync.Mutex
 	counters   map[calibrationCounterKey]calibrationCounters
 	seen       map[string]calibrationSeen
@@ -79,7 +82,7 @@ type UsageCalibrationRecorder struct {
 }
 
 func NewUsageCalibrationRecorder(dir string) *UsageCalibrationRecorder {
-	return &UsageCalibrationRecorder{dir: dir, epoch: rand.Text(), counters: map[calibrationCounterKey]calibrationCounters{}, seen: map[string]calibrationSeen{}, queue: make(chan []byte, usageCalibrationQueueSize)}
+	return &UsageCalibrationRecorder{dir: dir, epoch: rand.Text(), startedAt: time.Now(), counters: map[calibrationCounterKey]calibrationCounters{}, seen: map[string]calibrationSeen{}, queue: make(chan []byte, usageCalibrationQueueSize)}
 }
 
 func (r *AccountRef) SetUsageCalibrationRecorder(recorder *UsageCalibrationRecorder) {
@@ -95,6 +98,25 @@ func WithUsageCalibrationRecorder(recorder *UsageCalibrationRecorder) TokenUsage
 func calibrationAccountKey(provider, id string) string {
 	sum := sha256.Sum256([]byte(provider + "\x00" + id))
 	return hex.EncodeToString(sum[:])
+}
+
+// A merged last-good status can contain old account-wide windows alongside a
+// new model-only reading. Use only the exact cache entry that produced this
+// observation, bound to the current credential, rather than the merged view.
+func (r *AccountRef) observeUsageCalibration(c *UsageCalibrationRecorder, status AccountUsageStatus, account accounts.Account, generation string) {
+	key := account.ID + "\x00" + string(accountProviderOrCodex(account))
+	credentialKey := usageWindowsCredentialKey(account)
+	r.usageWindowsMu.Lock()
+	entry, ok := r.usageWindows[key]
+	if ok {
+		entry.windows = append([]accounts.UsageWindow(nil), entry.windows...)
+	}
+	r.usageWindowsMu.Unlock()
+	if !ok || entry.credentialKey != credentialKey || !entry.at.Equal(status.UsageFetchedAt) {
+		return
+	}
+	status.Windows = entry.windows
+	c.observe(status, generation)
 }
 
 // record is called with already-normalized accounting, never response content.
@@ -136,7 +158,7 @@ func (c *UsageCalibrationRecorder) record(key tokenUsageKey, counts tokenUsageCo
 // cleared for the durable last-good cache. Cache hits deduplicate by observation
 // timestamp. Partial model-only or paid-extra observations are not samples.
 func (c *UsageCalibrationRecorder) observe(status AccountUsageStatus, generation string) {
-	if c == nil || status.UsageThrottled || status.UsageFetchedAt.IsZero() || (!status.UsageFresh && !status.AccountWideUsageFresh) {
+	if c == nil || status.UsageThrottled || status.UsageFetchedAt.IsZero() || status.UsageFetchedAt.Before(c.startedAt) || (!status.UsageFresh && !status.AccountWideUsageFresh) {
 		return
 	}
 	windows := []calibrationWindow{}
