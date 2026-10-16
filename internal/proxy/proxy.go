@@ -11174,7 +11174,6 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			rewritten, changed, rewriteErr := rewriteAntigravityProject(rawBody, project)
 			if rewriteErr != nil {
-				nextReservation.Release()
 				return nil, rewriteErr
 			}
 			if changed {
@@ -11866,6 +11865,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			rewritten, changed, rewriteErr := rewriteAntigravityProject(rawBody, project)
 			if rewriteErr != nil {
+				nextReservation.Release()
 				return response, nil
 			}
 			if changed {
