@@ -243,3 +243,52 @@ func TestHandlerSpilledRequestNeverMovesTheSessionAfterLaterFailover(t *testing.
 		t.Fatalf("session moved to %q; a spilled request must leave it on its sticky account", assignment.AccountID)
 	}
 }
+
+// Once the subscription pool is at its cap, every account still standing has
+// a full queue. Nothing reached an upstream, so the fallback chain must serve
+// the request, as it does for a paused pool; answering 503 sent the client
+// back to the same full queues (1,052 requests in one hour gave up at attempt
+// 1 of 6 while the Bedrock chain sat idle, 2026-10-14).
+func TestHandlerFullAdmissionQueueServesTheFallbackChain(t *testing.T) {
+	f := newAdmissionSpillFixture(t)
+	f.saturate("a@example.com", f.control.queueCap)
+	f.saturate("b@example.com", f.control.queueCap)
+	var fallbackCalls int
+	server := f.server
+	// The chain serves every model through Bedrock (#627); an Opus request
+	// is what the capped pool turned away.
+	server.ClaudeBedrockModelID = "test-bedrock-profile"
+	server.Bedrock = &BedrockConfig{
+		Regions: []string{"us-east-1"},
+		Sources: []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
+		Transport: bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			fallbackCalls++
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"type":"message","id":"msg_fallback","content":[]}`)),
+				Request:    req,
+			}, nil
+		}),
+	}
+	handler := server.Handler()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages",
+		strings.NewReader(`{"model":"claude-opus-4-8","max_tokens":8,"messages":[]}`)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-pool-saturated")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "msg_fallback") {
+		t.Fatalf("status = %d body=%s, want 200 from the fallback chain", response.Code, response.Body.String())
+	}
+	if fallbackCalls != 1 {
+		t.Fatalf("fallback calls = %d, want 1", fallbackCalls)
+	}
+	if got := f.lastUpstreamToken(); got != "" {
+		t.Fatalf("saturated pool reached upstream with %q", got)
+	}
+}
