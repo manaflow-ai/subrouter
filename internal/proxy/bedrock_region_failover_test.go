@@ -12,7 +12,7 @@ import (
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/session"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 // fakeBedrockRegions answers each Bedrock region with a status the test sets,
