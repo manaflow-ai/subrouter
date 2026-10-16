@@ -1,8 +1,13 @@
 package selectacct
 
 import (
+	"context"
+	"fmt"
+	"math"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/account"
 )
@@ -140,4 +145,138 @@ func TestPlacementReservationCommitAndReleaseAreIdempotent(t *testing.T) {
 	if got := ref.LiveDebits()[ScoreKey(account.ProviderCodex, picked.ID)]; got != 1 {
 		t.Fatalf("released reservation changed committed debit to %d, want 1", got)
 	}
+}
+
+func reservationReplayScheduler() Scheduler {
+	scores := make([]Score, 0, 7)
+	for i := 0; i < 7; i++ {
+		id := fmt.Sprintf("reset-%d@example.com", i)
+		scores = append(scores, Score{
+			AccountID: id, Provider: account.ProviderCodex,
+			Headroom: 0.90, ShortHeadroom: 0.90, Fresh: true,
+		})
+	}
+	return NewScheduler(scores)
+}
+
+func reservationReplayAccounts() []account.Account {
+	accounts := make([]account.Account, 0, 7)
+	for i := 0; i < 7; i++ {
+		accounts = append(accounts, account.Account{
+			ID: fmt.Sprintf("reset-%d@example.com", i), Provider: account.ProviderCodex,
+			AuthMode: account.AuthModeOAuth,
+		})
+	}
+	return accounts
+}
+
+// A reset makes all currently pinned sessions eligible at once. This replay
+// keeps the 50-session burst concurrent and checks the property that matters:
+// reservations spread the burst before any upstream attempt is committed, so
+// a single account reset can move only its bounded share of the sessions.
+func TestPickAndReserveConcurrentResetReplayBoundsConcentration(t *testing.T) {
+	previous := spreadRandFloat
+	var draws uint64
+	spreadRandFloat = func() float64 {
+		// A deterministic low-discrepancy sequence keeps this test reproducible
+		// while still exercising every part of the weighted spread interval.
+		const step = 0.6180339887498949
+		draw := atomic.AddUint64(&draws, 1)
+		return math.Mod(float64(draw)*step, 1)
+	}
+	defer func() { spreadRandFloat = previous }()
+
+	ref := NewSchedulerRef(reservationReplayScheduler())
+	snapshot := ref.Get()
+	candidates := reservationReplayAccounts()
+	const sessions = 50
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	counts := make(map[string]int)
+	reservations := make([]*PlacementReservation, 0, sessions)
+	for i := 0; i < sessions; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			picked, reservation, err := ref.PickAndReserve(snapshot, candidates)
+			if err != nil {
+				t.Errorf("pick: %v", err)
+				return
+			}
+			mu.Lock()
+			counts[picked.ID]++
+			reservations = append(reservations, reservation)
+			mu.Unlock()
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(reservations) != sessions {
+		t.Fatalf("reservations = %d, want %d", len(reservations), sessions)
+	}
+	max := 0
+	for id, count := range counts {
+		if count > max {
+			max = count
+		}
+		if count == 0 {
+			t.Errorf("%s received no reset replay placements", id)
+		}
+	}
+	if max > 12 {
+		t.Fatalf("reset replay concentrated %d/%d sessions on one account: %v", max, sessions, counts)
+	}
+	if got := totalReservationDebits(ref.LiveDebits()); got != sessions {
+		t.Fatalf("pending reservation debits = %d, want %d", got, sessions)
+	}
+
+	// Half the upstream preparations fail or are canceled. Releases must not
+	// become routed debits, while successful preparations commit exactly once.
+	for i, reservation := range reservations {
+		if i%2 == 0 {
+			reservation.Release()
+		} else {
+			reservation.Commit()
+		}
+	}
+	if got := totalReservationDebits(ref.LiveDebits()); got != sessions/2 {
+		t.Fatalf("post-failure live debits = %d, want %d", got, sessions/2)
+	}
+
+	// If the account holding the largest share resets, this is the largest
+	// simultaneous move the router can cause from this burst.
+	if max > 12 {
+		t.Fatalf("mass move after account reset would be %d sessions", max)
+	}
+}
+
+func totalReservationDebits(debits map[string]int) int {
+	total := 0
+	for _, count := range debits {
+		total += count
+	}
+	return total
+}
+
+func TestPickAndReserveContextCancellationReleases(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ref := NewSchedulerRef(reservationTestScheduler())
+	_, reservation, err := ref.PickAndReserveContext(ctx, ref.Get(), reservationTestAccounts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if len(ref.LiveDebits()) == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	reservation.Release()
+	t.Fatalf("context cancellation left reservation live: %v", ref.LiveDebits())
 }

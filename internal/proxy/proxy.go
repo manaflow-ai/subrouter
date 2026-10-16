@@ -12599,7 +12599,7 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 			if reserveClaude && provider == accounts.ProviderClaude && s.SchedulerRef != nil && allOAuthCandidates(candidates) {
 				var normalized accounts.Account
 				normalizedCandidates := SchedulerAccounts(candidates)
-				normalized, reservation, pickErr := s.SchedulerRef.PickAndReserve(scheduler, normalizedCandidates)
+				normalized, reservation, pickErr := s.SchedulerRef.PickAndReserveContext(ctx, scheduler, normalizedCandidates)
 				if pickErr != nil {
 					return accounts.Account{}, nil, pickErr
 				}

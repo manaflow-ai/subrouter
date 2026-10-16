@@ -1,6 +1,7 @@
 package selectacct
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
@@ -141,31 +142,59 @@ func (r *SchedulerRef) RefreshSeed() Scheduler {
 // debit recorded by NoteRouted. Release removes it when account preparation
 // fails before the request is routed. Either method is idempotent.
 type PlacementReservation struct {
-	ref       *SchedulerRef
-	key       string
-	provider  account.Provider
-	accountID string
-	once      sync.Once
+	ref        *SchedulerRef
+	key        string
+	provider   account.Provider
+	accountID  string
+	once       sync.Once
+	cancelMu   sync.Mutex
+	cancelStop func() bool
+}
+
+// bindContext arranges for a request cancellation to release an uncommitted
+// reservation. The callback races safely with Commit and Release through the
+// same once gate; it only removes the pending placement and never records a
+// routed request.
+func (p *PlacementReservation) bindContext(ctx context.Context) {
+	if p == nil || p.ref == nil || ctx == nil {
+		return
+	}
+	stop := context.AfterFunc(ctx, func() { p.releaseOnce() })
+	p.cancelMu.Lock()
+	p.cancelStop = stop
+	p.cancelMu.Unlock()
+}
+
+func (p *PlacementReservation) finish(fn func()) {
+	if p == nil || p.ref == nil {
+		return
+	}
+	p.once.Do(func() {
+		p.cancelMu.Lock()
+		stop := p.cancelStop
+		p.cancelStop = nil
+		p.cancelMu.Unlock()
+		if stop != nil {
+			stop()
+		}
+		fn()
+	})
+}
+
+func (p *PlacementReservation) releaseOnce() {
+	p.finish(func() { p.ref.releasePlacementReservation(p.key) })
 }
 
 // Commit records the reserved request as routed. It is safe to call more than
 // once; only the first call changes scheduler state or placement statistics.
 func (p *PlacementReservation) Commit() {
-	if p == nil || p.ref == nil {
-		return
-	}
-	p.once.Do(func() {
-		p.ref.commitPlacementReservation(p.key, p.provider, p.accountID)
-	})
+	p.finish(func() { p.ref.commitPlacementReservation(p.key, p.provider, p.accountID) })
 }
 
 // Release drops a reservation without recording a routed request. It is safe
 // to call more than once.
 func (p *PlacementReservation) Release() {
-	if p == nil || p.ref == nil {
-		return
-	}
-	p.once.Do(func() { p.ref.releasePlacementReservation(p.key) })
+	p.releaseOnce()
 }
 
 // PickAndReserve chooses an account and reserves its live placement load as
@@ -177,6 +206,22 @@ func (p *PlacementReservation) Release() {
 // The caller must Commit or Release the returned reservation. A committed
 // reservation replaces the later NoteRouted call for that request.
 func (r *SchedulerRef) PickAndReserve(scheduler Scheduler, candidates []account.Account) (account.Account, *PlacementReservation, error) {
+	return r.pickAndReserve(scheduler, candidates)
+}
+
+// PickAndReserveContext is PickAndReserve with request-lifetime cleanup. If
+// ctx is canceled before the caller commits the upstream placement, the
+// pending reservation is released automatically. This closes the cancellation
+// gap between account selection and the upstream success boundary.
+func (r *SchedulerRef) PickAndReserveContext(ctx context.Context, scheduler Scheduler, candidates []account.Account) (account.Account, *PlacementReservation, error) {
+	picked, reservation, err := r.pickAndReserve(scheduler, candidates)
+	if err == nil && reservation != nil {
+		reservation.bindContext(ctx)
+	}
+	return picked, reservation, err
+}
+
+func (r *SchedulerRef) pickAndReserve(scheduler Scheduler, candidates []account.Account) (account.Account, *PlacementReservation, error) {
 	if r == nil {
 		picked, err := scheduler.Pick(candidates)
 		return picked, nil, err
