@@ -11348,7 +11348,8 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				// fan-out, so a genuinely API-wide overload is not amplified.
 				// Overload is not quota, so the first account is never marked.
 				// With no candidate the request keeps to the same-account ladder.
-				if next, ok := t.claudeOverloadRerouteCandidate(req.Context(), tried); ok && a.consume() {
+				next, reservation, ok := t.claudeOverloadRerouteCandidateWithReservation(req.Context(), tried)
+				if ok && a.consume() {
 					nextReq, retargetErr := a.replay(req, &next)
 					if retargetErr == nil {
 						if t.logger != nil {
@@ -11364,13 +11365,17 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 						accountID = next.ID
 						accountCredential = next.CredentialIdentity()
 						tried[accountID] = struct{}{}
-						if t.server.SchedulerRef != nil {
+						if reservation != nil {
+							reservation.Commit()
+						} else if t.server.SchedulerRef != nil {
 							t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
 						}
 						attemptReq = nextReq
 						continue
 					}
 				}
+				// No replay was dispatched, including an exhausted shared budget.
+				reservation.Release()
 			}
 			var wait time.Duration
 			if claudeOverload {

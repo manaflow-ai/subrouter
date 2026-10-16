@@ -160,18 +160,6 @@ func (b *claudeSSEDeferredBody) Close() error {
 	return b.peek.body.Close()
 }
 
-// claudeOverloadRerouteCandidate picks the single alternate subscription
-// account an overloaded request may try after its first same-account retries,
-// when the reroute is opted in (Server.ClaudeOverloadReroute); by default the
-// request never leaves its account on overload. Overload is usually API-wide, so this is deliberately narrow: OAuth
-// accounts only, and only one with new-session headroom, so a sustained outage
-// costs at most one extra upstream request rather than a pool fan-out.
-func (t usageLimitRetryTransport) claudeOverloadRerouteCandidate(ctx context.Context, tried map[string]struct{}) (accounts.Account, bool) {
-	next, reservation, ok := t.claudeOverloadRerouteCandidateWithReservation(ctx, tried)
-	reservation.Release()
-	return next, ok
-}
-
 // claudeOverloadRerouteCandidateWithReservation holds the selected replacement
 // in the live placement load until its caller dispatches or abandons the retry.
 func (t usageLimitRetryTransport) claudeOverloadRerouteCandidateWithReservation(ctx context.Context, tried map[string]struct{}) (accounts.Account, *selectacct.PlacementReservation, bool) {
