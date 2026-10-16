@@ -2552,7 +2552,9 @@ func (r srRunner) claudeCodex(ctx context.Context, args []string) error {
 	env = envWithoutPrefix(env, "ANTHROPIC_DEFAULT_")
 	env = envWithoutPrefix(env, "ANTHROPIC_CUSTOM_MODEL_")
 	env = append(env,
-		"ANTHROPIC_BASE_URL="+strings.TrimRight(serverURL, "/")+"/claude-codex",
+		// Claude Code resolves Messages requests as absolute /v1 paths, so the
+		// bridge is selected by X-Subrouter-Agent rather than a URL prefix.
+		"ANTHROPIC_BASE_URL="+strings.TrimRight(serverURL, "/"),
 		"ANTHROPIC_AUTH_TOKEN="+firstNonEmpty(strings.TrimSpace(server.TenantKey), "subrouter"),
 		"ANTHROPIC_CUSTOM_HEADERS="+customHeaders,
 		"ANTHROPIC_DEFAULT_FABLE_MODEL=gpt-6.1-sol",

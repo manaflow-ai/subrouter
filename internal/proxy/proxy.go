@@ -5573,7 +5573,7 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		modelCatalogRequest := requestProvider == accounts.ProviderCodex && codexModelCatalogRequest(r)
 		sessionID := session.ExtractID(r, s.MaxBodyBytes)
-		bridgePath := claudeCodexRequestPath(r.URL.Path)
+		bridgePath := isClaudeCodexRequest(r)
 		if bridgePath {
 			agentType = "claude-codex"
 			requestProvider = accounts.ProviderCodex

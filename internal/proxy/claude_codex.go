@@ -82,6 +82,19 @@ func claudeCodexRequestPath(path string) bool {
 	return path == claudeCodexPrefix || strings.HasPrefix(path, claudeCodexPrefix+"/")
 }
 
+func isClaudeCodexRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if claudeCodexRequestPath(r.URL.Path) {
+		return true
+	}
+	if !strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Subrouter-Agent")), "claude-codex") {
+		return false
+	}
+	return strings.HasSuffix(r.URL.Path, "/messages") || strings.HasSuffix(r.URL.Path, "/count_tokens")
+}
+
 func (s Server) serveClaudeCodex(w http.ResponseWriter, r *http.Request, agentType, sessionID string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

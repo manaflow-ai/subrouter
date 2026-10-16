@@ -332,12 +332,12 @@ func TestClaudeCodexBridgeRoutesThroughCodexOAuthAccount(t *testing.T) {
 	defer server.Close()
 
 	requestBody := `{"model":"claude-codex-sol","stream":false,"system":"test","messages":[{"role":"user","content":"reply"}],"tools":[]}`
-	req, err := http.NewRequest(http.MethodPost, server.URL+"/claude-codex/v1/messages", bytes.NewBufferString(requestBody))
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/messages", bytes.NewBufferString(requestBody))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Authorization", "Bearer ignored-claude-token")
-	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Agent", "claude-codex")
 	req.Header.Set("X-Subrouter-Session", "claude-session-1")
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
