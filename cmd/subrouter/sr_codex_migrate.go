@@ -21,7 +21,8 @@ import (
 const codexIsolationRemediation = "sr codex migrate-isolation"
 const codexIsolatedEnrollmentCommand = "sr codex enroll-isolated"
 const codexIsolationComparisonRemediation = "verify candidate and retiring credential stores before activation"
-const codexAccountUsage = "sr codex isolation-check [--json] [--retiring-state-dir PATH], sr codex migrate-isolation [--device-auth], sr codex enroll-isolated --retiring-state-dir PATH [--device-auth] [--only ACCOUNT]..., or sr codex attest-legacy [--state-dir PATH] [--dry-run] [--only ACCOUNT]..."
+const codexIsolationAllowSharedEnv = "SUBROUTER_CODEX_ISOLATION_ALLOW_SHARED"
+const codexAccountUsage = "sr codex isolation-check [--json] [--retiring-state-dir PATH] [--allow-shared-active ACCOUNT]..., sr codex migrate-isolation [--device-auth], sr codex enroll-isolated --retiring-state-dir PATH [--device-auth] [--only ACCOUNT]..., or sr codex attest-legacy [--state-dir PATH] [--dry-run] [--only ACCOUNT]..."
 
 var errCodexIsolationCheckFailed = errors.New("codex credential isolation preflight failed")
 
@@ -42,6 +43,7 @@ type codexIsolationCheckResult struct {
 	SchemaVersion              int                             `json:"schema_version"`
 	OK                         bool                            `json:"ok"`
 	AccountsRequiringMigration int                             `json:"accounts_requiring_migration"`
+	AccountsAllowedShared      int                             `json:"accounts_allowed_shared_active,omitempty"`
 	Remediation                string                          `json:"remediation,omitempty"`
 	Comparison                 *codexIsolationComparisonResult `json:"comparison,omitempty"`
 }
@@ -104,13 +106,29 @@ func codexIsolationTargetsReadOnly(store accounts.CodexStore) ([]accounts.Stored
 	return codexIsolationTargetsFromList(store, store.ListStoredReadOnly)
 }
 
+func codexIsolationTargetsReadOnlyWithAllowlist(
+	store accounts.CodexStore,
+	allowShared map[string]struct{},
+) ([]accounts.StoredCodexAccount, int, error) {
+	return codexIsolationTargetsFromListWithAllowlist(store, store.ListStoredReadOnly, allowShared)
+}
+
 func codexIsolationTargetsFromList(
 	store accounts.CodexStore,
 	list func() ([]accounts.StoredCodexAccount, error),
 ) ([]accounts.StoredCodexAccount, error) {
+	targets, _, err := codexIsolationTargetsFromListWithAllowlist(store, list, nil)
+	return targets, err
+}
+
+func codexIsolationTargetsFromListWithAllowlist(
+	store accounts.CodexStore,
+	list func() ([]accounts.StoredCodexAccount, error),
+	allowShared map[string]struct{},
+) ([]accounts.StoredCodexAccount, int, error) {
 	stored, err := list()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	active, activeOK, activeErr := accounts.ReadActiveCodexAuth()
 	if activeErr != nil {
@@ -119,6 +137,7 @@ func codexIsolationTargetsFromList(
 		activeOK = false
 	}
 	targets := make([]accounts.StoredCodexAccount, 0)
+	allowed := 0
 	for _, account := range stored {
 		if account.IsAPIKey() || account.ProviderOrDefault() != accounts.ProviderCodex || account.Auth.Tokens == nil {
 			continue
@@ -127,16 +146,61 @@ func codexIsolationTargetsFromList(
 			account.OAuthCredentialOrigin == accounts.CodexOAuthOriginServerAttested
 		sharesActive := activeOK && active.Tokens != nil && active.Tokens.RefreshToken != "" &&
 			active.Tokens.RefreshToken == account.Auth.Tokens.RefreshToken
-		if !trusted || sharesActive {
+		// A named, trusted account may be deliberately quarantined while it
+		// still shares the machine's interactive chain. This exception applies
+		// only to the deployment preflight. Serving still rejects the shared
+		// chain in validateServingCredentialIsolation, so the account cannot
+		// rotate the interactive credential.
+		if !trusted || (sharesActive && !codexIsolationSharedAccountAllowed(account, allowShared)) {
 			targets = append(targets, account)
+		} else if sharesActive {
+			allowed++
 		}
 	}
-	return targets, nil
+	return targets, allowed, nil
+}
+
+func codexIsolationSharedAccountAllowed(account accounts.StoredCodexAccount, allowShared map[string]struct{}) bool {
+	if len(allowShared) == 0 || account.OAuthCredentialOrigin != accounts.CodexOAuthOriginServerAttested {
+		return false
+	}
+	for _, selector := range []string{
+		strings.ToLower(strings.TrimSpace(account.Email)),
+		strings.ToLower(strings.TrimSpace(accounts.ExtractChatGPTAccountID(account.Auth))),
+	} {
+		if selector != "" {
+			if _, ok := allowShared[selector]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func codexIsolationAllowlist(values []string) (map[string]struct{}, error) {
+	allowed := make(map[string]struct{})
+	values = append(values, os.Getenv(codexIsolationAllowSharedEnv))
+	for _, raw := range values {
+		for _, selector := range strings.FieldsFunc(raw, func(r rune) bool {
+			return r == ',' || r == ';' || r == '\n' || r == '\r'
+		}) {
+			selector = strings.ToLower(strings.TrimSpace(selector))
+			if selector == "" {
+				continue
+			}
+			if _, duplicate := allowed[selector]; duplicate {
+				return nil, fmt.Errorf("duplicate shared-active Codex account selector %q", selector)
+			}
+			allowed[selector] = struct{}{}
+		}
+	}
+	return allowed, nil
 }
 
 func compareCodexIsolationStores(
 	candidateRoot, retiringRoot string,
 	candidateStore, retiringStore accounts.CodexStore,
+	allowShared map[string]struct{},
 ) (codexIsolationComparisonResult, error) {
 	normalizedCandidate, err := normalizeStateRoot(candidateRoot)
 	if err != nil {
@@ -189,6 +253,7 @@ func compareCodexIsolationStores(
 	inventoryMatch := nonzeroInventory && selectorsUnique && identitiesComplete && equalStoredAccountInventories(candidateIDs, retiringIDs)
 
 	candidateRefresh := make(map[[sha256.Size]byte]int)
+	candidateRefreshAllowed := make(map[[sha256.Size]byte]bool)
 	retiringRefresh := make(map[[sha256.Size]byte]struct{})
 	candidateOAuthCount := 0
 	candidateUntrusted := 0
@@ -206,7 +271,14 @@ func compareCodexIsolationStores(
 			continue
 		}
 		token := strings.TrimSpace(account.Auth.Tokens.RefreshToken)
-		candidateRefresh[sha256.Sum256([]byte(token))]++
+		fingerprint := sha256.Sum256([]byte(token))
+		candidateRefresh[fingerprint]++
+		if _, exists := candidateRefreshAllowed[fingerprint]; !exists {
+			candidateRefreshAllowed[fingerprint] = true
+		}
+		if !codexIsolationSharedAccountAllowed(account, allowShared) {
+			candidateRefreshAllowed[fingerprint] = false
+		}
 	}
 	for _, account := range retiring {
 		if !storedCodexOAuthAccount(account) {
@@ -226,7 +298,7 @@ func compareCodexIsolationStores(
 	}
 	sharedRefresh := 0
 	for fingerprint := range candidateRefresh {
-		if _, shared := retiringRefresh[fingerprint]; shared {
+		if _, shared := retiringRefresh[fingerprint]; shared && !candidateRefreshAllowed[fingerprint] {
 			sharedRefresh++
 		}
 	}
@@ -444,11 +516,13 @@ func (r srRunner) checkCodexIsolation(args []string) error {
 	flags.SetOutput(r.errOut)
 	jsonOutput := flags.Bool("json", false, "print machine-readable JSON")
 	retiringStateDir := flags.String("retiring-state-dir", "", "compare against the retiring service state root")
+	var allowShared stringList
+	flags.Var(&allowShared, "allow-shared-active", "allow one trusted shared-active account in this preflight (repeatable)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
-		return errors.New("usage: sr codex isolation-check [--json] [--retiring-state-dir PATH]")
+		return errors.New("usage: sr codex isolation-check [--json] [--retiring-state-dir PATH] [--allow-shared-active ACCOUNT]...")
 	}
 	comparisonRequested := false
 	flags.Visit(func(parsed *flag.Flag) {
@@ -459,7 +533,11 @@ func (r srRunner) checkCodexIsolation(args []string) error {
 	if comparisonRequested && strings.TrimSpace(*retiringStateDir) == "" {
 		return errors.New("--retiring-state-dir must not be empty")
 	}
-	targets, err := codexIsolationTargetsReadOnly(r.store)
+	allowedShared, err := codexIsolationAllowlist(allowShared)
+	if err != nil {
+		return err
+	}
+	targets, allowedCount, err := codexIsolationTargetsReadOnlyWithAllowlist(r.store, allowedShared)
 	if err != nil {
 		return err
 	}
@@ -467,6 +545,7 @@ func (r srRunner) checkCodexIsolation(args []string) error {
 		SchemaVersion:              1,
 		OK:                         len(targets) == 0,
 		AccountsRequiringMigration: len(targets),
+		AccountsAllowedShared:      allowedCount,
 	}
 	if comparisonRequested {
 		normalizedRetiring, normalizeErr := normalizeStateRoot(*retiringStateDir)
@@ -476,6 +555,7 @@ func (r srRunner) checkCodexIsolation(args []string) error {
 		comparison, compareErr := compareCodexIsolationStores(
 			storepath.StateDir(), *retiringStateDir, r.store,
 			accounts.CodexStoreForStateRootReadOnlyInspection(normalizedRetiring),
+			allowedShared,
 		)
 		if compareErr != nil {
 			return compareErr
@@ -495,7 +575,11 @@ func (r srRunner) checkCodexIsolation(args []string) error {
 			return err
 		}
 	} else if result.OK {
-		fmt.Fprintln(r.out, "Codex credential isolation preflight passed.")
+		if result.AccountsAllowedShared > 0 {
+			fmt.Fprintf(r.out, "Codex credential isolation preflight passed with %d explicitly allowed shared-active account(s).\n", result.AccountsAllowedShared)
+		} else {
+			fmt.Fprintln(r.out, "Codex credential isolation preflight passed.")
+		}
 	} else if result.Comparison != nil && !result.Comparison.OK {
 		fmt.Fprintf(r.out, "Codex credential isolation comparison failed: %s.\n", result.Remediation)
 	} else {
