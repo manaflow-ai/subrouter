@@ -219,12 +219,13 @@ func TestPickAndReserveConcurrentResetReplayBoundsConcentration(t *testing.T) {
 		t.Fatalf("reservations = %d, want %d", len(reservations), sessions)
 	}
 	max := 0
-	for id, count := range counts {
+	for _, candidate := range candidates {
+		count := counts[candidate.ID]
 		if count > max {
 			max = count
 		}
 		if count == 0 {
-			t.Errorf("%s received no reset replay placements", id)
+			t.Errorf("%s received no reset replay placements", candidate.ID)
 		}
 	}
 	if max > 12 {
@@ -247,11 +248,6 @@ func TestPickAndReserveConcurrentResetReplayBoundsConcentration(t *testing.T) {
 		t.Fatalf("post-failure live debits = %d, want %d", got, sessions/2)
 	}
 
-	// If the account holding the largest share resets, this is the largest
-	// simultaneous move the router can cause from this burst.
-	if max > 12 {
-		t.Fatalf("mass move after account reset would be %d sessions", max)
-	}
 }
 
 func totalReservationDebits(debits map[string]int) int {
