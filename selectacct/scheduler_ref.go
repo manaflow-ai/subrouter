@@ -198,6 +198,8 @@ func (r *SchedulerRef) PickAndReserve(scheduler Scheduler, candidates []account.
 	return picked, &PlacementReservation{ref: r, key: key, provider: picked.Provider, accountID: picked.ID}, nil
 }
 
+// commitPlacementReservation converts one pending reservation into the
+// existing routed-request debit and placement statistic.
 func (r *SchedulerRef) commitPlacementReservation(key string, provider account.Provider, accountID string) {
 	if r == nil {
 		return
@@ -221,6 +223,8 @@ func (r *SchedulerRef) commitPlacementReservation(key string, provider account.P
 	r.noteRoutedStat(provider, accountID)
 }
 
+// releasePlacementReservation removes one pending reservation without
+// recording a routed request.
 func (r *SchedulerRef) releasePlacementReservation(key string) {
 	if r == nil {
 		return
@@ -234,6 +238,8 @@ func (r *SchedulerRef) releasePlacementReservation(key string) {
 	}
 }
 
+// liveDebitsLocked returns committed and pending placement load for callers
+// that already hold r.mu.
 func (r *SchedulerRef) liveDebitsLocked() map[string]int {
 	if len(r.routedSinceRefresh) == 0 && len(r.placementReservations) == 0 {
 		return nil

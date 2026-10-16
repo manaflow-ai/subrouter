@@ -7,6 +7,8 @@ import (
 	"github.com/manaflow-ai/subrouter/account"
 )
 
+// reservationTestScheduler returns two equal accounts so reservation tests
+// can observe the scheduler's spreading behavior.
 func reservationTestScheduler() Scheduler {
 	return NewScheduler([]Score{
 		{AccountID: "a@example.com", Provider: account.ProviderCodex, Headroom: 0.90, ShortHeadroom: 0.90, Fresh: true},
@@ -14,6 +16,7 @@ func reservationTestScheduler() Scheduler {
 	})
 }
 
+// reservationTestAccounts returns the candidates used by reservation tests.
 func reservationTestAccounts() []account.Account {
 	return []account.Account{
 		{ID: "a@example.com", Provider: account.ProviderCodex, AuthMode: account.AuthModeOAuth},
