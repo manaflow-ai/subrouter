@@ -227,3 +227,52 @@ func TestAdmissionRecoveryCountsStreamsStartedBeforeThrottle(t *testing.T) {
 	}
 	lease.release()
 }
+
+func TestAdmissionRecoveryWaiterQueuedBeforePauseWakesAfterLastStreamCloses(t *testing.T) {
+	control := testAdmissionControl(1, 64)
+	key := admissionKeyFor(accounts.ProviderClaude, "account", "claude-opus")
+	active, err := control.acquire(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.release()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		lease, err := control.acquire(ctx, key)
+		if lease != nil {
+			lease.release()
+		}
+		done <- err
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	// Ensure the second request queued while the bucket was full and had
+	// no cooldown timer. The later 429 must notify it to arm that timer.
+	for control.snapshot().Accounts[0].Queued == 0 {
+		select {
+		case <-ctx.Done():
+			t.Fatal("second request did not queue")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	expiry := time.Now().Add(100 * time.Millisecond)
+	control.pauseWithRecovery(key, expiry, true)
+	active.release()
+	select {
+	case err := <-done:
+		// Leave a result for cleanup, including on failure.
+		done <- err
+		if err != nil {
+			t.Fatalf("queued request never re-armed its cooldown timer: %v", err)
+		}
+		if time.Now().Before(expiry) {
+			t.Fatal("queued request bypassed the newly applied cooldown")
+		}
+	case <-ctx.Done():
+		t.Fatal("queued request stalled after all active streams closed")
+	}
+}
