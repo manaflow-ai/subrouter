@@ -5759,6 +5759,18 @@ func (s Server) proxyHandler() http.Handler {
 		var pendingSessionCommit bool
 		var pendingSessionExpectedAccount string
 		var pendingSessionMoveReason accountMoveReason
+		var placementReservation *selectacct.PlacementReservation
+		defer func() { placementReservation.Release() }()
+		selectionOptions := accountSelectionOptions{
+			oauthOnly: modelCatalogRequest, preferredAccountID: preferredAccountID,
+			pendingSessionCommit: &pendingSessionCommit, pendingSessionMoveReason: &pendingSessionMoveReason,
+		}
+		// HTTP placements hand the pending debit to the existing routed-request
+		// boundary below. WebSocket connection/turn accounting has a separate
+		// lifetime and retains its current behavior.
+		if !websocket.IsWebSocketUpgrade(r) {
+			selectionOptions.placementReservation = &placementReservation
+		}
 		var err error
 		if s.CredentialBroker != nil {
 			requiredAuthMode := accounts.AuthMode("")
@@ -5791,9 +5803,10 @@ func (s Server) proxyHandler() http.Handler {
 				sessionAgentType,
 				sessionID,
 				routingRequest,
-				accountSelectionOptions{oauthOnly: modelCatalogRequest, preferredAccountID: preferredAccountID, pendingSessionCommit: &pendingSessionCommit, pendingSessionMoveReason: &pendingSessionMoveReason},
+				selectionOptions,
 			)
 			if err == nil {
+				selectedAccountID := account.ID
 				pendingSessionExpectedAccount = account.ID
 				if s.Sessions != nil {
 					if assignment, ok := s.Sessions.Get(sessionAgentType, sessionID); ok {
@@ -5816,6 +5829,10 @@ func (s Server) proxyHandler() http.Handler {
 				}
 				if err != nil {
 					err = fmt.Errorf("refresh selected account: %w", err)
+				} else if account.ID != selectedAccountID && placementReservation != nil {
+					placementReservation.Release()
+					placementReservation = nil
+					_, placementReservation, err = pickAndReserveRoutingAccount(r.Context(), s.scheduler(), s.SchedulerRef, []accounts.Account{account})
 				}
 			}
 		}
@@ -6240,7 +6257,12 @@ func (s Server) proxyHandler() http.Handler {
 			// Live debit: the scheduler sees its own routed traffic draining
 			// the usage snapshot between refreshes (sticky and fresh picks
 			// both consume quota).
-			s.SchedulerRef.NoteRouted(schedulerAccountProvider(requestProvider), account.ID)
+			if placementReservation != nil {
+				placementReservation.Commit()
+				placementReservation = nil
+			} else {
+				s.SchedulerRef.NoteRouted(schedulerAccountProvider(requestProvider), account.ID)
+			}
 		}
 		if s.Logger != nil {
 			// remote_addr + user_agent attribute each request to a source (tailnet
@@ -8978,6 +9000,17 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			}
 		}
 	}
+	var placementReservation *selectacct.PlacementReservation
+	defer func() { placementReservation.Release() }()
+	pickPlacement := func(candidates []accounts.Account) (accounts.Account, error) {
+		if options.placementReservation == nil || s.SchedulerRef == nil {
+			return pickRoutingAccount(scheduler, candidates)
+		}
+		var picked accounts.Account
+		var err error
+		picked, placementReservation, err = pickAndReserveRoutingAccount(r.Context(), scheduler, s.SchedulerRef, candidates)
+		return picked, err
+	}
 	// picked carries a placement decided inside the sticky branch (the
 	// constrained account's replacement) into the shared assignment tail, so
 	// the account that was judged materially better is the one assigned.
@@ -9023,7 +9056,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			if provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeAPIKey {
 				subscriptions := claudeSubscriptionCandidatesFromScores(base, scheduler, availableAccounts, poolModel)
 				if len(subscriptions) > 0 {
-					if candidate, pickErr := pickRoutingAccount(scheduler, subscriptions); pickErr == nil {
+					if candidate, pickErr := pickPlacement(subscriptions); pickErr == nil {
 						if s.Logger != nil {
 							s.Logger.Info("moving Claude session from API key to subscription quota",
 								"agent", agentType, "session", sessionID,
@@ -9049,7 +9082,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 						placementCandidates = subscriptions
 					}
 				}
-				candidate, pickErr := pickRoutingAccount(scheduler, placementCandidates)
+				candidate, pickErr := pickPlacement(placementCandidates)
 				if pickErr != nil || s.keepConstrainedStickyAssignment(stickyScheduler, account, candidate) {
 					if s.Logger != nil {
 						s.Logger.Info("keeping sticky session on constrained account; no materially better account",
@@ -9066,7 +9099,16 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 				}
 				if candidate.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(candidate.Provider), candidate.ID) {
 					if fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, availableAccounts, poolModel); ok {
+						placementReservation.Release()
+						placementReservation = nil
 						candidate = fallback
+						if options.placementReservation != nil && s.SchedulerRef != nil {
+							var reserveErr error
+							_, placementReservation, reserveErr = pickAndReserveRoutingAccount(r.Context(), scheduler, s.SchedulerRef, []accounts.Account{candidate})
+							if reserveErr != nil {
+								return accounts.Account{}, sessionID, userEmail, reserveErr
+							}
+						}
 					} else {
 						// The whole pool is exhausted: Pick ranks exhausted accounts
 						// last but still returns one, and the post-selection check
@@ -9098,11 +9140,6 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		}
 	}
 
-	// A fresh lease reserves as part of its full-pool pick, before session
-	// persistence or credential preparation. Keep ownership local until the
-	// assignment tail hands it to the caller, releasing on every early error.
-	var placementReservation *selectacct.PlacementReservation
-	defer func() { placementReservation.Release() }()
 	var account accounts.Account
 	if picked == nil && options.preferredAccountID != "" {
 		preferred, ok := findAccount(availableAccounts, options.preferredAccountID)
@@ -9125,11 +9162,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			// reassignment decisions made above.
 			placementCandidates = claudeNewSessionCandidatesFromScores(base, scheduler, availableAccounts, poolModel)
 		}
-		if previousAccountID == "" && options.placementReservation != nil && s.SchedulerRef != nil {
-			account, placementReservation, err = pickAndReserveRoutingAccount(r.Context(), scheduler, s.SchedulerRef, placementCandidates)
-		} else {
-			account, err = pickRoutingAccount(scheduler, placementCandidates)
-		}
+		account, err = pickPlacement(placementCandidates)
 		if err != nil {
 			return accounts.Account{}, sessionID, userEmail, err
 		}
@@ -9141,8 +9174,10 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		}
 		// Paid fallback may choose a different account. Its reservation must
 		// follow that account rather than leave load attached to the rejected pick.
-		placementReservation.Release()
-		placementReservation = nil
+		if fallback.ID != account.ID {
+			placementReservation.Release()
+			placementReservation = nil
+		}
 		account = fallback
 	}
 	if account.AuthMode == accounts.AuthModeAPIKey && provider == accounts.ProviderClaude &&
