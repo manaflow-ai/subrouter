@@ -218,6 +218,8 @@ Running agents:
                         Launch Claude Code on AWS Bedrock via the server (Fable 5)
   sr claude-codex [claude args...]
                         Launch Claude Code against the pooled Codex backend
+  sr claude-muse [claude args...]
+                        Launch Claude Code against the local Muse Wonder subscription
   sr claude-direct [claude args...]
                         Launch Claude Code directly on Anthropic (bypass subrouter)
   sr spend              Show AWS Bedrock spend tracked by the server
@@ -644,6 +646,8 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 		return r.claude(ctx, args[1:])
 	case "claude-codex":
 		return r.claudeCodex(ctx, args[1:])
+	case "claude-muse", "muse-claude":
+		return r.claudeMuse(ctx, args[1:])
 	case "claude-codex-hook":
 		return r.claudeCodexHook(ctx, args[1:])
 	case "claude-aws":
@@ -745,7 +749,7 @@ func (r srRunner) runSelectedRemoteAccountCommand(ctx context.Context, args []st
 
 func shouldRouteSRCommand(command string) bool {
 	switch command {
-	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-codex", "claude-codex-hook", "claude-direct", "spend", "cost", "gemini", "az", "azure", "oai", "openai", "recover", "help", "-h", "--help":
+	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-codex", "claude-muse", "muse-claude", "claude-codex-hook", "claude-direct", "spend", "cost", "gemini", "az", "azure", "oai", "openai", "recover", "help", "-h", "--help":
 		return false
 	// Setup, cleanup and doctor act on this machine, never the remote server.
 	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage", "host", "hosts":

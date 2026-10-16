@@ -296,6 +296,8 @@ var directSRCommands = map[string]struct{}{
 	"claude":            {},
 	"claude-aws":        {},
 	"claude-codex":      {},
+	"claude-muse":       {},
+	"muse-claude":       {},
 	"claude-codex-hook": {},
 	"claude-direct":     {},
 	"cleanup":           {},
@@ -1947,6 +1949,8 @@ Usage:
                            Launch Claude Code on AWS Bedrock via the server (Fable 5)
   %[1]s claude-codex [claude args...]
                            Launch Claude Code against the pooled Codex backend
+  %[1]s claude-muse [claude args...]
+                           Launch Claude Code against the local Muse Wonder subscription
   %[1]s claude-direct [claude args...]
                            Launch Claude Code directly on Anthropic (bypass subrouter)
   %[1]s agy                Launch AGY through the pooled Cloud Code route (use --account to pin; plain agy stays direct)
