@@ -9131,11 +9131,6 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		}
 	}
 
-	// A fresh lease reserves as part of its full-pool pick, before session
-	// persistence or credential preparation. Keep ownership local until the
-	// assignment tail hands it to the caller, releasing on every early error.
-	var placementReservation *selectacct.PlacementReservation
-	defer func() { placementReservation.Release() }()
 	var account accounts.Account
 	if picked == nil && options.preferredAccountID != "" {
 		preferred, ok := findAccount(availableAccounts, options.preferredAccountID)
