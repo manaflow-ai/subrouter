@@ -224,7 +224,8 @@ func TestTenantCredentialLeaseReportIsSessionLocal(t *testing.T) {
 		Provider: string(accounts.ProviderCodex), AgentType: "codex",
 		SessionID: "session-a", PreferAccountID: accountA.ID, Model: "gpt-5",
 	}
-	picked, err := pickTenantCredentialLeaseAccount(store, server, []accounts.Account{accountA, accountB}, nil, sameSession)
+	picked, reservation, err := pickTenantCredentialLeaseAccount(t.Context(), store, server, []accounts.Account{accountA, accountB}, nil, sameSession)
+	reservation.Release()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +235,8 @@ func TestTenantCredentialLeaseReportIsSessionLocal(t *testing.T) {
 
 	otherSession := sameSession
 	otherSession.SessionID = "session-b"
-	picked, err = pickTenantCredentialLeaseAccount(store, server, []accounts.Account{accountA, accountB}, nil, otherSession)
+	picked, reservation, err = pickTenantCredentialLeaseAccount(t.Context(), store, server, []accounts.Account{accountA, accountB}, nil, otherSession)
+	reservation.Release()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,11 +399,12 @@ func TestTenantCredentialLeaseClaudeQuota403AndModelLessFailOver(t *testing.T) {
 	}, claudeA, tenantCredentialLeasePoolModel(accounts.ProviderClaude, "claude-sonnet-4"), now); !avoided {
 		t.Fatal("account-scoped Claude report did not block the same account across model pools")
 	}
-	picked, err := pickTenantCredentialLeaseAccount(store, server, []accounts.Account{claudeA, claudeB}, nil, tenantCredentialLeaseRequest{
+	picked, reservation, err := pickTenantCredentialLeaseAccount(t.Context(), store, server, []accounts.Account{claudeA, claudeB}, nil, tenantCredentialLeaseRequest{
 		Provider: string(accounts.ProviderClaude), AgentType: "claude",
 		SessionID: "claude-session", PreferAccountID: claudeA.ID,
 		Model: "claude-opus-4-8",
 	})
+	reservation.Release()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,10 +425,11 @@ func TestTenantCredentialLeaseClaudeQuota403AndModelLessFailOver(t *testing.T) {
 	}, now); err != nil {
 		t.Fatalf("model-less report was not accepted: %v", err)
 	}
-	picked, err = pickTenantCredentialLeaseAccount(modelLessStore, modelLessServer, []accounts.Account{codexA, codexB}, nil, tenantCredentialLeaseRequest{
+	picked, reservation, err = pickTenantCredentialLeaseAccount(t.Context(), modelLessStore, modelLessServer, []accounts.Account{codexA, codexB}, nil, tenantCredentialLeaseRequest{
 		Provider: string(accounts.ProviderCodex), AgentType: "codex",
 		SessionID: "catalog-session", PreferAccountID: codexA.ID,
 	})
+	reservation.Release()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,10 +458,11 @@ func TestTenantCredentialLeaseFiltersBeforePreferredAndSticky(t *testing.T) {
 	}, now); err != nil {
 		t.Fatal(err)
 	}
-	picked, err := pickTenantCredentialLeaseAccount(store, server, []accounts.Account{accountA, accountB}, nil, tenantCredentialLeaseRequest{
+	picked, reservation, err := pickTenantCredentialLeaseAccount(t.Context(), store, server, []accounts.Account{accountA, accountB}, nil, tenantCredentialLeaseRequest{
 		Provider: string(accounts.ProviderCodex), AgentType: "codex",
 		SessionID: "session-a", PreferAccountID: accountA.ID, Model: "gpt-5",
 	})
+	reservation.Release()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -469,10 +474,11 @@ func TestTenantCredentialLeaseFiltersBeforePreferredAndSticky(t *testing.T) {
 	server.SchedulerRef.MarkExhaustedUntil(
 		accounts.ProviderCodex, accountA.ID, "gpt-5", now.Add(time.Minute),
 	)
-	picked, err = pickTenantCredentialLeaseAccount(otherStore, server, []accounts.Account{accountA, accountB}, nil, tenantCredentialLeaseRequest{
+	picked, reservation, err = pickTenantCredentialLeaseAccount(t.Context(), otherStore, server, []accounts.Account{accountA, accountB}, nil, tenantCredentialLeaseRequest{
 		Provider: string(accounts.ProviderCodex), AgentType: "codex",
 		SessionID: "other-session", PreferAccountID: accountA.ID, Model: "gpt-5",
 	})
+	reservation.Release()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,13 +601,14 @@ func TestTenantCredentialLeaseRetriesMeasuredZeroAfterExplicitCooldownExpires(t 
 		account.Provider, account.ID, "gpt-5", now.Add(-time.Second),
 	)
 
-	picked, err := pickTenantCredentialLeaseAccount(
+	picked, reservation, err := pickTenantCredentialLeaseAccount(t.Context(),
 		newTenantCredentialLeaseStore(), server, []accounts.Account{account}, nil,
 		tenantCredentialLeaseRequest{
 			Provider: string(account.Provider), AgentType: "codex",
 			SessionID: "session-a", PreferAccountID: account.ID, Model: "gpt-5",
 		},
 	)
+	reservation.Release()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -876,13 +883,14 @@ func TestTenantCredentialLeaseRetryDeadlineAccumulatesAcrossRefreshAndScheduler(
 	}, now); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := selectTenantCredentialLeaseAccount(
+	_, _, reservation, err := selectTenantCredentialLeaseAccount(
 		context.Background(), store, server, accounts.ProviderCodex, "",
 		tenantCredentialLeaseRequest{
 			Provider: string(accounts.ProviderCodex), AgentType: "codex",
 			SessionID: "session-a", PreferAccountID: accountA.ID, Model: "gpt-5",
 		},
 	)
+	reservation.Release()
 	var allAvoided *tenantCredentialLeaseAllAvoidedError
 	if !errors.As(err, &allAvoided) {
 		t.Fatalf("error=%v, want all-avoided", err)
@@ -907,13 +915,14 @@ func TestTenantCredentialLeaseRetryDeadlineIncludesNewRefreshFailureMark(t *test
 	server.SchedulerRef.MarkExhaustedUntil(
 		accountB.Provider, accountB.ID, "gpt-5", now.Add(20*time.Minute),
 	)
-	_, _, err := selectTenantCredentialLeaseAccount(
+	_, _, reservation, err := selectTenantCredentialLeaseAccount(
 		context.Background(), newTenantCredentialLeaseStore(), server,
 		accounts.ProviderCodex, "", tenantCredentialLeaseRequest{
 			Provider: string(accounts.ProviderCodex), AgentType: "codex",
 			SessionID: "session-a", PreferAccountID: accountA.ID, Model: "gpt-5",
 		},
 	)
+	reservation.Release()
 	var allAvoided *tenantCredentialLeaseAllAvoidedError
 	if !errors.As(err, &allAvoided) {
 		t.Fatalf("error=%v, want all-avoided", err)
@@ -1021,9 +1030,10 @@ func TestTenantCredentialLeaseAvoidanceExpiresAndCredentialRepairRecovers(t *tes
 		}
 		return account, nil
 	}
-	picked, _, err := selectTenantCredentialLeaseAccount(
+	picked, _, reservation, err := selectTenantCredentialLeaseAccount(
 		context.Background(), store, server, accounts.ProviderCodex, "", input,
 	)
+	reservation.Release()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1035,10 +1045,11 @@ func TestTenantCredentialLeaseAvoidanceExpiresAndCredentialRepairRecovers(t *tes
 	if _, avoided := store.avoidanceUntil(input, old, poolModel, expiredNow); avoided {
 		t.Fatal("expired avoidance remained active")
 	}
-	picked, err = pickTenantCredentialLeaseAccount(store, server, server.Accounts, nil, tenantCredentialLeaseRequest{
+	picked, reservation, err = pickTenantCredentialLeaseAccount(t.Context(), store, server, server.Accounts, nil, tenantCredentialLeaseRequest{
 		Provider: string(accounts.ProviderCodex), AgentType: "codex",
 		SessionID: "session-a", PreferAccountID: old.ID, Model: "gpt-5",
 	})
+	reservation.Release()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1671,7 +1682,8 @@ func TestQwenAnthropicLeaseSelectionUsesSharedTokenPlanScores(t *testing.T) {
 			if testCase.configure != nil {
 				testCase.configure(t, &copyServer, &input)
 			}
-			picked, err := pickTenantCredentialLeaseAccount(nil, &copyServer, available, nil, input)
+			picked, reservation, err := pickTenantCredentialLeaseAccount(t.Context(), nil, &copyServer, available, nil, input)
+			reservation.Release()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1782,10 +1794,11 @@ func TestTenantCredentialLeaseSessionCountsAreProviderScoped(t *testing.T) {
 	}
 	server.Sessions = sessions
 
-	picked, err := pickTenantCredentialLeaseAccount(nil, server, []accounts.Account{shared, other}, nil, tenantCredentialLeaseRequest{
+	picked, reservation, err := pickTenantCredentialLeaseAccount(t.Context(), nil, server, []accounts.Account{shared, other}, nil, tenantCredentialLeaseRequest{
 		Provider: string(accounts.ProviderCodex), AgentType: "codex",
 		SessionID: "new-codex-session", Model: "gpt-5",
 	})
+	reservation.Release()
 	if err != nil {
 		t.Fatal(err)
 	}
