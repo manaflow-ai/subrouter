@@ -5764,12 +5764,7 @@ func (s Server) proxyHandler() http.Handler {
 		selectionOptions := accountSelectionOptions{
 			oauthOnly: modelCatalogRequest, preferredAccountID: preferredAccountID,
 			pendingSessionCommit: &pendingSessionCommit, pendingSessionMoveReason: &pendingSessionMoveReason,
-		}
-		// HTTP placements hand the pending debit to the existing routed-request
-		// boundary below. WebSocket connection/turn accounting has a separate
-		// lifetime and retains its current behavior.
-		if !websocket.IsWebSocketUpgrade(r) {
-			selectionOptions.placementReservation = &placementReservation
+			placementReservation: &placementReservation,
 		}
 		var err error
 		if s.CredentialBroker != nil {
@@ -5961,7 +5956,7 @@ func (s Server) proxyHandler() http.Handler {
 					return s.azureCodexWebSocketDivert(sessionAgentType, sessionID, model)
 				}
 			}
-			s.proxyWebSocket(w, r, account, credentialLease, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream, azureDivert, autonomousRetry, pendingSessionCommit, pendingSessionExpectedAccount, pendingSessionMoveReason)
+			s.proxyWebSocket(w, r, account, credentialLease, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream, azureDivert, autonomousRetry, pendingSessionCommit, pendingSessionExpectedAccount, pendingSessionMoveReason, placementReservation)
 			return
 		}
 		proxyRequest := r.Clone(r.Context())
@@ -6561,7 +6556,7 @@ func (s Server) reportCredentialLease(
 	}()
 }
 
-func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL, azureDivert func(model string) bool, autonomousRetry bool, pendingSessionCommit bool, pendingSessionExpectedAccount string, pendingSessionMoveReason accountMoveReason) {
+func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL, azureDivert func(model string) bool, autonomousRetry bool, pendingSessionCommit bool, pendingSessionExpectedAccount string, pendingSessionMoveReason accountMoveReason, placementReservation *selectacct.PlacementReservation) {
 	if !webSocketOriginAllowed(r) {
 		http.Error(w, "websocket origin not allowed", http.StatusForbidden)
 		return
@@ -6587,6 +6582,9 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	}
 	if s.SchedulerRef != nil && s.CredentialBroker == nil {
 		releaseInflight = s.SchedulerRef.BeginInflight(schedulerAccountProvider(account.Provider), account.ID)
+		// Publish the existing connection-lifetime load before dropping the
+		// pending choice. WebSocket setup is not an extra routed model request.
+		placementReservation.Release()
 	}
 	defer func() {
 		releaseInflight()
@@ -6611,7 +6609,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	r = r.WithContext(withTranscriptRequestID(r.Context(), transcriptRequestID))
 	s.recordWebSocketMeta(r, transcriptRequestID, upstreamURL, headers, agentType, sessionID, userEmail, account, upstream)
 
-	upstreamConn, response, err := outboundWebSocketDialer().Dial(upstreamURL.String(), headers)
+	upstreamConn, response, err := dialWebSocketWithContext(r.Context(), upstreamURL.String(), headers)
 	if err != nil {
 		status := 502
 		if response != nil {
@@ -6668,6 +6666,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	if err != nil {
 		return
 	}
+
 	markWebSocketUpgraded(r.Context())
 	defer clientConn.Close()
 	if pendingSessionCommit {
@@ -6690,7 +6689,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	}
 	if modelState.autonomousRetrying {
 		link.redial = func(ctx context.Context) (*websocket.Conn, error) {
-			conn, response, err := outboundWebSocketDialer().DialContext(ctx, upstreamURL.String(), headers)
+			conn, response, err := dialWebSocketWithContext(ctx, upstreamURL.String(), headers)
 			if response != nil && response.Body != nil {
 				_ = response.Body.Close()
 			}
@@ -11174,7 +11173,6 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			rewritten, changed, rewriteErr := rewriteAntigravityProject(rawBody, project)
 			if rewriteErr != nil {
-				nextReservation.Release()
 				return nil, rewriteErr
 			}
 			if changed {
@@ -11866,6 +11864,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			rewritten, changed, rewriteErr := rewriteAntigravityProject(rawBody, project)
 			if rewriteErr != nil {
+				nextReservation.Release()
 				return response, nil
 			}
 			if changed {
@@ -12579,10 +12578,14 @@ func (s Server) rerouteModelIncompatibilityInternal(ctx context.Context, provide
 }
 
 func (s Server) rerouteModelIncompatibilityForReconnect(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, model string) error {
-	next, err := s.rerouteModelIncompatibility(ctx, provider, agentType, sessionID, userEmail, accountID, model, nil)
+	next, reservation, err := s.rerouteModelIncompatibilityWithReservation(ctx, provider, agentType, sessionID, userEmail, accountID, model, nil)
+	defer reservation.Release()
 	if err != nil {
 		return err
 	}
+	// This only publishes the next connection's affinity. Keep concurrent
+	// reconnect choices visible until publication, then release the pending
+	// load without inventing an upstream dispatch.
 	_, err = s.commitSessionReassignment(agentType, sessionID, accountID, next.ID, userEmail)
 	return err
 }

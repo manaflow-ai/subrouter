@@ -140,7 +140,7 @@ func TestReconnectModelIncompatibilityDoesNotDebitDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
-		requireOverloadDebits(t, &server, 0)
+		requireOverloadDebits(t, &server, 1)
 		return account, nil
 	}
 	if err := server.rerouteModelIncompatibilityForReconnect(t.Context(), accounts.ProviderCodex, "codex", "reconnect", "", initial, "test-model"); err != nil {

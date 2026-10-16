@@ -182,6 +182,9 @@ func TestWebSocketTracksInflightUntilConnectionCloses(t *testing.T) {
 		t.Fatalf("websocket inflight = %d, want 1", got)
 	}
 
+	if got := ref.LiveDebits(); len(got) != 0 {
+		t.Fatalf("established WebSocket retained a placement or routed-request debit: %v", got)
+	}
 	close(upstreamRelease)
 	_ = conn.Close()
 	deadline := time.Now().Add(time.Second)
@@ -190,6 +193,9 @@ func TestWebSocketTracksInflightUntilConnectionCloses(t *testing.T) {
 	}
 	if got := ref.InflightCounts(); got != nil {
 		t.Fatalf("websocket inflight after close = %v, want nil", got)
+	}
+	if got := ref.LiveDebits(); len(got) != 0 {
+		t.Fatalf("closed WebSocket invented a routed-request debit: %v", got)
 	}
 }
 
