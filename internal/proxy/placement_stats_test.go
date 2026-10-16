@@ -136,6 +136,8 @@ func TestPlacementStatsEndpointsServeAdmins(t *testing.T) {
 		`subrouter_routed_requests_total{provider="codex",account="roomy@example.com"} 1`,
 		`subrouter_sticky_assignments{provider="codex",account="roomy@example.com"} 1`,
 		`subrouter_failovers_total{provider="codex",account="idle@example.com",reason="usage_limit"} 1`,
+		`subrouter_failovers_1h{provider="codex",account="idle@example.com"} 1`,
+		`subrouter_failover_peak_1m{provider="codex",account="idle@example.com"} 1`,
 		`subrouter_pool_busiest_share_1h{provider="codex",pool=""} 1`,
 	} {
 		if !strings.Contains(resp.Body.String(), want) {

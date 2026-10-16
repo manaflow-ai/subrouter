@@ -104,7 +104,7 @@ Usage:
   sr trace <email>      Show OAuth refresh breadcrumbs for an account
   sr errors [--provider claude|codex] [--since 1h] [--account ID] [--json]
                         Show recent upstream errors and every account's quota at the newest one
-  sr codex isolation-check [--json] [--retiring-state-dir PATH]
+  sr codex isolation-check [--json] [--retiring-state-dir PATH] [--allow-shared-active ACCOUNT]...
                         Check serving credential isolation without changing credentials
   sr codex migrate-isolation [--device-auth]
                         Re-enroll legacy OAuth accounts without changing local Codex auth
