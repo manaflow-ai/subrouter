@@ -12505,7 +12505,7 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 	return account, err
 }
 
-// oauthRetryCandidateWithReservation is the Claude failover variant used by
+// oauthRetryCandidateWithReservation is the OAuth failover variant used by
 // the replay transport. It atomically reserves the replacement account before
 // refreshing its credential, so concurrent quota failures cannot all select
 // the same stale best account. The caller must commit the reservation once the
@@ -12514,7 +12514,7 @@ func (s Server) oauthRetryCandidateWithReservation(ctx context.Context, provider
 	return s.oauthRetryCandidateInternal(ctx, provider, agentType, sessionID, userEmail, poolModel, tried, oauthOnly, allowTriedClaudeExtraUsage, true)
 }
 
-func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly, allowTriedClaudeExtraUsage, reserveClaude bool) (accounts.Account, *selectacct.PlacementReservation, error) {
+func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly, allowTriedClaudeExtraUsage, reserveOAuth bool) (accounts.Account, *selectacct.PlacementReservation, error) {
 	allCandidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
 	if len(allCandidates) == 0 {
 		return accounts.Account{}, nil, fmt.Errorf("no %s accounts available", provider)
@@ -12608,7 +12608,7 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 				return accounts.Account{}, nil, fmt.Errorf("no untried %s accounts available", provider)
 			}
 			var err error
-			if reserveClaude && provider == accounts.ProviderClaude && s.SchedulerRef != nil && allOAuthCandidates(candidates) {
+			if reserveOAuth && s.SchedulerRef != nil && allOAuthCandidates(candidates) {
 				var normalized accounts.Account
 				normalizedCandidates := SchedulerAccounts(candidates)
 				normalized, reservation, pickErr := s.SchedulerRef.PickAndReserveContext(ctx, scheduler, normalizedCandidates)
