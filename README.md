@@ -584,6 +584,24 @@ hook for both automatic and manual compaction. If you pass an explicit
 `--settings` file, merge that hook because Claude Code gives explicit settings
 precedence.
 
+The injected `/model` picker exposes GPT-6.1-Sol, GPT-6-Astra, GPT-6-Astra
+Ultrafast, GPT-6-Sol, GPT-6-Luna, GPT-5.6-Sol, GPT-5.6-Terra, GPT-5.6-Luna,
+and GPT-5.5. `/effort` supports low, medium, high, xhigh, and max; the chosen
+value is sent as Codex reasoning effort. To pin a Codex account or session,
+use the same routing variables as `sr codex`:
+
+```bash
+SUBROUTER_CODEX_ACCOUNT_ID=lawrence@manaflow.ai sr claude-codex
+SUBROUTER_SESSION_KEY=my-conversation sr claude-codex
+```
+
+The Ultrafast picker row sends `service_tier=ultrafast` to Codex. The direct
+Codex launcher accepts the equivalent explicit form:
+
+```bash
+SUBROUTER_CODEX_ACCOUNT_ID=lawrence@manaflow.ai sr codex --yolo -c service_tier=ultrafast
+```
+
 Replay-safe POSTs get ten bounded attempts with exponential backoff, and Codex
 WebSocket handshakes get eight transient attempts. Once output has started
 streaming, Subrouter does not replay the turn, so tool calls cannot be
