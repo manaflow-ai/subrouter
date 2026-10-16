@@ -43,6 +43,40 @@ type accountCounters struct {
 	evictions     uint64
 	capacityMarks uint64
 	failovers     map[FailoverReason]uint64
+	// failoverBurst is a bounded rolling window used to spot a switch
+	// stampede without retaining session IDs or unbounded event history.
+	failoverBurst burstRing
+}
+
+// burstRing keeps one-minute event counts for the same one-hour window used
+// by pool placement herding. It is deliberately per-account: the account
+// label already exists in placement stats, while adding session or device
+// labels here would make the operational endpoint grow with traffic.
+type burstRing struct {
+	minutes [herdBuckets]int64
+	counts  [herdBuckets]uint64
+}
+
+func (b *burstRing) add(minute int64) {
+	slot := int(minute % int64(herdBuckets))
+	if b.minutes[slot] != minute {
+		b.minutes[slot] = minute
+		b.counts[slot] = 0
+	}
+	b.counts[slot]++
+}
+
+func (b *burstRing) window(minute int64) (total, peak uint64) {
+	for slot, count := range b.counts {
+		if count == 0 || minute-b.minutes[slot] >= int64(herdBuckets) || b.minutes[slot] > minute {
+			continue
+		}
+		total += count
+		if count > peak {
+			peak = count
+		}
+	}
+	return total, peak
 }
 
 type poolKey struct {
@@ -168,6 +202,7 @@ func (r *SchedulerRef) NoteFailover(provider account.Provider, accountID string,
 			c.failovers = make(map[FailoverReason]uint64, 2)
 		}
 		c.failovers[reason]++
+		c.failoverBurst.add(r.placement.clock().Unix() / 60)
 	})
 }
 
@@ -188,13 +223,19 @@ func normalizedStatsProvider(provider account.Provider) account.Provider {
 
 // AccountPlacementStats is one account's counters since process start.
 type AccountPlacementStats struct {
-	Provider      account.Provider          `json:"provider"`
-	AccountID     string                    `json:"account_id"`
-	Placements    uint64                    `json:"placements"`
-	Routed        uint64                    `json:"routed_requests"`
-	Evictions     uint64                    `json:"sticky_evictions"`
-	Failovers     map[FailoverReason]uint64 `json:"failovers,omitempty"`
-	CapacityMarks uint64                    `json:"capacity_marks"`
+	Provider   account.Provider          `json:"provider"`
+	AccountID  string                    `json:"account_id"`
+	Placements uint64                    `json:"placements"`
+	Routed     uint64                    `json:"routed_requests"`
+	Evictions  uint64                    `json:"sticky_evictions"`
+	Failovers  map[FailoverReason]uint64 `json:"failovers,omitempty"`
+	// FailoversLastHour and FailoverPeakPerMinute are bounded rolling signals
+	// for detecting a reroute burst. Lifetime Failovers remains available for
+	// trend totals; these fields make a current stampede visible without
+	// retaining individual session or device identities.
+	FailoversLastHour  uint64 `json:"failovers_last_hour,omitempty"`
+	FailoverPeakMinute uint64 `json:"failover_peak_per_minute,omitempty"`
+	CapacityMarks      uint64 `json:"capacity_marks"`
 	// StickyAssignments is how many retained sticky session assignments point
 	// at the account (sessions.json). They are durable resume/cache-affinity
 	// state with no inactivity TTL, not a count of live sessions.
@@ -252,6 +293,7 @@ func (r *SchedulerRef) PlacementStats(sessionCounts map[string]int, known []acco
 			Evictions:     counters.evictions,
 			CapacityMarks: counters.capacityMarks,
 		}
+		entry.FailoversLastHour, entry.FailoverPeakMinute = counters.failoverBurst.window(p.clock().Unix() / 60)
 		if len(counters.failovers) > 0 {
 			entry.Failovers = make(map[FailoverReason]uint64, len(counters.failovers))
 			for reason, count := range counters.failovers {

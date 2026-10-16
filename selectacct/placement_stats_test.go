@@ -94,6 +94,35 @@ func TestNoteRoutedFeedsLiveDebitAndStats(t *testing.T) {
 	}
 }
 
+func TestFailoverBurstWindowIsBoundedAndAgesOut(t *testing.T) {
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.placement.now = func() time.Time { return now }
+	for i := 0; i < 5; i++ {
+		ref.NoteFailover(account.ProviderClaude, "cooked@example.com", FailoverUsageLimit)
+	}
+	now = now.Add(2 * time.Minute)
+	for i := 0; i < 3; i++ {
+		ref.NoteFailover(account.ProviderClaude, "cooked@example.com", FailoverUsageLimit)
+	}
+	stats := ref.PlacementStats(nil, nil).Accounts[0]
+	if stats.FailoversLastHour != 8 || stats.FailoverPeakMinute != 5 {
+		t.Fatalf("burst stats = %+v, want 8 in window and peak 5", stats)
+	}
+
+	// The ring has fixed one-minute buckets. Once the one-hour window has
+	// passed, old failures disappear while the lifetime reason counter remains.
+	now = now.Add(HerdWindow + time.Minute)
+	ref.NoteFailover(account.ProviderClaude, "cooked@example.com", FailoverUsageLimit)
+	stats = ref.PlacementStats(nil, nil).Accounts[0]
+	if stats.FailoversLastHour != 1 || stats.FailoverPeakMinute != 1 {
+		t.Fatalf("aged burst stats = %+v, want only the new event", stats)
+	}
+	if stats.Failovers[FailoverUsageLimit] != 9 {
+		t.Fatalf("lifetime failovers = %v, want 9", stats.Failovers)
+	}
+}
+
 func TestCapacityMarkCounted(t *testing.T) {
 	ref := NewSchedulerRef(NewScheduler(nil))
 	until := time.Now().Add(time.Minute)
