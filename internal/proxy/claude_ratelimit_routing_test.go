@@ -293,7 +293,7 @@ func TestClaudeForcedAccount429DoesNotFailOver(t *testing.T) {
 	}
 }
 
-func TestReplayablePostRetryBudgetIsAggregateWithoutFallback(t *testing.T) {
+func TestReplayablePostTransient429StopsBeforeWalkingPool(t *testing.T) {
 	const accountCount = replayablePostMaxAttempts * 2
 	upstreamHits := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -342,11 +342,11 @@ func TestReplayablePostRetryBudgetIsAggregateWithoutFallback(t *testing.T) {
 
 	handler.ServeHTTP(response, req)
 
-	if response.Code != http.StatusRequestTimeout {
-		t.Fatalf("status = %d, want final upstream 408; body=%s", response.Code, response.Body.String())
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want transient 429; body=%s", response.Code, response.Body.String())
 	}
-	if upstreamHits != replayablePostMaxAttempts {
-		t.Fatalf("upstream hits = %d, want aggregate cap %d across account failover and POST replay", upstreamHits, replayablePostMaxAttempts)
+	if want := claudeTransient429MaxRetries + 2; upstreamHits != want {
+		t.Fatalf("upstream hits = %d, want %d (initial attempt, short retries, one alternate)", upstreamHits, want)
 	}
 }
 
