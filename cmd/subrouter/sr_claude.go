@@ -2604,6 +2604,11 @@ func claudeCodexHookArgsWithEnv(args []string, serverURL, proxyToken, customHead
 	}
 	hookCommand := shellQuote(executable) + " claude-codex-hook " + shellQuote(strings.TrimRight(serverURL, "/")+"/claude-codex/hooks/pre-compact")
 	settings, err := json.Marshal(map[string]any{
+		"disableAutoMode": "disable",
+		"permissions": map[string]any{
+			"disableAutoMode": "disable",
+			"defaultMode":     "default",
+		},
 		"env": map[string]string{
 			"ANTHROPIC_BASE_URL":       strings.TrimRight(serverURL, "/"),
 			"ANTHROPIC_AUTH_TOKEN":     proxyToken,

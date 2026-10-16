@@ -2514,6 +2514,13 @@ func TestClaudeCodexHookArgsInstallPreCompactHook(t *testing.T) {
 	if !ok || len(options) != 10 {
 		t.Fatalf("model picker options = %#v, want 10", picker["options"])
 	}
+	if settings["disableAutoMode"] != "disable" {
+		t.Fatalf("top-level auto mode gate = %#v", settings["disableAutoMode"])
+	}
+	permissions, ok := settings["permissions"].(map[string]any)
+	if !ok || permissions["disableAutoMode"] != "disable" || permissions["defaultMode"] != "default" {
+		t.Fatalf("permission auto mode gate = %#v", settings["permissions"])
+	}
 	if got := claudeCodexHookArgs([]string{"--settings", "{}", "--resume", "session"}, "http://router.test"); len(got) != 4 || got[1] != "{}" {
 		t.Fatalf("explicit settings should win, got %#v", got)
 	}
