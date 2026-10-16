@@ -267,6 +267,34 @@ func TestClaudeTransientPauseAlsoBlocksPaidExtraUsageCandidate(t *testing.T) {
 	}
 }
 
+func TestClaudeExtraUsagePauseKeepsOtherFundedAccountsAvailable(t *testing.T) {
+	s := transientThrottleServer(3)
+	for _, healthyPaused := range []bool{false, true} {
+		t.Run(fmt.Sprint("healthy paused=", healthyPaused), func(t *testing.T) {
+			paused := selectacct.Score{AccountID: "account-1", Provider: accounts.ProviderClaude,
+				ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 20}
+			if healthyPaused {
+				paused.Headroom, paused.ShortHeadroom = 1, 1
+			}
+			s.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+				{AccountID: "account-0", Provider: accounts.ProviderClaude}, paused,
+				{AccountID: "account-2", Provider: accounts.ProviderClaude,
+					ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
+			}))
+			s.admission = testAdmissionControl(1, 2)
+			s.admission.observe(admissionKeyFor(accounts.ProviderClaude, "account-1", "claude-opus"), http.StatusTooManyRequests, http.Header{}, time.Now())
+			got, ok := s.pickClaudeExtraUsageFallbackForRequest(s.SchedulerRef.Get().ForModel("claude-opus"), s.Accounts, "claude-opus")
+			if healthyPaused {
+				if ok {
+					t.Fatal("a healthy subscription's transient pause unlocked paid usage")
+				}
+			} else if !ok || got.ID != "account-2" {
+				t.Fatalf("fallback=(%s,%v), want other unpaused funded account", got.ID, ok)
+			}
+		})
+	}
+}
+
 func TestClaudeTransient429StillUsesConfiguredFallback(t *testing.T) {
 	s := transientThrottleServer(6)
 	calls, fallbacks := 0, 0

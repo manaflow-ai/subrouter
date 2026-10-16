@@ -9230,7 +9230,7 @@ func (s Server) pickClaudeExtraUsageFallbackForRequest(
 	candidates []accounts.Account,
 	poolModel string,
 ) (accounts.Account, bool) {
-	if s.SchedulerRef == nil {
+	if s.SchedulerRef == nil && s.admission == nil {
 		return pickClaudeExtraUsageFallback(scheduler, candidates)
 	}
 	now := time.Now()
@@ -9238,6 +9238,15 @@ func (s Server) pickClaudeExtraUsageFallbackForRequest(
 	for _, candidate := range candidates {
 		provider := schedulerAccountProvider(candidate.Provider)
 		if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(provider, candidate.ID, poolModel, now); blocked {
+			continue
+		}
+		if s.admission.paused(admissionKeyFor(provider, candidate.ID, poolModel), now) {
+			// A transient pause is not proof that plan quota is cooked. Keep
+			// a paused healthy subscription from unlocking paid extra usage,
+			// while allowing another funded account when quotas really are out.
+			if !scheduler.Exhausted(provider, candidate.ID) {
+				return accounts.Account{}, false
+			}
 			continue
 		}
 		eligible = append(eligible, candidate)
@@ -12532,8 +12541,7 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 		// Cost order: paid extra usage (tier 3) is reached only when no
 		// untried API key (tier 2, free credits) can still take the request.
 		if provider == accounts.ProviderClaude && !s.claudeAPIKeyCandidateAvailable(scheduler, candidates, poolModel) {
-			if fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, allCandidates, poolModel); ok &&
-				!s.admission.paused(admissionKeyFor(schedulerAccountProvider(fallback.Provider), fallback.ID, poolModel), time.Now()) {
+			if fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, allCandidates, poolModel); ok {
 				_, alreadyTried := tried[fallback.ID]
 				if !alreadyTried || allowTriedClaudeExtraUsage {
 					account = fallback
