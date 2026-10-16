@@ -88,8 +88,8 @@ func TestRegistryDoesNotCaptureCodexOrClaudeRouting(t *testing.T) {
 	}
 }
 
-// The auth headers for Codex and Claude must be exactly what they were before
-// the registry existed, including the Claude API-key and OAuth split.
+// The auth headers for Codex and Claude stay provider-specific, including the
+// Claude API-key/OAuth split and the required Messages API version default.
 func TestRegistryDoesNotChangeCodexOrClaudeAuthHeaders(t *testing.T) {
 	claudeOAuth := http.Header{}
 	claudeOAuth.Set("X-Api-Key", "client-supplied")
@@ -99,6 +99,9 @@ func TestRegistryDoesNotChangeCodexOrClaudeAuthHeaders(t *testing.T) {
 	}
 	if claudeOAuth.Get("X-Api-Key") != "" {
 		t.Fatal("claude oauth must strip a client X-Api-Key")
+	}
+	if claudeOAuth.Get("Anthropic-Version") != claudeAnthropicVersion {
+		t.Fatalf("claude oauth Anthropic-Version = %q, want %q", claudeOAuth.Get("Anthropic-Version"), claudeAnthropicVersion)
 	}
 	if claudeOAuth.Get("Anthropic-Beta") != claudeOAuthBetaHeader {
 		t.Fatalf("claude oauth Anthropic-Beta = %q, want %q", claudeOAuth.Get("Anthropic-Beta"), claudeOAuthBetaHeader)
@@ -113,8 +116,18 @@ func TestRegistryDoesNotChangeCodexOrClaudeAuthHeaders(t *testing.T) {
 	if claudeKey.Get("X-Api-Key") != "sk-ant" {
 		t.Fatalf("claude api-key X-Api-Key = %q", claudeKey.Get("X-Api-Key"))
 	}
+	if claudeKey.Get("Anthropic-Version") != claudeAnthropicVersion {
+		t.Fatalf("claude api-key Anthropic-Version = %q, want %q", claudeKey.Get("Anthropic-Version"), claudeAnthropicVersion)
+	}
 	if claudeKey.Get("Anthropic-Beta") == claudeOAuthBetaHeader {
 		t.Fatal("claude api-key auth must drop the OAuth beta header")
+	}
+
+	claudeExplicitVersion := http.Header{}
+	claudeExplicitVersion.Set("Anthropic-Version", "2024-10-22")
+	setAccountAuthHeaders(claudeExplicitVersion, accounts.Account{Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "oauth-token"}, "")
+	if claudeExplicitVersion.Get("Anthropic-Version") != "2024-10-22" {
+		t.Fatalf("explicit Claude Anthropic-Version = %q, want it preserved", claudeExplicitVersion.Get("Anthropic-Version"))
 	}
 
 	codex := http.Header{}

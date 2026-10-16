@@ -8687,7 +8687,13 @@ func (w proxyErrorWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-const claudeOAuthBetaHeader = "oauth-2025-04-20"
+const (
+	claudeOAuthBetaHeader = "oauth-2025-04-20"
+	// Anthropic-Version is required by the Messages API. Claude Code sends it
+	// today, but keeping the default at the auth boundary makes the proxy
+	// compatible with native Anthropic clients and health probes that omit it.
+	claudeAnthropicVersion = "2023-06-01"
+)
 
 func setAccountAuthHeaders(headers http.Header, account accounts.Account, model string) {
 	headers.Set("Authorization", account.AuthorizationHeader())
@@ -8698,6 +8704,9 @@ func setAccountAuthHeaders(headers http.Header, account accounts.Account, model 
 	}
 	switch account.Provider {
 	case accounts.ProviderClaude:
+		if headers.Get("Anthropic-Version") == "" {
+			headers.Set("Anthropic-Version", claudeAnthropicVersion)
+		}
 		if account.AuthMode == accounts.AuthModeAPIKey {
 			headers.Del("Authorization")
 			headers.Set("X-Api-Key", account.Token)
@@ -12894,7 +12903,12 @@ func (b *uploadLimiterBody) Close() error {
 }
 
 func retryablePostUpstreamStatus(response *http.Response) bool {
-	return response != nil && response.StatusCode == http.StatusRequestTimeout
+	// Keep this transport-level policy aligned with the native Claude client:
+	// 408 and 409 are request-safe transient responses. Claude 429 and 5xx
+	// responses are handled by the provider-specific layers above, where their
+	// account and Retry-After semantics are auditable; replaying them here would
+	// otherwise restart those policies and amplify traffic.
+	return response != nil && (response.StatusCode == http.StatusRequestTimeout || response.StatusCode == http.StatusConflict)
 }
 
 func retryablePostTransportError(err error) bool {
