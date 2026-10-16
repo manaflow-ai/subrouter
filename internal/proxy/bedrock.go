@@ -380,7 +380,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 			s.Logger.Warn("claude-fable bedrock stream failed before content", attrs...)
 		}
 		_ = resp.Body.Close()
-		if strings.Contains(strings.ToLower(peek.errorFrame.exceptionType), "throttl") {
+		if bedrockPeekThrottled(peek) {
 			cfg.markThrottled(region, sourceName)
 		}
 		s.recordClaudeFableBedrockCost(started, region, http.StatusServiceUnavailable, bedrockUsage{}, false)
@@ -722,6 +722,9 @@ func (cfg *BedrockConfig) markThrottled(region, sourceName string) {
 // throttle cool-down behind the pairs that are not. No pair is removed, so a
 // request still tries every pair once, and a 429 reaches the client only
 // after every pair throttled.
+// A stall retry can therefore go back to the pair that stalled when the
+// pair after it is cooling; a pair that throttled a moment ago is the worse
+// choice of the two.
 func (cfg *BedrockConfig) uncooledFirst(attempts []bedrockAttempt) []bedrockAttempt {
 	if len(attempts) <= 1 {
 		return attempts
@@ -1159,6 +1162,22 @@ func peekBedrockStreamUntilCommit(src io.Reader) bedrockStreamPeek {
 // bedrockPeekFailureRetryable reports whether a fresh attempt may succeed:
 // transport errors, throttles, and capacity errors qualify; validation and
 // auth errors fail identically everywhere and do not.
+// bedrockPeekThrottled reports a throttle in the first stream frame, as a
+// Bedrock throttlingException or as an Anthropic rate_limit_error event.
+func bedrockPeekThrottled(peek bedrockStreamPeek) bool {
+	frame := peek.errorFrame
+	if strings.Contains(strings.ToLower(frame.exceptionType), "throttl") {
+		return true
+	}
+	var ev struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	return json.Unmarshal(frame.payload, &ev) == nil && ev.Type == "error" && ev.Error.Type == "rate_limit_error"
+}
+
 func bedrockPeekFailureRetryable(peek bedrockStreamPeek) bool {
 	if peek.outcome == bedrockPeekReadErr {
 		return true
