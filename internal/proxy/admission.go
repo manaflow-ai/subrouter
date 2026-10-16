@@ -48,6 +48,12 @@ const admissionPauseWaitMax = 5 * time.Second
 // throttle, not a reason to apply the ten-minute quota fallback.
 const claudeTransientThrottleFallback = time.Second
 
+// Reopen a transiently throttled bucket gradually, rather than sending the
+// entire queued burst as soon as its cooldown expires: 1, 2, 4, then the
+// normal limit, one second apart. Time, rather than a successful response,
+// bounds recovery so a cancelled request or a long stream cannot wedge it.
+const admissionRecoveryStep = time.Second
+
 // admissionRejected reports a limiter rejection that another account could
 // serve: the queue is full or the account is paused.
 func admissionRejected(err error) bool {
@@ -161,10 +167,13 @@ type admissionBucket struct {
 	active    int
 	waiters   []*admissionWaiter
 	pausedTil time.Time
-	served    uint64
-	queued    uint64
-	blocked   uint64
-	throttled uint64
+	// recoverSlowly applies only to non-quota Claude 429s. The ramp starts
+	// at pausedTil, so another throttle restarts it without shortening a pause.
+	recoverSlowly bool
+	served        uint64
+	queued        uint64
+	blocked       uint64
+	throttled     uint64
 }
 
 // admissionControl is the controller-wide physical-attempt gate. It is
@@ -188,16 +197,40 @@ type admissionLease struct {
 }
 
 type admissionKeySnapshot struct {
-	Provider    accounts.Provider `json:"provider"`
-	AccountHash string            `json:"account_hash"`
-	Model       string            `json:"model"`
-	Limit       int               `json:"limit"`
-	Active      int               `json:"active"`
-	Queued      int               `json:"queued"`
-	Served      uint64            `json:"served"`
-	Blocked     uint64            `json:"blocked"`
-	Throttled   uint64            `json:"throttled"`
-	PausedUntil string            `json:"paused_until,omitempty"`
+	Provider       accounts.Provider `json:"provider"`
+	AccountHash    string            `json:"account_hash"`
+	Model          string            `json:"model"`
+	Limit          int               `json:"limit"`
+	EffectiveLimit int               `json:"effective_limit"`
+	Active         int               `json:"active"`
+	Queued         int               `json:"queued"`
+	Served         uint64            `json:"served"`
+	Blocked        uint64            `json:"blocked"`
+	Throttled      uint64            `json:"throttled"`
+	PausedUntil    string            `json:"paused_until,omitempty"`
+}
+
+// admissionLimitLocked returns the concurrency allowed now and the next time
+// that limit increases. Every admission path uses this under a.mu, including
+// spill reservations; waiters also wake on each boundary without an upstream
+// response having to complete first.
+func (a *admissionControl) admissionLimitLocked(bucket *admissionBucket, now time.Time) (int, time.Time) {
+	if bucket.pausedTil.After(now) {
+		return 0, bucket.pausedTil
+	}
+	if !bucket.recoverSlowly {
+		return a.limit, time.Time{}
+	}
+	limit := min(1, a.limit)
+	elapsed := now.Sub(bucket.pausedTil)
+	for elapsed >= admissionRecoveryStep && limit < a.limit {
+		limit = min(a.limit, limit*2)
+		elapsed -= admissionRecoveryStep
+	}
+	if limit >= a.limit {
+		return a.limit, time.Time{}
+	}
+	return limit, now.Add(admissionRecoveryStep - elapsed)
 }
 
 // admissionSessionSnapshot is one session's fan-out: how many physical
@@ -358,7 +391,8 @@ func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who
 		now := time.Now()
 		a.mu.Lock()
 		bucket := a.bucketLocked(key)
-		if waiter == nil && len(bucket.waiters) == 0 && bucket.active < a.limit && !bucket.pausedTil.After(now) {
+		limit, nextWake := a.admissionLimitLocked(bucket, now)
+		if waiter == nil && len(bucket.waiters) == 0 && bucket.active < limit {
 			bucket.active++
 			bucket.served++
 			a.grantSessionLocked(who, key.account, false, now)
@@ -366,12 +400,13 @@ func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who
 			return &admissionLease{control: a, key: key, who: who}, nil
 		}
 		if waiter != nil && len(bucket.waiters) > 0 && bucket.waiters[0] == waiter &&
-			bucket.active < a.limit && !bucket.pausedTil.After(now) {
+			bucket.active < limit {
 			copy(bucket.waiters, bucket.waiters[1:])
 			bucket.waiters = bucket.waiters[:len(bucket.waiters)-1]
 			bucket.active++
 			bucket.served++
 			a.grantSessionLocked(who, key.account, true, now)
+			a.wakeLocked(key, bucket, now)
 			a.mu.Unlock()
 			return &admissionLease{control: a, key: key, who: who}, nil
 		}
@@ -400,13 +435,12 @@ func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who
 				}
 			}
 		}
-		pausedUntil := bucket.pausedTil
 		a.mu.Unlock()
 
 		var timer <-chan time.Time
 		var stop func()
-		if pausedUntil.After(now) {
-			t := time.NewTimer(time.Until(pausedUntil))
+		if !nextWake.IsZero() {
+			t := time.NewTimer(time.Until(nextWake))
 			timer = t.C
 			stop = func() { t.Stop() }
 		}
@@ -435,8 +469,7 @@ func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who
 			}
 			return nil, ctx.Err()
 		case <-timer:
-			// The waiter remains in FIFO order. Re-check the pause before the
-			// release path wakes it so a long Retry-After never drains a burst.
+			// Re-check both the pause and recovery ramp in FIFO order.
 		}
 	}
 }
@@ -482,7 +515,8 @@ func (a *admissionControl) tryAcquire(key admissionKey, who admissionSessionKey)
 	defer a.mu.Unlock()
 	now := time.Now()
 	bucket := a.bucketLocked(key)
-	if len(bucket.waiters) > 0 || bucket.active >= a.limit || bucket.pausedTil.After(now) {
+	limit, _ := a.admissionLimitLocked(bucket, now)
+	if len(bucket.waiters) > 0 || bucket.active >= limit {
 		return nil, false
 	}
 	bucket.active++
@@ -503,7 +537,8 @@ func (a *admissionControl) freeLoad(key admissionKey) (free bool, load int) {
 	if bucket == nil {
 		return true, 0
 	}
-	free = len(bucket.waiters) == 0 && bucket.active < a.limit && !bucket.pausedTil.After(time.Now())
+	limit, _ := a.admissionLimitLocked(bucket, time.Now())
+	free = len(bucket.waiters) == 0 && bucket.active < limit
 	return free, bucket.active + len(bucket.waiters)
 }
 
@@ -521,6 +556,7 @@ func (a *admissionControl) cancelWaiter(key admissionKey, waiter *admissionWaite
 			if entry := a.sessions[waiter.who]; entry != nil && entry.queued > 0 {
 				entry.queued--
 			}
+			a.wakeLocked(key, bucket, time.Now())
 			return true
 		}
 	}
@@ -545,19 +581,23 @@ func (a *admissionControl) release(key admissionKey, who admissionSessionKey) {
 }
 
 func (a *admissionControl) wakeLocked(key admissionKey, bucket *admissionBucket, now time.Time) {
-	if bucket.pausedTil.After(now) || bucket.active >= a.limit || len(bucket.waiters) == 0 {
-		return
+	limit, _ := a.admissionLimitLocked(bucket, now)
+	for bucket.active < limit && len(bucket.waiters) > 0 {
+		waiter := bucket.waiters[0]
+		copy(bucket.waiters, bucket.waiters[1:])
+		bucket.waiters = bucket.waiters[:len(bucket.waiters)-1]
+		bucket.active++
+		bucket.served++
+		a.grantSessionLocked(waiter.who, key.account, true, now)
+		close(waiter.ready)
 	}
-	waiter := bucket.waiters[0]
-	copy(bucket.waiters, bucket.waiters[1:])
-	bucket.waiters = bucket.waiters[:len(bucket.waiters)-1]
-	bucket.active++
-	bucket.served++
-	a.grantSessionLocked(waiter.who, key.account, true, now)
-	close(waiter.ready)
 }
 
 func (a *admissionControl) pause(key admissionKey, until time.Time) {
+	a.pauseWithRecovery(key, until, false)
+}
+
+func (a *admissionControl) pauseWithRecovery(key admissionKey, until time.Time, recoverSlowly bool) {
 	if a == nil || until.IsZero() {
 		return
 	}
@@ -566,6 +606,12 @@ func (a *admissionControl) pause(key admissionKey, until time.Time) {
 	bucket.throttled++
 	if until.After(bucket.pausedTil) {
 		bucket.pausedTil = until
+		bucket.recoverSlowly = recoverSlowly
+	} else if !recoverSlowly {
+		// A shorter transient hint cannot change an authoritative quota
+		// pause into transient recovery. A quota response still wins when
+		// its deadline is shorter than an existing transient pause.
+		bucket.recoverSlowly = false
 	}
 	// Requests already queued would otherwise sit out the whole pause. Turn
 	// them away like new attempts so their callers can fail over.
@@ -591,10 +637,12 @@ func (a *admissionControl) observe(key admissionKey, status int, header http.Hea
 		return
 	}
 	until := retryAfterExpiry(header, now)
+	recoverSlowly := false
 	if key.provider == accounts.ProviderClaude {
 		if claudeResponseRejectedForPool(header, key.model) {
 			until = claudeExhaustionExpiryForPool(header, now, key.model)
 		} else {
+			recoverSlowly = true
 			// A bare/allowed 429 is a short request throttle, not quota
 			// exhaustion. Honor Retry-After when present, without inheriting
 			// an unrelated healthy quota window's reset or the quota default.
@@ -606,7 +654,7 @@ func (a *admissionControl) observe(key admissionKey, status int, header http.Hea
 	if until.IsZero() {
 		until = now.Add(time.Second)
 	}
-	a.pause(key, until)
+	a.pauseWithRecovery(key, until, recoverSlowly)
 }
 
 // paused reports whether an account/model is in an admission cooldown. It is
@@ -636,24 +684,26 @@ func (a *admissionControl) snapshot() admissionSnapshot {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	out := admissionSnapshot{Limit: a.limit}
+	now := time.Now()
 	for key, bucket := range a.buckets {
+		limit, _ := a.admissionLimitLocked(bucket, now)
 		entry := admissionKeySnapshot{
-			Provider:    key.provider,
-			AccountHash: admissionAccountHash(key.account),
-			Model:       key.model,
-			Limit:       a.limit,
-			Active:      bucket.active,
-			Queued:      len(bucket.waiters),
-			Served:      bucket.served,
-			Blocked:     bucket.blocked,
-			Throttled:   bucket.throttled,
+			Provider:       key.provider,
+			AccountHash:    admissionAccountHash(key.account),
+			Model:          key.model,
+			Limit:          a.limit,
+			EffectiveLimit: limit,
+			Active:         bucket.active,
+			Queued:         len(bucket.waiters),
+			Served:         bucket.served,
+			Blocked:        bucket.blocked,
+			Throttled:      bucket.throttled,
 		}
-		if bucket.pausedTil.After(time.Now()) {
+		if bucket.pausedTil.After(now) {
 			entry.PausedUntil = bucket.pausedTil.UTC().Format(time.RFC3339)
 		}
 		out.Accounts = append(out.Accounts, entry)
 	}
-	now := time.Now()
 	a.pruneSessionsLocked(now)
 	for who, entry := range a.sessions {
 		session := admissionSessionSnapshot{
