@@ -9099,7 +9099,16 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 				}
 				if candidate.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(candidate.Provider), candidate.ID) {
 					if fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, availableAccounts, poolModel); ok {
+						placementReservation.Release()
+						placementReservation = nil
 						candidate = fallback
+						if options.placementReservation != nil && s.SchedulerRef != nil {
+							var reserveErr error
+							_, placementReservation, reserveErr = pickAndReserveRoutingAccount(r.Context(), scheduler, s.SchedulerRef, []accounts.Account{candidate})
+							if reserveErr != nil {
+								return accounts.Account{}, sessionID, userEmail, reserveErr
+							}
+						}
 					} else {
 						// The whole pool is exhausted: Pick ranks exhausted accounts
 						// last but still returns one, and the post-selection check
@@ -9165,8 +9174,10 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		}
 		// Paid fallback may choose a different account. Its reservation must
 		// follow that account rather than leave load attached to the rejected pick.
-		placementReservation.Release()
-		placementReservation = nil
+		if fallback.ID != account.ID {
+			placementReservation.Release()
+			placementReservation = nil
+		}
 		account = fallback
 	}
 	if account.AuthMode == accounts.AuthModeAPIKey && provider == accounts.ProviderClaude &&
