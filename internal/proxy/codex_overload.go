@@ -460,9 +460,10 @@ type codexOverloadFailoverTransport struct {
 // codexCapacityAttemptPlan is where and when the next capacity retry goes.
 type codexCapacityAttemptPlan struct {
 	// next is the account to switch to; nil retries on the current one.
-	next  *accounts.Account
-	gap   time.Duration
-	phase string
+	next        *accounts.Account
+	reservation *selectacct.PlacementReservation
+	gap         time.Duration
+	phase       string
 }
 
 func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -528,7 +529,16 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 	persistUnbounded := false
 	releasePersist := func() {}
 	defer func() { releasePersist() }()
+	var pendingPlacement *selectacct.PlacementReservation
+	defer func() { pendingPlacement.Release() }()
 	for attempt := 1; ; attempt++ {
+		// A replacement counts as offered load only when its request is
+		// dispatched. Sticky ownership still waits for terminal success below.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		pendingPlacement.Commit()
+		pendingPlacement = nil
 		response, err := a.send(base, attemptReq, addressed)
 		if err != nil || !a.replayable() || ctx.Err() != nil {
 			return response, err
@@ -621,6 +631,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			t.server.labelCodexCapacityExhausted(req.Context(), response, t.poolModel, t.serviceTier)
 			return response, nil
 		}
+		pendingPlacement = plan.reservation
 		// A switch is the plan's choice; the retarget below for an account
 		// the layer below already moved to is still the same account.
 		switching := plan.next != nil
@@ -664,7 +675,7 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			t.server.SchedulerRef.NoteFailover(accounts.ProviderCodex, accountID, selectacct.FailoverCapacity)
 			accountID = plan.next.ID
 			tried[accountID] = struct{}{}
-			if t.server.SchedulerRef != nil {
+			if t.server.SchedulerRef != nil && pendingPlacement == nil {
 				t.server.SchedulerRef.NoteRouted(accounts.ProviderCodex, accountID)
 			}
 			// The layers below start from the account the request is
@@ -754,13 +765,14 @@ func (t codexOverloadFailoverTransport) planDefaultRetry(ctx context.Context, ac
 		t.logOverload("codex overload failover exhausted", accountID, reason, *switched, "retry_budget")
 		return codexCapacityAttemptPlan{}, false
 	}
-	next, pickErr := t.server.oauthRetryCandidate(ctx, accounts.ProviderCodex, t.agent, t.session, t.userEmail, t.poolModel, tried, false, false)
+	next, reservation, pickErr := t.server.oauthRetryCandidateWithReservation(ctx, accounts.ProviderCodex, t.agent, t.session, t.userEmail, t.poolModel, tried, false, false)
 	if pickErr != nil {
+		reservation.Release()
 		t.logOverload("codex overload failover has no alternate account", accountID, reason, *switched, pickErr.Error())
 		return codexCapacityAttemptPlan{}, false
 	}
 	*switched++
-	return codexCapacityAttemptPlan{next: &next, gap: gap, phase: "switch_account"}, true
+	return codexCapacityAttemptPlan{next: &next, reservation: reservation, gap: gap, phase: "switch_account"}, true
 }
 
 // planPersistRetry keeps going after the default ladder. With the failover
@@ -777,18 +789,20 @@ func (t codexOverloadFailoverTransport) planPersistRetry(ctx context.Context, ac
 	if !config.enabled() {
 		return codexCapacityAttemptPlan{gap: gap, phase: "persist_same_account"}, true
 	}
-	next, pickErr := t.server.oauthRetryCandidate(ctx, accounts.ProviderCodex, t.agent, t.session, t.userEmail, t.poolModel, tried, false, false)
+	next, reservation, pickErr := t.server.oauthRetryCandidateWithReservation(ctx, accounts.ProviderCodex, t.agent, t.session, t.userEmail, t.poolModel, tried, false, false)
 	if pickErr != nil && ctx.Err() == nil {
 		for id := range tried {
 			delete(tried, id)
 		}
-		next, pickErr = t.server.oauthRetryCandidate(ctx, accounts.ProviderCodex, t.agent, t.session, t.userEmail, t.poolModel, tried, false, false)
+		reservation.Release()
+		next, reservation, pickErr = t.server.oauthRetryCandidateWithReservation(ctx, accounts.ProviderCodex, t.agent, t.session, t.userEmail, t.poolModel, tried, false, false)
 	}
 	if pickErr != nil || next.ID == accountID {
+		reservation.Release()
 		// Nothing else to pick: the same account again.
 		return codexCapacityAttemptPlan{gap: gap, phase: "persist_same_account"}, true
 	}
-	return codexCapacityAttemptPlan{next: &next, gap: gap, phase: "persist"}, true
+	return codexCapacityAttemptPlan{next: &next, reservation: reservation, gap: gap, phase: "persist"}, true
 }
 
 // codexAccountByID finds a Codex account of the current inventory by ID.
