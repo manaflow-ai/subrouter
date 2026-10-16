@@ -545,7 +545,6 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no account is available for the requested lease", http.StatusServiceUnavailable)
 		return
 	}
-	selectedAccountID := account.ID
 	pendingSessionExpectedAccount := account.ID
 	if s.Sessions != nil {
 		if assignment, ok := s.Sessions.Get(agentTypeForProviderSession(request.Agent, provider), sessionKey); ok {
@@ -553,7 +552,7 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var refreshPendingSessionCommit bool
-	account, refreshPendingSessionCommit, err = s.refreshSelectedAccount(
+	account, refreshPendingSessionCommit, err = s.refreshSelectedAccountWithReservation(
 		r.Context(),
 		provider,
 		agentTypeForProviderSession(request.Agent, provider),
@@ -561,6 +560,7 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		"",
 		r,
 		account,
+		&placementReservation,
 	)
 	pendingSessionCommit = pendingSessionCommit || refreshPendingSessionCommit
 	if err != nil {
@@ -571,17 +571,7 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no account is available for the requested lease", http.StatusServiceUnavailable)
 		return
 	}
-	if account.ID != selectedAccountID && s.SchedulerRef != nil {
-		// Terminal credential refresh can replace the chosen account. Move
-		// the pending debit to the account the lease will actually persist.
-		placementReservation.Release()
-		placementReservation = nil
-		_, placementReservation, err = pickAndReserveRoutingAccount(r.Context(), s.scheduler(), s.SchedulerRef, []accounts.Account{account})
-		if err != nil {
-			http.Error(w, "no account is available for the requested lease", http.StatusServiceUnavailable)
-			return
-		}
-	}
+
 	template := sessionLease{
 		ScopeKey:       sessionLeaseScopeKey(request, provider, model),
 		OrganizationID: request.OrganizationID,

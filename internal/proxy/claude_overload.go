@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 // claudeSSEOverloadPeekMaxBytes bounds how much of a Claude SSE stream is
@@ -159,22 +160,20 @@ func (b *claudeSSEDeferredBody) Close() error {
 	return b.peek.body.Close()
 }
 
-// claudeOverloadRerouteCandidate picks the single alternate subscription
-// account an overloaded request may try after its first same-account retries,
-// when the reroute is opted in (Server.ClaudeOverloadReroute); by default the
-// request never leaves its account on overload. Overload is usually API-wide, so this is deliberately narrow: OAuth
-// accounts only, and only one with new-session headroom, so a sustained outage
-// costs at most one extra upstream request rather than a pool fan-out.
-func (t usageLimitRetryTransport) claudeOverloadRerouteCandidate(ctx context.Context, tried map[string]struct{}) (accounts.Account, bool) {
+// claudeOverloadRerouteCandidateWithReservation holds the selected replacement
+// in the live placement load until its caller dispatches or abandons the retry.
+func (t usageLimitRetryTransport) claudeOverloadRerouteCandidateWithReservation(ctx context.Context, tried map[string]struct{}) (accounts.Account, *selectacct.PlacementReservation, bool) {
 	if t.server == nil {
-		return accounts.Account{}, false
+		return accounts.Account{}, nil, false
 	}
-	next, err := t.server.oauthRetryCandidate(ctx, t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, true, false)
+	next, reservation, err := t.server.oauthRetryCandidateWithReservation(ctx, t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, true, false)
 	if err != nil || next.ID == "" {
-		return accounts.Account{}, false
+		reservation.Release()
+		return accounts.Account{}, nil, false
 	}
 	if !t.server.scheduler().ForModel(t.poolModel).UsableForNewSession(schedulerAccountProvider(next.Provider), next.ID) {
-		return accounts.Account{}, false
+		reservation.Release()
+		return accounts.Account{}, nil, false
 	}
-	return next, true
+	return next, reservation, true
 }
