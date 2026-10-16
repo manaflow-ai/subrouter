@@ -2526,6 +2526,26 @@ func TestClaudeCodexHookArgsInstallPreCompactHook(t *testing.T) {
 	}
 }
 
+func TestClaudeCodexCommonDirDetectsLinkedSubmoduleWorktrees(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "submodule", path: "/Users/lawrence/fun/cmuxterm-hq/.git/modules/subrouter", want: true},
+		{name: "relative submodule", path: "../../.git/modules/subrouter", want: true},
+		{name: "ordinary repository", path: "/Users/lawrence/fun/cmuxterm-hq/repo/.git", want: false},
+		{name: "ordinary worktree", path: "/Users/lawrence/fun/cmuxterm-hq/repo/.git/worktrees/agent", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := claudeCodexCommonDirIsLinkedSubmodule(test.path); got != test.want {
+				t.Fatalf("claudeCodexCommonDirIsLinkedSubmodule(%q) = %v, want %v", test.path, got, test.want)
+			}
+		})
+	}
+}
+
 func TestClaudeCodexArgsUsesRecognizedModelAliases(t *testing.T) {
 	if got := claudeCodexArgs(nil); len(got) != 2 || got[0] != "--model" || got[1] != "gpt-6.1-sol" {
 		t.Fatalf("default args = %#v", got)

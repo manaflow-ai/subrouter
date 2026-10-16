@@ -2614,12 +2614,7 @@ func claudeCodexHookArgsWithEnv(args []string, serverURL, proxyToken, customHead
 			"ANTHROPIC_AUTH_TOKEN":     proxyToken,
 			"ANTHROPIC_CUSTOM_HEADERS": customHeaders,
 		},
-		"hooks": map[string]any{
-			"PreCompact": []any{map[string]any{
-				"matcher": "",
-				"hooks":   []any{map[string]any{"type": "command", "command": hookCommand, "timeout": 10}},
-			}},
-		},
+		"hooks": claudeCodexHooks(hookCommand),
 		"modelPicker": map[string]any{
 			"replaceBuiltInOptions": true,
 			"options":               claudeCodexModelPickerOptions(),
@@ -2629,6 +2624,52 @@ func claudeCodexHookArgsWithEnv(args []string, serverURL, proxyToken, customHead
 		return args
 	}
 	return append([]string{"--settings", string(settings)}, args...)
+}
+
+func claudeCodexHooks(compactionHookCommand string) map[string]any {
+	hooks := map[string]any{
+		"PreCompact": []any{map[string]any{
+			"matcher": "",
+			"hooks":   []any{map[string]any{"type": "command", "command": compactionHookCommand, "timeout": 10}},
+		}},
+	}
+	// Claude's built-in agent worktree setup currently treats a linked
+	// submodule worktree's git common directory as a repository root. That
+	// makes its filter-driver safety read fail before the subagent starts.
+	// Returning the current checkout from a WorktreeCreate hook avoids that
+	// broken path while preserving normal isolation everywhere else.
+	if claudeCodexInLinkedSubmoduleWorktree() {
+		hooks["WorktreeCreate"] = []any{map[string]any{
+			"hooks": []any{map[string]any{
+				"type":    "command",
+				"command": "printf '%s\\n' \"$PWD\"",
+				"timeout": 5,
+			}},
+		}}
+	}
+	return hooks
+}
+
+func claudeCodexInLinkedSubmoduleWorktree() bool {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return false
+	}
+	commonDir, err := exec.Command("git", "-C", cwd, "rev-parse", "--git-common-dir").Output()
+	if err != nil {
+		return false
+	}
+	commonDir = bytes.TrimSpace(commonDir)
+	if len(commonDir) == 0 {
+		return false
+	}
+	return claudeCodexCommonDirIsLinkedSubmodule(string(commonDir))
+}
+
+func claudeCodexCommonDirIsLinkedSubmodule(commonDir string) bool {
+	clean := filepath.Clean(strings.TrimSpace(commonDir))
+	modulesMarker := string(filepath.Separator) + ".git" + string(filepath.Separator) + "modules" + string(filepath.Separator)
+	return strings.Contains(clean, modulesMarker)
 }
 
 func claudeCodexCustomHeaders() (string, error) {
