@@ -44,8 +44,26 @@ type BedrockConfig struct {
 	CostLogPath string
 	// Bumper, when set, requests a Service Quotas increase when Bedrock throttles
 	// (HTTP 429), deduped per quota with a cooldown.
-	Bumper      *bedrockQuotaBumper
-	nextAttempt atomic.Uint64
+	Bumper *bedrockQuotaBumper
+	// ThrottleCooldown is how long a region/source pair that answered a
+	// throttle is moved to the back of the attempt order, so new requests
+	// start on a pair that is not throttled. Zero uses
+	// defaultBedrockThrottleCooldown. A cooling pair is still tried, after
+	// the others, so one request still makes one full pass over every pair.
+	ThrottleCooldown time.Duration
+	nextAttempt      atomic.Uint64
+	coolingMu        sync.Mutex
+	coolingUntil     map[bedrockAttemptKey]time.Time
+}
+
+// defaultBedrockThrottleCooldown is short on purpose: the fable path keeps
+// steady traffic on the primary region for its prompt cache, so traffic must
+// go back to the primary soon after its throttle clears.
+const defaultBedrockThrottleCooldown = 30 * time.Second
+
+type bedrockAttemptKey struct {
+	region string
+	source string
 }
 
 type BedrockCredentialSource struct {
@@ -362,6 +380,9 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 			s.Logger.Warn("claude-fable bedrock stream failed before content", attrs...)
 		}
 		_ = resp.Body.Close()
+		if bedrockPeekThrottled(peek) {
+			cfg.markThrottled(region, sourceName)
+		}
 		s.recordClaudeFableBedrockCost(started, region, http.StatusServiceUnavailable, bedrockUsage{}, false)
 		if retryable && attempt < claudeFableBedrockStreamAttempts && bedrockRetryBackoff(ctx, attempt) {
 			// The next loop iteration passes a higher retry index to
@@ -534,6 +555,7 @@ func (s Server) signAndForwardBedrockWithHeaders(ctx context.Context, method, up
 
 func (s Server) signAndForwardBedrockFrom(ctx context.Context, attempts []bedrockAttempt, method, upstreamPath, rawQuery string, headers http.Header, body []byte) (*http.Response, string, string, error) {
 	cfg := s.Bedrock
+	attempts = cfg.uncooledFirst(attempts)
 	var firstErr error
 	for i, attempt := range attempts {
 		resp, err := s.signAndForwardBedrockWithSource(ctx, attempt.Source, attempt.Region, method, upstreamPath, rawQuery, headers, body)
@@ -550,6 +572,9 @@ func (s Server) signAndForwardBedrockFrom(ctx context.Context, attempts []bedroc
 		// TPM) or a Bedrock-side 5xx (e.g. 503 "Bedrock is unable to process
 		// your request"): both are specific to this source's account/endpoint
 		// and another source may serve the request fine.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			cfg.markThrottled(attempt.Region, attempt.Source.Name)
+		}
 		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) && i+1 < len(attempts) {
 			if s.Logger != nil {
 				s.Logger.Warn("bedrock source unusable, retrying next source", "bedrock_source", attempt.Source.Name, "region", attempt.Region, "path", upstreamPath, "status", resp.StatusCode)
@@ -674,6 +699,69 @@ func (cfg *BedrockConfig) orderedAttempts(start int) []bedrockAttempt {
 // roundRobinAttempts rotates the start across calls (gateway path only).
 func (cfg *BedrockConfig) roundRobinAttempts() []bedrockAttempt {
 	return cfg.orderedAttempts(int(cfg.nextAttempt.Add(1) - 1))
+}
+
+func (cfg *BedrockConfig) throttleCooldown() time.Duration {
+	if cfg.ThrottleCooldown > 0 {
+		return cfg.ThrottleCooldown
+	}
+	return defaultBedrockThrottleCooldown
+}
+
+// markThrottled starts the cool-down of one region/source pair.
+func (cfg *BedrockConfig) markThrottled(region, sourceName string) {
+	cfg.coolingMu.Lock()
+	defer cfg.coolingMu.Unlock()
+	if cfg.coolingUntil == nil {
+		cfg.coolingUntil = make(map[bedrockAttemptKey]time.Time)
+	}
+	cfg.coolingUntil[bedrockAttemptKey{region: region, source: sourceName}] = time.Now().Add(cfg.throttleCooldown())
+}
+
+// uncooledFirst keeps the given order but moves every pair that is in its
+// throttle cool-down behind the pairs that are not. No pair is removed, so a
+// request still tries every pair once, and a 429 reaches the client only
+// after every pair throttled.
+// A stall retry can therefore go back to the pair that stalled when the
+// pair after it is cooling; a pair that throttled a moment ago is the worse
+// choice of the two.
+func (cfg *BedrockConfig) uncooledFirst(attempts []bedrockAttempt) []bedrockAttempt {
+	if len(attempts) <= 1 {
+		return attempts
+	}
+	now := time.Now()
+	cfg.coolingMu.Lock()
+	cooling := make([]bool, len(attempts))
+	anyCooling := false
+	for i, attempt := range attempts {
+		key := bedrockAttemptKey{region: attempt.Region, source: attempt.Source.Name}
+		until, ok := cfg.coolingUntil[key]
+		if !ok {
+			continue
+		}
+		if now.Before(until) {
+			cooling[i] = true
+			anyCooling = true
+		} else {
+			delete(cfg.coolingUntil, key)
+		}
+	}
+	cfg.coolingMu.Unlock()
+	if !anyCooling {
+		return attempts
+	}
+	out := make([]bedrockAttempt, 0, len(attempts))
+	for i, attempt := range attempts {
+		if !cooling[i] {
+			out = append(out, attempt)
+		}
+	}
+	for i, attempt := range attempts {
+		if cooling[i] {
+			out = append(out, attempt)
+		}
+	}
+	return out
 }
 
 func (cfg *BedrockConfig) onThrottle(sourceName, region, model string) {
@@ -1074,6 +1162,22 @@ func peekBedrockStreamUntilCommit(src io.Reader) bedrockStreamPeek {
 // bedrockPeekFailureRetryable reports whether a fresh attempt may succeed:
 // transport errors, throttles, and capacity errors qualify; validation and
 // auth errors fail identically everywhere and do not.
+// bedrockPeekThrottled reports a throttle in the first stream frame, as a
+// Bedrock throttlingException or as an Anthropic rate_limit_error event.
+func bedrockPeekThrottled(peek bedrockStreamPeek) bool {
+	frame := peek.errorFrame
+	if strings.Contains(strings.ToLower(frame.exceptionType), "throttl") {
+		return true
+	}
+	var ev struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	return json.Unmarshal(frame.payload, &ev) == nil && ev.Type == "error" && ev.Error.Type == "rate_limit_error"
+}
+
 func bedrockPeekFailureRetryable(peek bedrockStreamPeek) bool {
 	if peek.outcome == bedrockPeekReadErr {
 		return true
