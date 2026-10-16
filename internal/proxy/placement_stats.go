@@ -78,6 +78,10 @@ var placementAccountMetrics = []promCounter{
 		func(a selectacct.AccountPlacementStats) uint64 { return a.Evictions }},
 	{"subrouter_capacity_marks_total", "Capacity (load-shedding) failures recorded against the account.", "counter",
 		func(a selectacct.AccountPlacementStats) uint64 { return a.CapacityMarks }},
+	{"subrouter_failovers_1h", "Requests that failed over away from the account in the last hour.", "gauge",
+		func(a selectacct.AccountPlacementStats) uint64 { return a.FailoversLastHour }},
+	{"subrouter_failover_peak_1m", "Largest one-minute failover burst away from the account in the last hour.", "gauge",
+		func(a selectacct.AccountPlacementStats) uint64 { return a.FailoverPeakMinute }},
 	{"subrouter_sticky_assignments", "Retained sticky session assignments pointing at the account (durable resume state, not live sessions).", "gauge",
 		func(a selectacct.AccountPlacementStats) uint64 { return uint64(a.StickyAssignments) }},
 }

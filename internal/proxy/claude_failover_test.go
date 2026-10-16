@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -151,6 +152,101 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn429(t *testing.T) {
 	assignment, ok := store.Get("claude", "session-1")
 	if !ok || assignment.AccountID != "fresh@example.com" {
 		t.Fatalf("sticky assignment = %+v, want moved to fresh@example.com", assignment)
+	}
+}
+
+// Concurrent Claude quota failures must reserve their replacement placement
+// before credential refresh completes. Otherwise every request sees the same
+// stale scheduler snapshot and sends its retry to one account.
+func TestClaudeRetryCandidateReservesBeforeRefresh(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	server.Accounts = append(server.Accounts,
+		accounts.Account{ID: "fresh-2@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh-2"},
+	)
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0.9, ShortHeadroom: 0.9},
+		{AccountID: "fresh-2@example.com", Provider: accounts.ProviderClaude, Headroom: 0.9, ShortHeadroom: 0.9},
+	}))
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	server.RefreshAccountFn = func(ctx context.Context, account accounts.Account) (accounts.Account, error) {
+		if account.ID == "cooked@example.com" {
+			return account, nil
+		}
+		started <- struct{}{}
+		select {
+		case <-release:
+			return account, nil
+		case <-ctx.Done():
+			return accounts.Account{}, ctx.Err()
+		}
+	}
+
+	type result struct {
+		account     accounts.Account
+		reservation *selectacct.PlacementReservation
+		err         error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			account, reservation, err := server.oauthRetryCandidateWithReservation(
+				context.Background(), accounts.ProviderClaude, "claude", "session", "", "",
+				map[string]struct{}{"cooked@example.com": {}}, false, false,
+			)
+			results <- result{account: account, reservation: reservation, err: err}
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("replacement refresh did not start twice")
+		}
+	}
+	debits := server.SchedulerRef.LiveDebits()
+	if got := debits[selectacct.ScoreKey(accounts.ProviderClaude, "fresh@example.com")] + debits[selectacct.ScoreKey(accounts.ProviderClaude, "fresh-2@example.com")]; got != 2 {
+		t.Fatalf("live reservation debit = %d, want 2 while refreshes are blocked: %v", got, debits)
+	}
+	close(release)
+	wg.Wait()
+	close(results)
+	for outcome := range results {
+		if outcome.err != nil {
+			t.Fatal(outcome.err)
+		}
+		if outcome.reservation == nil {
+			t.Fatal("successful replacement returned no placement reservation")
+		}
+		outcome.reservation.Commit()
+	}
+	debits = server.SchedulerRef.LiveDebits()
+	if got := debits[selectacct.ScoreKey(accounts.ProviderClaude, "fresh@example.com")] + debits[selectacct.ScoreKey(accounts.ProviderClaude, "fresh-2@example.com")]; got != 2 {
+		t.Fatalf("committed live debit = %d, want 2: %v", got, debits)
+	}
+}
+
+func TestClaudeRetryCandidateReleasesReservationOnRefreshFailure(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+		if account.ID == "fresh@example.com" {
+			return accounts.Account{}, errors.New("refresh failed")
+		}
+		return account, nil
+	}
+	_, reservation, err := server.oauthRetryCandidateWithReservation(
+		context.Background(), accounts.ProviderClaude, "claude", "session", "", "",
+		map[string]struct{}{"cooked@example.com": {}}, false, false,
+	)
+	if err == nil || reservation != nil {
+		t.Fatalf("refresh failure result = account reservation %v err %v, want no reservation", reservation, err)
+	}
+	if got := server.SchedulerRef.LiveDebits(); len(got) != 0 {
+		t.Fatalf("failed refresh leaked placement reservation: %v", got)
 	}
 }
 

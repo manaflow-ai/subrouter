@@ -77,6 +77,11 @@ type SchedulerRef struct {
 	// by LiveDebitPerRequest per routed request so concurrent traffic spreads
 	// instead of herding onto the snapshot's best account until it cooks.
 	routedSinceRefresh map[string]int
+	// placementReservations counts picks that have been made but have not yet
+	// crossed the caller's upstream-success boundary. They steer concurrent
+	// placements immediately, then become routedSinceRefresh on Commit or are
+	// discarded on Release.
+	placementReservations map[string]int
 	// inflight counts physical upstream attempts whose response is still open,
 	// keyed by ScoreKey. Unlike routedSinceRefresh it is instantaneous and is
 	// never cleared by a usage refresh.
@@ -128,11 +133,125 @@ func (r *SchedulerRef) RefreshSeed() Scheduler {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	debits := make(map[string]int, len(r.routedSinceRefresh))
+	return r.scheduler.WithLiveDebits(r.liveDebitsLocked())
+}
+
+// PlacementReservation is the live-load reservation returned by
+// PickAndReserve. Commit turns the reservation into the same routed-request
+// debit recorded by NoteRouted. Release removes it when account preparation
+// fails before the request is routed. Either method is idempotent.
+type PlacementReservation struct {
+	ref       *SchedulerRef
+	key       string
+	provider  account.Provider
+	accountID string
+	once      sync.Once
+}
+
+// Commit records the reserved request as routed. It is safe to call more than
+// once; only the first call changes scheduler state or placement statistics.
+func (p *PlacementReservation) Commit() {
+	if p == nil || p.ref == nil {
+		return
+	}
+	p.once.Do(func() {
+		p.ref.commitPlacementReservation(p.key, p.provider, p.accountID)
+	})
+}
+
+// Release drops a reservation without recording a routed request. It is safe
+// to call more than once.
+func (p *PlacementReservation) Release() {
+	if p == nil || p.ref == nil {
+		return
+	}
+	p.once.Do(func() { p.ref.releasePlacementReservation(p.key) })
+}
+
+// PickAndReserve chooses an account and reserves its live placement load as
+// one atomic operation. The scheduler passed by the caller supplies the
+// immutable selection state (for example the model pool, active session
+// counts, and capacity marks); the live debit and in-flight maps are replaced
+// with the latest values held by this ref while its lock is held.
+//
+// The caller must Commit or Release the returned reservation. A committed
+// reservation replaces the later NoteRouted call for that request.
+func (r *SchedulerRef) PickAndReserve(scheduler Scheduler, candidates []account.Account) (account.Account, *PlacementReservation, error) {
+	if r == nil {
+		picked, err := scheduler.Pick(candidates)
+		return picked, nil, err
+	}
+
+	r.mu.Lock()
+	scheduler = scheduler.WithLiveDebits(r.liveDebitsLocked()).WithInflightCounts(r.inflight)
+	picked, err := scheduler.Pick(candidates)
+	if err != nil {
+		r.mu.Unlock()
+		return account.Account{}, nil, err
+	}
+	if r.placementReservations == nil {
+		r.placementReservations = make(map[string]int)
+	}
+	key := ScoreKey(picked.Provider, picked.ID)
+	r.placementReservations[key]++
+	r.mu.Unlock()
+	return picked, &PlacementReservation{ref: r, key: key, provider: picked.Provider, accountID: picked.ID}, nil
+}
+
+// commitPlacementReservation converts one pending reservation into the
+// existing routed-request debit and placement statistic.
+func (r *SchedulerRef) commitPlacementReservation(key string, provider account.Provider, accountID string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if count := r.placementReservations[key]; count <= 1 {
+		delete(r.placementReservations, key)
+	} else {
+		r.placementReservations[key] = count - 1
+	}
+	if accountID == "" {
+		r.mu.Unlock()
+		return
+	}
+	if r.routedSinceRefresh == nil {
+		r.routedSinceRefresh = make(map[string]int)
+	}
+	r.routedSinceRefresh[key]++
+	r.noteDemandLocked(provider, time.Now())
+	r.mu.Unlock()
+	r.noteRoutedStat(provider, accountID)
+}
+
+// releasePlacementReservation removes one pending reservation without
+// recording a routed request.
+func (r *SchedulerRef) releasePlacementReservation(key string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if count := r.placementReservations[key]; count <= 1 {
+		delete(r.placementReservations, key)
+	} else {
+		r.placementReservations[key] = count - 1
+	}
+}
+
+// liveDebitsLocked returns committed and pending placement load for callers
+// that already hold r.mu.
+func (r *SchedulerRef) liveDebitsLocked() map[string]int {
+	if len(r.routedSinceRefresh) == 0 && len(r.placementReservations) == 0 {
+		return nil
+	}
+	debits := make(map[string]int, len(r.routedSinceRefresh)+len(r.placementReservations))
 	for key, count := range r.routedSinceRefresh {
 		debits[key] = count
 	}
-	return r.scheduler.WithLiveDebits(debits)
+	for key, count := range r.placementReservations {
+		debits[key] += count
+	}
+	return debits
 }
 
 // RunIfAccountNotBlocked executes publish while the current scheduler state
@@ -758,16 +877,12 @@ func (r *SchedulerRef) MergeScoresForAccountGenerationAtScoreRevision(
 		// same account-generation identity and let the older one publish first.
 		r.refreshInvalidated = true
 	}
-	debits := make(map[string]int, len(r.routedSinceRefresh))
-	for key, count := range r.routedSinceRefresh {
-		debits[key] = count
-	}
 	now := time.Now()
 	published := applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
 	published = applyExhaustionMarks(published, r.activeCredentialExhaustionLocked(), now)
 	published = applyExhaustionMarks(published, r.accountUnavailableUntil, now)
 	published = applyExhaustionMarks(published, r.incompatibleUntil, now)
-	return published.WithLiveDebits(debits), true
+	return published.WithLiveDebits(r.liveDebitsLocked()), true
 }
 
 // retainExhaustedExpiriesLocked reconciles mark expiries with an incoming
@@ -1693,14 +1808,7 @@ func (r *SchedulerRef) LiveDebits() map[string]int {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if len(r.routedSinceRefresh) == 0 {
-		return nil
-	}
-	out := make(map[string]int, len(r.routedSinceRefresh))
-	for key, count := range r.routedSinceRefresh {
-		out[key] = count
-	}
-	return out
+	return r.liveDebitsLocked()
 }
 
 func (r *SchedulerRef) Touch() {

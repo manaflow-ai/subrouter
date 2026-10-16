@@ -84,10 +84,10 @@ func TestAdmissionPauseUsesClaudeQuotaReset(t *testing.T) {
 	key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus-5-5")
 	now := time.Now()
 	reset := now.Add(2 * time.Minute).Unix()
-	control.observe(key, http.StatusTooManyRequests, http.Header{
-		"anthropic-ratelimit-unified-5h-status": []string{"rejected"},
-		"anthropic-ratelimit-unified-5h-reset":  []string{formatInt64(reset)},
-	}, now)
+	header := http.Header{}
+	header.Set("Anthropic-Ratelimit-Unified-5h-Status", "rejected")
+	header.Set("Anthropic-Ratelimit-Unified-5h-Reset", formatInt64(reset))
+	control.observe(key, http.StatusTooManyRequests, header, now)
 	paused := control.snapshot().Accounts[0].PausedUntil
 	if paused == "" {
 		t.Fatal("Claude quota rejection did not pause admission")
