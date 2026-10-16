@@ -44,6 +44,10 @@ var errAdmissionPaused = errors.New("upstream account is paused after a rate lim
 // to wait than to move a session and lose its prompt cache.
 const admissionPauseWaitMax = 5 * time.Second
 
+// A Claude 429 without quota evidence or a Retry-After hint is a short burst
+// throttle, not a reason to apply the ten-minute quota fallback.
+const claudeTransientThrottleFallback = time.Second
+
 // admissionRejected reports a limiter rejection that another account could
 // serve: the queue is full or the account is paused.
 func admissionRejected(err error) bool {
@@ -588,12 +592,34 @@ func (a *admissionControl) observe(key admissionKey, status int, header http.Hea
 	}
 	until := retryAfterExpiry(header, now)
 	if key.provider == accounts.ProviderClaude {
-		until = claudeExhaustionExpiryForPool(header, now, key.model)
+		if claudeResponseRejectedForPool(header, key.model) {
+			until = claudeExhaustionExpiryForPool(header, now, key.model)
+		} else {
+			// A bare/allowed 429 is a short request throttle, not quota
+			// exhaustion. Honor Retry-After when present, without inheriting
+			// an unrelated healthy quota window's reset or the quota default.
+			if until.IsZero() {
+				until = now.Add(claudeTransientThrottleFallback)
+			}
+		}
 	}
 	if until.IsZero() {
 		until = now.Add(time.Second)
 	}
 	a.pause(key, until)
+}
+
+// paused reports whether an account/model is in an admission cooldown. It is
+// deliberately separate from SchedulerRef's quota overlays: transient Claude
+// throttles must not appear as exhausted in status or score snapshots.
+func (a *admissionControl) paused(key admissionKey, now time.Time) bool {
+	if a == nil || key.account == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	bucket := a.buckets[key]
+	return bucket != nil && bucket.pausedTil.After(now)
 }
 
 func (l *admissionLease) release() {

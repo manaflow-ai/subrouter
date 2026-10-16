@@ -201,6 +201,10 @@ type attemptBudget struct {
 	// claudeOverload is the request's same-account Claude overload ladder,
 	// bounded on its own (see claudeOverloadHold).
 	claudeOverload claudeOverloadHold
+	// claudeTransient429Rerouted records the one alternate account already
+	// used for a transient Claude throttle. It is request-wide so nested
+	// transport replays cannot fan one burst out across the whole pool.
+	claudeTransient429Rerouted atomic.Bool
 }
 
 func newAttemptBudget(retries int) *attemptBudget {
