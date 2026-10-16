@@ -511,7 +511,7 @@ go run ./cmd/subrouter status
 sr status
 ```
 
-The supported Codex commands include `add`, `add-key`, `import`, `list`, `switch`, `g`, `gui`, `gui-switch`, `remove`, `status`, `usage`, `server`, `add-admin-key`, `admin-keys`, `remove-admin-key`, `attach-project`, `claude`, and `gemini`. The older `subrouter cx <command>` form remains as a compatibility alias.
+The supported Codex commands include `add`, `add-key`, `import`, `list`, `switch`, `g`, `gui`, `gui-switch`, `remove`, `status`, `usage`, `server`, `add-admin-key`, `admin-keys`, `remove-admin-key`, `attach-project`, `claude`, `claude-codex`, and `gemini`. The older `subrouter cx <command>` form remains as a compatibility alias.
 
 `sr switch` also syncs compatible ChatGPT Codex credentials into:
 
@@ -563,6 +563,31 @@ configuration and memory-permission behavior.
 Remote server-pool launches need neither local Claude profiles nor a local
 Subrouter daemon; Claude arguments such as `--resume <session-id>` pass through
 unchanged.
+
+### Claude Code on the pooled Codex backend
+
+Select the Subrouter server that owns the Codex subscription pool, then launch
+the Claude Code TUI through the bridge:
+
+```bash
+sr server use team
+sr claude-codex
+```
+
+`sr claude-codex` removes ambient Anthropic and gateway credentials, sets
+Claude Code's base URL to `/claude-codex`, and disables nonessential network
+traffic. Messages requests are translated to Codex Responses traffic and can
+only select OAuth Codex accounts. The bridge keeps a stable `prompt_cache_key`
+for each Claude session, reports Codex cached input tokens in Claude's usage
+shape, and tags compaction turns with Codex metadata. It installs a `PreCompact`
+hook for both automatic and manual compaction. If you pass an explicit
+`--settings` file, merge that hook because Claude Code gives explicit settings
+precedence.
+
+Replay-safe POSTs get ten bounded attempts with exponential backoff, and Codex
+WebSocket handshakes get eight transient attempts. Once output has started
+streaming, Subrouter does not replay the turn, so tool calls cannot be
+duplicated.
 
 Overload (Anthropic 529 or another 5xx) should be rare and brief, and it is
 API-wide, so by default Subrouter waits it out on the session's own account,

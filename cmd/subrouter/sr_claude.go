@@ -2505,6 +2505,123 @@ func claudeAWSChildEnvironment(environ []string, baseURL, region, model, gateway
 	return env
 }
 
+// claudeCodex launches Claude Code through Subrouter's Claude-to-Codex bridge.
+// The Claude UI and tool loop remain intact while every model request uses the
+// server's pooled Codex subscription accounts.
+func (r srRunner) claudeCodex(ctx context.Context, args []string) error {
+	server, ok, err := r.defaultRemoteServer()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("sr claude-codex needs a default Subrouter server; run '%s server use <name>'", r.programOrSubrouter())
+	}
+	proxyRoot := canonicalServerProxyRootURL(server)
+	protectedServer := server
+	if strings.TrimSpace(protectedServer.TenantKey) == "" {
+		protectedServer.TenantKey = "protected-claude-codex"
+	}
+	serverURL, err := secureTenantServerURL(ctx, proxyRoot, protectedServer)
+	if err != nil {
+		return err
+	}
+	claudePath, ok := claude.DetectCLI()
+	if !ok {
+		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
+	}
+	launchArgs := claudeCodexHookArgs(claudeCodexArgs(args), serverURL)
+	cmd := exec.CommandContext(ctx, claudePath, launchArgs...)
+	cmd.Stdin = r.in
+	cmd.Stdout = r.out
+	cmd.Stderr = r.errOut
+	env := envWithoutSubrouterControl(os.Environ())
+	env = envWithout(env, claudeRoutingEnvKeys)
+	env = envWithoutPrefix(env, "ANTHROPIC_DEFAULT_")
+	env = envWithoutPrefix(env, "ANTHROPIC_CUSTOM_MODEL_")
+	env = append(env,
+		"ANTHROPIC_BASE_URL="+strings.TrimRight(serverURL, "/")+"/claude-codex",
+		"ANTHROPIC_AUTH_TOKEN="+firstNonEmpty(strings.TrimSpace(server.TenantKey), "subrouter"),
+		"ANTHROPIC_DEFAULT_FABLE_MODEL=claude-codex-sol",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL=claude-codex-sol",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL=claude-codex-terra",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-codex-luna",
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+	)
+	cmd.Env = env
+	fmt.Fprintf(r.errOut, "Claude Code -> Codex Sol/Terra/Luna via Subrouter %s\n", serverURL)
+	return cmd.Run()
+}
+
+func claudeCodexArgs(args []string) []string {
+	for _, arg := range args {
+		if arg == "--model" || strings.HasPrefix(arg, "--model=") {
+			return args
+		}
+	}
+	return append([]string{"--model", "claude-codex-sol"}, args...)
+}
+
+func claudeCodexHookArgs(args []string, serverURL string) []string {
+	for _, arg := range args {
+		if arg == "--settings" || strings.HasPrefix(arg, "--settings=") {
+			return args
+		}
+	}
+	executable, err := os.Executable()
+	if err != nil || executable == "" {
+		executable = "sr"
+	}
+	hookCommand := shellQuote(executable) + " claude-codex-hook " + shellQuote(strings.TrimRight(serverURL, "/")+"/claude-codex/hooks/pre-compact")
+	settings, err := json.Marshal(map[string]any{
+		"hooks": map[string]any{
+			"PreCompact": []any{map[string]any{
+				"matcher": "",
+				"hooks":   []any{map[string]any{"type": "command", "command": hookCommand, "timeout": 10}},
+			}},
+		},
+	})
+	if err != nil {
+		return args
+	}
+	return append([]string{"--settings", string(settings)}, args...)
+}
+
+func (r srRunner) claudeCodexHook(ctx context.Context, args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("invalid claude-codex hook invocation")
+	}
+	body, err := io.ReadAll(io.LimitReader(r.in, 64*1024+1))
+	if err != nil {
+		return fmt.Errorf("read Claude hook: %w", err)
+	}
+	if len(body) > 64*1024 {
+		return fmt.Errorf("Claude hook payload is too large")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, args[0], bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create Claude hook request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := r.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	response, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("send Claude hook: %w", err)
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 64*1024))
+	if err != nil {
+		return fmt.Errorf("read Claude hook response: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("Claude hook returned HTTP %s", response.Status)
+	}
+	_, err = r.out.Write(responseBody)
+	return err
+}
+
 // claudeDirect launches Claude Code straight against Anthropic on the user's own
 // claude.ai login, guaranteeing subrouter (and any Bedrock/Vertex/Mantle
 // gateway) is not used. It strips every routing/gateway env var plus

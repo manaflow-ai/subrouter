@@ -5573,6 +5573,11 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		modelCatalogRequest := requestProvider == accounts.ProviderCodex && codexModelCatalogRequest(r)
 		sessionID := session.ExtractID(r, s.MaxBodyBytes)
+		bridgePath := claudeCodexRequestPath(r.URL.Path)
+		if bridgePath {
+			agentType = "claude-codex"
+			requestProvider = accounts.ProviderCodex
+		}
 		if modelCatalogRequest {
 			sessionID = codexModelCatalogSessionID
 		}
@@ -5636,6 +5641,13 @@ func (s Server) proxyHandler() http.Handler {
 			agentType = "codex-realtime"
 			sessionID += ":" + callID
 		}
+		bridgeRequest := bridgePath && boundLease == nil
+		if bridgeRequest {
+			// The public bridge endpoint is Anthropic-shaped, but its account pool,
+			// scheduler, and session namespace are all Codex-owned.
+			agentType = "claude-codex"
+			requestProvider = accounts.ProviderCodex
+		}
 		routingRequest := r
 		if modelCatalogRequest && boundLease == nil {
 			var pinnedCatalogAccount string
@@ -5682,6 +5694,10 @@ func (s Server) proxyHandler() http.Handler {
 			return
 		}
 		defer endProxyRequest()
+		if bridgeRequest {
+			s.serveClaudeCodex(w, r, agentType, sessionID)
+			return
+		}
 		// Claude Fable routing order: subscription pool (Max accounts) first, then
 		// AWS Bedrock, then the dedicated Anthropic API key. The fallback stages
 		// run when the pool gives up (usageLimitRetryTransport exhausts failover)
@@ -10091,7 +10107,11 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 }
 
 const replayablePostMaxBodyBytes = 128 << 20
-const replayablePostMaxAttempts = 6
+
+// Keep a larger bounded replay budget for short upstream restarts and pooled
+// connection flaps. The shared attempt budget prevents nested failover layers
+// from multiplying this number, and retryBackoff spaces the attempts out.
+const replayablePostMaxAttempts = 10
 
 const subrouterNoRetryHeader = "X-Subrouter-No-Retry"
 
@@ -12739,9 +12759,9 @@ func retryBackoff(attempt int) time.Duration {
 
 const (
 	retryBaseBackoff = 100 * time.Millisecond
-	// Bounds the worst case: with six attempts the added latency stays near a
-	// couple of seconds, far better than surfacing a 502 to the caller.
-	retryMaxBackoff = 800 * time.Millisecond
+	// Ten attempts add at most 3.3 seconds of backoff, far better than
+	// surfacing a 502 before a brief upstream restart has recovered.
+	retryMaxBackoff = 400 * time.Millisecond
 )
 
 // sleepForRetry waits for the backoff, reporting false if the caller gave up

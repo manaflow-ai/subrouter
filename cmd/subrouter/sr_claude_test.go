@@ -2493,3 +2493,20 @@ func TestProxyClaudeLaunchSettingsSendsTheCallersSessionKey(t *testing.T) {
 		}
 	}
 }
+
+func TestClaudeCodexHookArgsInstallPreCompactHook(t *testing.T) {
+	args := claudeCodexHookArgs([]string{"--dangerously-skip-permissions"}, "http://router.test")
+	if len(args) != 3 || args[0] != "--settings" {
+		t.Fatalf("args = %#v, want injected settings", args)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal([]byte(args[1]), &settings); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(args[1], "claude-codex-hook") || !strings.Contains(args[1], "pre-compact") {
+		t.Fatalf("settings = %s, want compaction hook URL and command", args[1])
+	}
+	if got := claudeCodexHookArgs([]string{"--settings", "{}", "--resume", "session"}, "http://router.test"); len(got) != 4 || got[1] != "{}" {
+		t.Fatalf("explicit settings should win, got %#v", got)
+	}
+}
