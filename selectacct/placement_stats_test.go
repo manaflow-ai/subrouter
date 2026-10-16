@@ -94,6 +94,8 @@ func TestNoteRoutedFeedsLiveDebitAndStats(t *testing.T) {
 	}
 }
 
+// TestFailoverBurstWindowIsBoundedAndAgesOut checks rollover while preserving
+// lifetime failover totals.
 func TestFailoverBurstWindowIsBoundedAndAgesOut(t *testing.T) {
 	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
 	ref := NewSchedulerRef(NewScheduler(nil))

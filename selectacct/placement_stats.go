@@ -57,6 +57,7 @@ type burstRing struct {
 	counts  [herdBuckets]uint64
 }
 
+// add records one event in the minute bucket containing minute.
 func (b *burstRing) add(minute int64) {
 	slot := int(minute % int64(herdBuckets))
 	if b.minutes[slot] != minute {
@@ -66,6 +67,8 @@ func (b *burstRing) add(minute int64) {
 	b.counts[slot]++
 }
 
+// window returns the total and largest single-minute event count still inside
+// the rolling hour that ends at minute.
 func (b *burstRing) window(minute int64) (total, peak uint64) {
 	for slot, count := range b.counts {
 		if count == 0 || minute-b.minutes[slot] >= int64(herdBuckets) || b.minutes[slot] > minute {
