@@ -60,8 +60,8 @@ func TestGateThresholdsFromEnvUsesBakeOverrides(t *testing.T) {
 }
 
 func TestTrafficWindowSinceTreatsLowerCountsAsRestart(t *testing.T) {
-	base := trafficWindow{Requests: 100, Proxy5xx: 5}
-	if got := (trafficWindow{Requests: 150, Proxy5xx: 6}).since(base); got != (trafficWindow{Requests: 50, Proxy5xx: 1}) {
+	base := trafficWindow{Requests: 100, Responses5xx: 7, Proxy5xx: 5, StreamProxyDrops: 3, ClientAborts: 2}
+	if got := (trafficWindow{Requests: 150, Responses5xx: 9, Proxy5xx: 6, StreamProxyDrops: 4, ClientAborts: 5}).since(base); got != (trafficWindow{Requests: 50, Responses5xx: 2, Proxy5xx: 1, StreamProxyDrops: 1, ClientAborts: 3}) {
 		t.Fatalf("delta = %+v", got)
 	}
 	if got := (trafficWindow{Requests: 20}).since(base); got != (trafficWindow{Requests: 20}) {
