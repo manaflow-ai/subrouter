@@ -8887,6 +8887,7 @@ type accountSelectionOptions struct {
 	// selection callers that have no upstream success boundary.
 	pendingSessionCommit     *bool
 	pendingSessionMoveReason *accountMoveReason
+	placementReservation     **selectacct.PlacementReservation
 }
 
 // accountForSessionProviderWithOptions selects or reuses the account for a
@@ -9165,6 +9166,13 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			moveReason = accountMoveRetention
 		}
 	}
+	if options.placementReservation != nil && s.SchedulerRef != nil {
+		_, reservation, reserveErr := s.SchedulerRef.PickAndReserve(scheduler, SchedulerAccounts([]accounts.Account{account}))
+		if reserveErr != nil {
+			return accounts.Account{}, sessionID, userEmail, reserveErr
+		}
+		*options.placementReservation = reservation
+	}
 	if options.pendingSessionCommit != nil && previousAccountID != "" && previousAccountID != account.ID {
 		*options.pendingSessionCommit = true
 		if options.pendingSessionMoveReason != nil {
@@ -9176,6 +9184,10 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, moveReason, &scheduler, false)
 	assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
 	if err != nil {
+		if options.placementReservation != nil && *options.placementReservation != nil {
+			(*options.placementReservation).Release()
+			*options.placementReservation = nil
+		}
 		return accounts.Account{}, sessionID, userEmail, err
 	}
 	if moveReason == accountMoveCapacity && previousAccountID != "" {

@@ -17,6 +17,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 )
 
@@ -526,6 +527,7 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		r.Header.Set("X-Subrouter-Model", model)
 	}
 	var pendingSessionCommit bool
+	var placementReservation *selectacct.PlacementReservation
 	account, sessionKey, _, err := s.accountForSessionProviderWithOptions(
 		provider,
 		agentTypeForProviderSession(request.Agent, provider),
@@ -536,6 +538,7 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 			ignoreForcedAccount:  true,
 			oauthOnly:            provider == accounts.ProviderCodex,
 			pendingSessionCommit: &pendingSessionCommit,
+			placementReservation: &placementReservation,
 		},
 	)
 	if err != nil {
@@ -560,6 +563,10 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 	)
 	pendingSessionCommit = pendingSessionCommit || refreshPendingSessionCommit
 	if err != nil {
+		if placementReservation != nil {
+			placementReservation.Release()
+			placementReservation = nil
+		}
 		http.Error(w, "no account is available for the requested lease", http.StatusServiceUnavailable)
 		return
 	}
@@ -598,12 +605,19 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		lease, _, err = s.sessionLeases.putWithDisposition(template)
 	}
 	if err != nil {
+		if placementReservation != nil {
+			placementReservation.Release()
+			placementReservation = nil
+		}
 		if errors.Is(err, errSessionAssignmentChanged) {
 			http.Error(w, "session assignment changed; retry", http.StatusConflict)
 			return
 		}
 		http.Error(w, "create session lease", http.StatusInternalServerError)
 		return
+	}
+	if placementReservation != nil {
+		placementReservation.Commit()
 	}
 	writeSessionLeaseResponse(w, lease)
 }
