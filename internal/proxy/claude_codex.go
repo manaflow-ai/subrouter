@@ -463,6 +463,14 @@ func claudeCodexClientModel(model string) string {
 	if strings.TrimSpace(model) == "" {
 		return "gpt-6.1-sol"
 	}
+	switch model {
+	case "gpt-5.6-sol":
+		return "claude-codex-sol"
+	case "gpt-5.6-terra":
+		return "claude-codex-terra"
+	case "gpt-5.6-luna":
+		return "claude-codex-luna"
+	}
 	return model
 }
 
