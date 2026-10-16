@@ -55,13 +55,29 @@ This collection supplies evidence for a future measured calibration. It does
 not make the hourly token ledger sufficient for request-order replay, establish
 provider token weights, or authorize a token-based quota debit.
 
-To inspect an available private file from a checkout without credentials or
-network access:
+To inspect available private files from a checkout without credentials or
+network access (omit the rotated file if it does not exist):
 
 ```sh
-python3 -c 'import json,sys; r=json.loads(open(sys.argv[1]).readline()); print(r["purpose"], r["provider_observed_at"], r["counters_sampled_at"], r["limitations"])' usage-calibration/observations.jsonl
+python3 scripts/inspect-usage-calibration.py usage-calibration/observations.jsonl.1 usage-calibration/observations.jsonl --limit 10
 ```
 
-The result names `quota_token_calibration`, both capture times, and the
-limitations. Reading a service-owned file still requires local filesystem
-permission; this command does not grant access to another user's private data.
+The report gives interval counts, exclusion counts, and recent descriptive
+window/counter deltas with both capture times and uncertainty labels. It strips
+account keys and worker identifiers from output. Worker/generation changes,
+counter resets, reset-window changes, sequence/drop gaps and missing token
+usage exclude intervals. Gaps are checked across the whole worker sequence,
+including other accounts, so normal interleaved account observations are not
+mistaken for dropped records. Do not filter to one account before inspection.
+
+Schema 1 cannot establish complete demand coverage, so every interval remains
+ineligible for quota calibration. Cross-worker/generation counters and changed
+reset windows do not get fabricated comparable deltas. No weights are fitted.
+Reading a service-owned file still requires local filesystem permission; this
+command does not grant access to another user's private data.
+
+Reader checks run with:
+
+```sh
+python3 -m unittest discover -s scripts -p test_usage_calibration.py
+```
