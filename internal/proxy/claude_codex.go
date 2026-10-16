@@ -25,6 +25,7 @@ const (
 
 var claudeCodexModels = map[string]string{
 	"gpt-6.1-sol":           "gpt-6.1-sol",
+	"gpt-6.1-sol-ultrafast": "gpt-6.1-sol",
 	"gpt-6-astra":           "gpt-6-astra",
 	"gpt-6-astra-ultrafast": "gpt-6-astra",
 	"gpt-6-sol":             "gpt-6-sol",
@@ -466,7 +467,8 @@ func resolveClaudeCodexModel(model string) (string, error) {
 }
 
 func resolveClaudeCodexServiceTier(model string) string {
-	if strings.EqualFold(strings.TrimSpace(model), "gpt-6-astra-ultrafast") {
+	if strings.EqualFold(strings.TrimSpace(model), "gpt-6-astra-ultrafast") ||
+		strings.EqualFold(strings.TrimSpace(model), "gpt-6.1-sol-ultrafast") {
 		return "ultrafast"
 	}
 	return ""

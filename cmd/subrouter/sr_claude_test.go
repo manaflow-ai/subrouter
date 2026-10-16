@@ -2511,8 +2511,8 @@ func TestClaudeCodexHookArgsInstallPreCompactHook(t *testing.T) {
 		t.Fatalf("settings missing model picker replacement: %#v", settings["modelPicker"])
 	}
 	options, ok := picker["options"].([]any)
-	if !ok || len(options) != 9 {
-		t.Fatalf("model picker options = %#v, want 9", picker["options"])
+	if !ok || len(options) != 10 {
+		t.Fatalf("model picker options = %#v, want 10", picker["options"])
 	}
 	if got := claudeCodexHookArgs([]string{"--settings", "{}", "--resume", "session"}, "http://router.test"); len(got) != 4 || got[1] != "{}" {
 		t.Fatalf("explicit settings should win, got %#v", got)

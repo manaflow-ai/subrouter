@@ -159,7 +159,7 @@ func TestTranslateClaudeRequestAcceptsClaudeModelAliases(t *testing.T) {
 }
 
 func TestTranslateClaudeRequestRoutesAllCodexPickerModels(t *testing.T) {
-	models := []string{"gpt-6.1-sol", "gpt-6-astra", "gpt-6-astra-ultrafast", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"}
+	models := []string{"gpt-6.1-sol", "gpt-6.1-sol-ultrafast", "gpt-6-astra", "gpt-6-astra-ultrafast", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"}
 	for _, model := range models {
 		t.Run(model, func(t *testing.T) {
 			body := []byte(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hello"}]}`, model))
@@ -174,7 +174,7 @@ func TestTranslateClaudeRequestRoutesAllCodexPickerModels(t *testing.T) {
 			if payload["model"] == "" {
 				t.Fatalf("missing upstream model: %#v", payload)
 			}
-			if model == "gpt-6-astra-ultrafast" && payload["service_tier"] != "ultrafast" {
+			if strings.HasSuffix(model, "-ultrafast") && payload["service_tier"] != "ultrafast" {
 				t.Fatalf("service tier = %#v, want ultrafast", payload["service_tier"])
 			}
 		})

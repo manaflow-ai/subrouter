@@ -2646,6 +2646,7 @@ func claudeCodexCustomHeaders() (string, error) {
 func claudeCodexModelPickerOptions() []map[string]any {
 	return []map[string]any{
 		{"model": "gpt-6.1-sol", "label": "GPT-6.1-Sol", "description": "Latest workhorse model for coding and everyday work.", "behavesAs": "claude-opus-4-6"},
+		{"model": "gpt-6.1-sol-ultrafast", "label": "GPT-6.1-Sol · Ultrafast", "description": "GPT-6.1-Sol with the Ultrafast service tier.", "behavesAs": "claude-opus-4-6"},
 		{"model": "gpt-6-astra", "label": "GPT-6-Astra", "description": "Frontier intelligence for the most demanding work.", "behavesAs": "claude-opus-4-6"},
 		{"model": "gpt-6-astra-ultrafast", "label": "GPT-6-Astra · Ultrafast", "description": "GPT-6-Astra with the Ultrafast service tier.", "behavesAs": "claude-opus-4-6"},
 		{"model": "gpt-6-sol", "label": "GPT-6-Sol", "description": "Previous generation workhorse model.", "behavesAs": "claude-sonnet-4-6"},
