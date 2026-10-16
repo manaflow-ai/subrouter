@@ -169,9 +169,11 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 	var issuedAt, expiresAt time.Time
 	var leaseID string
 	var retryAt time.Time
+	var placement *selectacct.PlacementReservation
+	defer func() { placement.Release() }()
 	for attempts := 0; attempts < tenantCredentialLeaseIssueMaxAttempts; attempts++ {
 		var err error
-		account, generation, err = selectTenantCredentialLeaseAccount(
+		account, generation, placement, err = selectTenantCredentialLeaseAccount(
 			r.Context(), s, server, provider, authMode, input,
 		)
 		if err != nil {
@@ -197,6 +199,9 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 			http.Error(w, "credential lease unavailable", http.StatusInternalServerError)
 			return
 		}
+		if r.Context().Err() != nil {
+			return
+		}
 		lease := tenantCredentialLease{
 			accountID: account.ID, provider: schedulerAccountProvider(provider), authMode: account.AuthMode,
 			credentialIdentity: account.CredentialIdentity(),
@@ -209,12 +214,18 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 		if until, avoided := s.putIfEligible(
 			leaseID, lease, issuedAt, server.SchedulerRef,
 		); avoided {
+			placement.Release()
+			placement = nil
 			if retryAt.IsZero() || until.Before(retryAt) {
 				retryAt = until
 			}
 			leaseID = ""
 			continue
 		}
+		// A published credential lease is an offered placement, not measured
+		// token usage. Failed preparation and rejected publication debit none.
+		placement.Commit()
+		placement = nil
 		break
 	}
 	if leaseID == "" {
@@ -295,7 +306,7 @@ func selectTenantCredentialLeaseAccount(
 	provider accounts.Provider,
 	requiredAuthMode accounts.AuthMode,
 	input tenantCredentialLeaseRequest,
-) (accounts.Account, int, error) {
+) (accounts.Account, int, *selectacct.PlacementReservation, error) {
 	available, generation := server.accountListSnapshotContext(ctx)
 	if generation == 0 {
 		generation = 1
@@ -311,26 +322,34 @@ func selectTenantCredentialLeaseAccount(
 		available = filtered
 	}
 	if len(available) == 0 {
-		return accounts.Account{}, 0, fmt.Errorf("no %s accounts available", provider)
+		return accounts.Account{}, 0, nil, fmt.Errorf("no %s accounts available", provider)
 	}
 
 	tried := make(map[string]struct{}, len(available))
 	var retryAt time.Time
 	for len(tried) < len(available) {
-		account, err := pickTenantCredentialLeaseAccount(store, server, available, tried, input)
+		if ctx.Err() != nil {
+			return accounts.Account{}, 0, nil, ctx.Err()
+		}
+		account, placement, err := pickTenantCredentialLeaseAccount(ctx, store, server, available, tried, input)
 		if err != nil {
 			var allAvoided *tenantCredentialLeaseAllAvoidedError
 			if errors.As(err, &allAvoided) && !retryAt.IsZero() {
 				if allAvoided.retryAt.Before(retryAt) {
 					retryAt = allAvoided.retryAt
 				}
-				return accounts.Account{}, 0, &tenantCredentialLeaseAllAvoidedError{retryAt: retryAt}
+				return accounts.Account{}, 0, nil, &tenantCredentialLeaseAllAvoidedError{retryAt: retryAt}
 			}
-			return accounts.Account{}, 0, err
+			return accounts.Account{}, 0, nil, err
 		}
 		tried[account.ID] = struct{}{}
 		refreshed, err := server.refreshAccount(ctx, account)
+		if ctx.Err() != nil {
+			placement.Release()
+			return accounts.Account{}, 0, nil, ctx.Err()
+		}
 		if err != nil {
+			placement.Release()
 			server.markAccountExhaustedRefreshFailure(account, err)
 			if until, blocked := tenantCredentialLeaseTrustedBlockedUntil(
 				server, account, tenantCredentialLeasePoolModel(provider, input.Model, server.scheduler()), time.Now(),
@@ -340,6 +359,7 @@ func selectTenantCredentialLeaseAccount(
 			continue
 		}
 		if strings.TrimSpace(refreshed.Token) == "" {
+			placement.Release()
 			server.markAccountExhaustedCredentialForAccount(account)
 			if until, blocked := tenantCredentialLeaseTrustedBlockedUntil(
 				server, account, tenantCredentialLeasePoolModel(provider, input.Model, server.scheduler()), time.Now(),
@@ -355,6 +375,7 @@ func selectTenantCredentialLeaseAccount(
 		if store != nil {
 			model := tenantCredentialLeasePoolModel(provider, input.Model, server.scheduler())
 			if until, avoided := store.avoidanceUntil(input, refreshed, model, time.Now()); avoided {
+				placement.Release()
 				if retryAt.IsZero() || until.Before(retryAt) {
 					retryAt = until
 				}
@@ -364,24 +385,26 @@ func selectTenantCredentialLeaseAccount(
 		if server.Sessions != nil {
 			agentType := tenantCredentialLeaseAgentType(input, provider)
 			if _, err := server.Sessions.Put(agentType, input.SessionID, refreshed.ID, input.UserEmail); err != nil {
-				return accounts.Account{}, 0, &tenantCredentialLeasePersistenceError{err: err}
+				placement.Release()
+				return accounts.Account{}, 0, nil, &tenantCredentialLeasePersistenceError{err: err}
 			}
 		}
-		return refreshed, int(generation), nil
+		return refreshed, int(generation), placement, nil
 	}
 	if !retryAt.IsZero() {
-		return accounts.Account{}, 0, &tenantCredentialLeaseAllAvoidedError{retryAt: retryAt}
+		return accounts.Account{}, 0, nil, &tenantCredentialLeaseAllAvoidedError{retryAt: retryAt}
 	}
-	return accounts.Account{}, 0, fmt.Errorf("no usable %s credential", provider)
+	return accounts.Account{}, 0, nil, fmt.Errorf("no usable %s credential", provider)
 }
 
 func pickTenantCredentialLeaseAccount(
+	ctx context.Context,
 	store *tenantCredentialLeaseStore,
 	server *Server,
 	available []accounts.Account,
 	tried map[string]struct{},
 	input tenantCredentialLeaseRequest,
-) (accounts.Account, error) {
+) (accounts.Account, *selectacct.PlacementReservation, error) {
 	candidates := make([]accounts.Account, 0, len(available))
 	for _, candidate := range available {
 		if _, seen := tried[candidate.ID]; !seen {
@@ -389,7 +412,7 @@ func pickTenantCredentialLeaseAccount(
 		}
 	}
 	if len(candidates) == 0 {
-		return accounts.Account{}, errors.New("no untried credential accounts")
+		return accounts.Account{}, nil, errors.New("no untried credential accounts")
 	}
 	provider := accounts.Provider(input.Provider)
 	baseScheduler := server.scheduler()
@@ -428,29 +451,45 @@ func pickTenantCredentialLeaseAccount(
 		if retryAt.IsZero() {
 			retryAt = now.Add(tenantCredentialLeaseReportDefaultCooldown)
 		}
-		return accounts.Account{}, &tenantCredentialLeaseAllAvoidedError{retryAt: retryAt}
+		return accounts.Account{}, nil, &tenantCredentialLeaseAllAvoidedError{retryAt: retryAt}
 	}
 	candidates = eligible
+	// Keep explicit affinity decisions exactly as before. Flexible placement
+	// reserves across the entire eligible set atomically, before refresh or
+	// session persistence can stall and expose the same stale best account.
+	reserve := func(choices []accounts.Account) (accounts.Account, *selectacct.PlacementReservation, error) {
+		picked, placement, err := server.SchedulerRef.PickAndReserveContext(ctx, scheduler, SchedulerAccounts(choices))
+		if err != nil {
+			return accounts.Account{}, nil, err
+		}
+		for _, candidate := range choices {
+			if candidate.ID == picked.ID && accountProviderFor(candidate.Provider) == picked.Provider {
+				return candidate, placement, nil
+			}
+		}
+		placement.Release()
+		return accounts.Account{}, nil, fmt.Errorf("scheduler returned unknown account %q", picked.ID)
+	}
 	if input.ForceAccountID != "" {
 		if forced, ok := findAccount(candidates, input.ForceAccountID); ok {
-			return forced, nil
+			return reserve([]accounts.Account{forced})
 		}
-		return accounts.Account{}, fmt.Errorf("forced account %q is unavailable", input.ForceAccountID)
+		return accounts.Account{}, nil, fmt.Errorf("forced account %q is unavailable", input.ForceAccountID)
 	}
 	if server.Sessions != nil {
 		agentType := tenantCredentialLeaseAgentType(input, provider)
 		if assignment, ok := server.Sessions.Get(agentType, input.SessionID); ok {
 			if sticky, found := findAccount(candidates, assignment.AccountID); found {
-				return sticky, nil
+				return reserve([]accounts.Account{sticky})
 			}
 		}
 	}
 	if input.PreferAccountID != "" {
 		if preferred, ok := findAccount(candidates, input.PreferAccountID); ok {
-			return preferred, nil
+			return reserve([]accounts.Account{preferred})
 		}
 	}
-	return pickRoutingAccount(scheduler, candidates)
+	return reserve(candidates)
 }
 
 func tenantCredentialLeaseTrustedBlockedUntil(
