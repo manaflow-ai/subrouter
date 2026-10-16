@@ -167,6 +167,9 @@ type admissionBucket struct {
 	active    int
 	waiters   []*admissionWaiter
 	pausedTil time.Time
+	// changed wakes waiters that queued before a pause was applied, so they
+	// arm an expiry timer even if every active stream closes during the pause.
+	changed chan struct{}
 	// recoverSlowly applies only to non-quota Claude 429s. The ramp starts
 	// at pausedTil, so another throttle restarts it without shortening a pause.
 	recoverSlowly bool
@@ -271,6 +274,9 @@ func (a *admissionControl) bucketLocked(key admissionKey) *admissionBucket {
 	if bucket == nil {
 		bucket = &admissionBucket{}
 		a.buckets[key] = bucket
+	}
+	if bucket.changed == nil {
+		bucket.changed = make(chan struct{})
 	}
 	return bucket
 }
@@ -435,6 +441,7 @@ func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who
 				}
 			}
 		}
+		changed := bucket.changed
 		a.mu.Unlock()
 
 		var timer <-chan time.Time
@@ -470,6 +477,12 @@ func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who
 			return nil, ctx.Err()
 		case <-timer:
 			// Re-check both the pause and recovery ramp in FIFO order.
+		case <-changed:
+			if stop != nil {
+				stop()
+			}
+			// The deadline changed after this request queued. Arm the new
+			// timer even when no response remains in flight to wake us.
 		}
 	}
 }
@@ -629,6 +642,8 @@ func (a *admissionControl) pauseWithRecovery(key admissionKey, until time.Time, 
 		bucket.blocked += uint64(len(bucket.waiters))
 		bucket.waiters = nil
 	}
+	close(bucket.changed)
+	bucket.changed = make(chan struct{})
 	a.mu.Unlock()
 }
 
