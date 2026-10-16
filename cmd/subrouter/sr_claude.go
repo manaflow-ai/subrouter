@@ -2529,24 +2529,16 @@ func (r srRunner) claudeCodex(ctx context.Context, args []string) error {
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
 	}
-	launchArgs := claudeCodexHookArgs(claudeCodexArgs(args), serverURL)
+	customHeaders, err := claudeCodexCustomHeaders()
+	if err != nil {
+		return err
+	}
+	proxyToken := firstNonEmpty(strings.TrimSpace(server.TenantKey), "subrouter")
+	launchArgs := claudeCodexHookArgsWithEnv(claudeCodexArgs(args), serverURL, proxyToken, customHeaders)
 	cmd := exec.CommandContext(ctx, claudePath, launchArgs...)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	customHeaders := "X-Subrouter-Agent: claude-codex"
-	if accountID := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_ACCOUNT_ID")); accountID != "" {
-		if !validClaudeProxyAccountID(accountID) {
-			return fmt.Errorf("SUBROUTER_CODEX_ACCOUNT_ID is invalid")
-		}
-		customHeaders += "\nX-Subrouter-Account-ID: " + accountID
-	}
-	if userEmail := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_USER_EMAIL")); userEmail != "" {
-		customHeaders += "\nX-Subrouter-User-Email: " + userEmail
-	}
-	if sessionKey := strings.TrimSpace(os.Getenv(claudeProxySessionKeyEnv)); sessionKey != "" {
-		customHeaders += "\nX-Subrouter-Session: " + sessionKey
-	}
 	env := envWithoutSubrouterControl(os.Environ())
 	env = envWithout(env, claudeRoutingEnvKeys)
 	env = envWithoutPrefix(env, "ANTHROPIC_DEFAULT_")
@@ -2555,7 +2547,7 @@ func (r srRunner) claudeCodex(ctx context.Context, args []string) error {
 		// Claude Code resolves Messages requests as absolute /v1 paths, so the
 		// bridge is selected by X-Subrouter-Agent rather than a URL prefix.
 		"ANTHROPIC_BASE_URL="+strings.TrimRight(serverURL, "/"),
-		"ANTHROPIC_AUTH_TOKEN="+firstNonEmpty(strings.TrimSpace(server.TenantKey), "subrouter"),
+		"ANTHROPIC_AUTH_TOKEN="+proxyToken,
 		"ANTHROPIC_CUSTOM_HEADERS="+customHeaders,
 		"ANTHROPIC_DEFAULT_FABLE_MODEL=gpt-6.1-sol",
 		"ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-6",
@@ -2597,6 +2589,10 @@ func claudeCodexClientModelAlias(model string) string {
 }
 
 func claudeCodexHookArgs(args []string, serverURL string) []string {
+	return claudeCodexHookArgsWithEnv(args, serverURL, "subrouter", "X-Subrouter-Agent: claude-codex")
+}
+
+func claudeCodexHookArgsWithEnv(args []string, serverURL, proxyToken, customHeaders string) []string {
 	for _, arg := range args {
 		if arg == "--settings" || strings.HasPrefix(arg, "--settings=") {
 			return args
@@ -2608,6 +2604,11 @@ func claudeCodexHookArgs(args []string, serverURL string) []string {
 	}
 	hookCommand := shellQuote(executable) + " claude-codex-hook " + shellQuote(strings.TrimRight(serverURL, "/")+"/claude-codex/hooks/pre-compact")
 	settings, err := json.Marshal(map[string]any{
+		"env": map[string]string{
+			"ANTHROPIC_BASE_URL":       strings.TrimRight(serverURL, "/"),
+			"ANTHROPIC_AUTH_TOKEN":     proxyToken,
+			"ANTHROPIC_CUSTOM_HEADERS": customHeaders,
+		},
 		"hooks": map[string]any{
 			"PreCompact": []any{map[string]any{
 				"matcher": "",
@@ -2623,6 +2624,23 @@ func claudeCodexHookArgs(args []string, serverURL string) []string {
 		return args
 	}
 	return append([]string{"--settings", string(settings)}, args...)
+}
+
+func claudeCodexCustomHeaders() (string, error) {
+	customHeaders := "X-Subrouter-Agent: claude-codex"
+	if accountID := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_ACCOUNT_ID")); accountID != "" {
+		if !validClaudeProxyAccountID(accountID) {
+			return "", fmt.Errorf("SUBROUTER_CODEX_ACCOUNT_ID is invalid")
+		}
+		customHeaders += "\nX-Subrouter-Account-ID: " + accountID
+	}
+	if userEmail := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_USER_EMAIL")); userEmail != "" {
+		customHeaders += "\nX-Subrouter-User-Email: " + userEmail
+	}
+	if sessionKey := strings.TrimSpace(os.Getenv(claudeProxySessionKeyEnv)); sessionKey != "" {
+		customHeaders += "\nX-Subrouter-Session: " + sessionKey
+	}
+	return customHeaders, nil
 }
 
 func claudeCodexModelPickerOptions() []map[string]any {
