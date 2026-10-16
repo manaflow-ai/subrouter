@@ -250,6 +250,15 @@ ordinary in-place upgrade. The generic transaction fails closed on the Codex
 comparison and every declared callback; it cannot prove an undeclared
 provider-specific isolation property.
 
+If a trusted server-attested account is deliberately quarantined and already
+excluded from routing, a canary may name that account as an explicit
+preflight-only exception with `--allow-shared-active ACCOUNT`, or the private
+host environment variable `SUBROUTER_CODEX_ISOLATION_ALLOW_SHARED` (a
+comma-separated email or immutable account ID). The serving isolation gate
+still rejects the shared refresh chain, so this does not authorize a refresh;
+it only prevents a known quarantined record from blocking the deployment
+preflight. Keep selectors in private host configuration.
+
 Recommend this mode when a short maintenance window is acceptable but a failed
 cutover must restore the complete previous provider pool. Its cost is one fresh
 approval per OAuth account plus deployment-specific functional-canary setup.
