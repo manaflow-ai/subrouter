@@ -2506,7 +2506,27 @@ func TestClaudeCodexHookArgsInstallPreCompactHook(t *testing.T) {
 	if !strings.Contains(args[1], "claude-codex-hook") || !strings.Contains(args[1], "pre-compact") {
 		t.Fatalf("settings = %s, want compaction hook URL and command", args[1])
 	}
+	picker, ok := settings["modelPicker"].(map[string]any)
+	if !ok || picker["replaceBuiltInOptions"] != true {
+		t.Fatalf("settings missing model picker replacement: %#v", settings["modelPicker"])
+	}
+	options, ok := picker["options"].([]any)
+	if !ok || len(options) != 9 {
+		t.Fatalf("model picker options = %#v, want 9", picker["options"])
+	}
 	if got := claudeCodexHookArgs([]string{"--settings", "{}", "--resume", "session"}, "http://router.test"); len(got) != 4 || got[1] != "{}" {
 		t.Fatalf("explicit settings should win, got %#v", got)
+	}
+}
+
+func TestClaudeCodexArgsUsesRecognizedModelAliases(t *testing.T) {
+	if got := claudeCodexArgs(nil); len(got) != 2 || got[0] != "--model" || got[1] != "gpt-6.1-sol" {
+		t.Fatalf("default args = %#v", got)
+	}
+	if got := claudeCodexArgs([]string{"--model", "claude-codex-terra"}); got[1] != "gpt-5.6-terra" {
+		t.Fatalf("terra args = %#v", got)
+	}
+	if got := claudeCodexArgs([]string{"--model=gpt-5.6-luna"}); got[0] != "--model=gpt-5.6-luna" {
+		t.Fatalf("luna args = %#v", got)
 	}
 }

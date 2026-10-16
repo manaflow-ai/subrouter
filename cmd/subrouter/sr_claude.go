@@ -2534,6 +2534,19 @@ func (r srRunner) claudeCodex(ctx context.Context, args []string) error {
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
+	customHeaders := "X-Subrouter-Agent: claude-codex"
+	if accountID := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_ACCOUNT_ID")); accountID != "" {
+		if !validClaudeProxyAccountID(accountID) {
+			return fmt.Errorf("SUBROUTER_CODEX_ACCOUNT_ID is invalid")
+		}
+		customHeaders += "\nX-Subrouter-Account-ID: " + accountID
+	}
+	if userEmail := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_USER_EMAIL")); userEmail != "" {
+		customHeaders += "\nX-Subrouter-User-Email: " + userEmail
+	}
+	if sessionKey := strings.TrimSpace(os.Getenv(claudeProxySessionKeyEnv)); sessionKey != "" {
+		customHeaders += "\nX-Subrouter-Session: " + sessionKey
+	}
 	env := envWithoutSubrouterControl(os.Environ())
 	env = envWithout(env, claudeRoutingEnvKeys)
 	env = envWithoutPrefix(env, "ANTHROPIC_DEFAULT_")
@@ -2541,24 +2554,44 @@ func (r srRunner) claudeCodex(ctx context.Context, args []string) error {
 	env = append(env,
 		"ANTHROPIC_BASE_URL="+strings.TrimRight(serverURL, "/")+"/claude-codex",
 		"ANTHROPIC_AUTH_TOKEN="+firstNonEmpty(strings.TrimSpace(server.TenantKey), "subrouter"),
-		"ANTHROPIC_DEFAULT_FABLE_MODEL=claude-codex-sol",
-		"ANTHROPIC_DEFAULT_OPUS_MODEL=claude-codex-sol",
-		"ANTHROPIC_DEFAULT_SONNET_MODEL=claude-codex-terra",
-		"ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-codex-luna",
+		"ANTHROPIC_CUSTOM_HEADERS="+customHeaders,
+		"ANTHROPIC_DEFAULT_FABLE_MODEL=gpt-6.1-sol",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-6",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5",
 		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
 	)
 	cmd.Env = env
-	fmt.Fprintf(r.errOut, "Claude Code -> Codex Sol/Terra/Luna via Subrouter %s\n", serverURL)
+	fmt.Fprintf(r.errOut, "Claude Code -> Codex model picker via Subrouter %s (use /model and /effort)\n", serverURL)
 	return cmd.Run()
 }
 
 func claudeCodexArgs(args []string) []string {
-	for _, arg := range args {
-		if arg == "--model" || strings.HasPrefix(arg, "--model=") {
-			return args
+	out := append([]string(nil), args...)
+	for i, arg := range out {
+		if arg == "--model" && i+1 < len(out) {
+			out[i+1] = claudeCodexClientModelAlias(out[i+1])
+			return out
+		}
+		if strings.HasPrefix(arg, "--model=") {
+			out[i] = "--model=" + claudeCodexClientModelAlias(strings.TrimPrefix(arg, "--model="))
+			return out
 		}
 	}
-	return append([]string{"--model", "claude-codex-sol"}, args...)
+	return append([]string{"--model", "gpt-6.1-sol"}, out...)
+}
+
+func claudeCodexClientModelAlias(model string) string {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "claude-codex-sol":
+		return "gpt-5.6-sol"
+	case "claude-codex-terra":
+		return "gpt-5.6-terra"
+	case "claude-codex-luna":
+		return "gpt-5.6-luna"
+	default:
+		return model
+	}
 }
 
 func claudeCodexHookArgs(args []string, serverURL string) []string {
@@ -2579,11 +2612,29 @@ func claudeCodexHookArgs(args []string, serverURL string) []string {
 				"hooks":   []any{map[string]any{"type": "command", "command": hookCommand, "timeout": 10}},
 			}},
 		},
+		"modelPicker": map[string]any{
+			"replaceBuiltInOptions": true,
+			"options":               claudeCodexModelPickerOptions(),
+		},
 	})
 	if err != nil {
 		return args
 	}
 	return append([]string{"--settings", string(settings)}, args...)
+}
+
+func claudeCodexModelPickerOptions() []map[string]any {
+	return []map[string]any{
+		{"model": "gpt-6.1-sol", "label": "GPT-6.1-Sol", "description": "Latest workhorse model for coding and everyday work.", "behavesAs": "claude-opus-4-6"},
+		{"model": "gpt-6-astra", "label": "GPT-6-Astra", "description": "Frontier intelligence for the most demanding work.", "behavesAs": "claude-opus-4-6"},
+		{"model": "gpt-6-astra-ultrafast", "label": "GPT-6-Astra · Ultrafast", "description": "GPT-6-Astra with the Ultrafast service tier.", "behavesAs": "claude-opus-4-6"},
+		{"model": "gpt-6-sol", "label": "GPT-6-Sol", "description": "Previous generation workhorse model.", "behavesAs": "claude-sonnet-4-6"},
+		{"model": "gpt-6-luna", "label": "GPT-6-Luna", "description": "Fast and affordable model for easier tasks.", "behavesAs": "claude-haiku-4-5"},
+		{"model": "gpt-5.6-sol", "label": "GPT-5.6-Sol", "description": "Older workhorse model for coding.", "behavesAs": "claude-opus-4-6"},
+		{"model": "gpt-5.6-terra", "label": "GPT-5.6-Terra", "description": "Older balanced model for straightforward work.", "behavesAs": "claude-sonnet-4-6"},
+		{"model": "gpt-5.6-luna", "label": "GPT-5.6-Luna", "description": "Older fast and efficient model.", "behavesAs": "claude-haiku-4-5"},
+		{"model": "gpt-5.5", "label": "GPT-5.5", "description": "Legacy coding model.", "behavesAs": "claude-sonnet-4-6"},
+	}
 }
 
 func (r srRunner) claudeCodexHook(ctx context.Context, args []string) error {

@@ -19,17 +19,29 @@ import (
 
 const (
 	claudeCodexPrefix          = "/claude-codex"
-	claudeCodexModel           = "gpt-5.6-sol"
+	claudeCodexModel           = "gpt-6.1-sol"
 	claudeCodexReasoningEffort = "medium"
 )
 
 var claudeCodexModels = map[string]string{
-	"claude-codex-sol":   "gpt-5.6-sol",
-	"claude-codex-terra": "gpt-5.6-terra",
-	"claude-codex-luna":  "gpt-5.6-luna",
-	"gpt-5.6-sol":        "gpt-5.6-sol",
-	"gpt-5.6-terra":      "gpt-5.6-terra",
-	"gpt-5.6-luna":       "gpt-5.6-luna",
+	"gpt-6.1-sol":           "gpt-6.1-sol",
+	"gpt-6-astra":           "gpt-6-astra",
+	"gpt-6-astra-ultrafast": "gpt-6-astra",
+	"gpt-6-sol":             "gpt-6-sol",
+	"gpt-6-luna":            "gpt-6-luna",
+	"gpt-5.6-sol":           "gpt-5.6-sol",
+	"gpt-5.6-terra":         "gpt-5.6-terra",
+	"gpt-5.6-luna":          "gpt-5.6-luna",
+	"gpt-5.5":               "gpt-5.5",
+	"opus":                  "gpt-5.6-sol",
+	"sonnet":                "gpt-5.6-terra",
+	"haiku":                 "gpt-5.6-luna",
+	"claude-opus-4-6":       "gpt-5.6-sol",
+	"claude-sonnet-4-6":     "gpt-5.6-terra",
+	"claude-haiku-4-5":      "gpt-5.6-luna",
+	"claude-codex-sol":      "gpt-5.6-sol",
+	"claude-codex-terra":    "gpt-5.6-terra",
+	"claude-codex-luna":     "gpt-5.6-luna",
 }
 
 type claudeCodexCompactionHook struct {
@@ -179,6 +191,9 @@ func (s Server) serveClaudeCodex(w http.ResponseWriter, r *http.Request, agentTy
 	}
 	wsRequest["type"] = "response.create"
 	upstreamModel, _ := wsRequest["model"].(string)
+	if serviceTier := resolveClaudeCodexServiceTier(upstreamModel); serviceTier != "" {
+		wsRequest["service_tier"] = serviceTier
+	}
 	reasoning, _ := wsRequest["reasoning"].(map[string]any)
 	reasoningEffort, _ := reasoning["effort"].(string)
 	// Keep successive turns from one Claude Code conversation on the same
@@ -417,6 +432,9 @@ func translateClaudeRequest(body []byte) ([]byte, bool, error) {
 		"stream":              true,
 		"include":             []string{"reasoning.encrypted_content"},
 	}
+	if serviceTier := resolveClaudeCodexServiceTier(request.Model); serviceTier != "" {
+		payload["service_tier"] = serviceTier
+	}
 	if choice := translateClaudeToolChoice(request.ToolChoice); choice != nil {
 		payload["tool_choice"] = choice
 	}
@@ -434,15 +452,18 @@ func resolveClaudeCodexModel(model string) (string, error) {
 	return "", fmt.Errorf("unsupported Claude-Codex model %q; choose Sol, Terra, or Luna with /model", model)
 }
 
-func claudeCodexClientModel(model string) string {
-	switch model {
-	case "gpt-5.6-terra":
-		return "claude-codex-terra"
-	case "gpt-5.6-luna":
-		return "claude-codex-luna"
-	default:
-		return "claude-codex-sol"
+func resolveClaudeCodexServiceTier(model string) string {
+	if strings.EqualFold(strings.TrimSpace(model), "gpt-6-astra-ultrafast") {
+		return "ultrafast"
 	}
+	return ""
+}
+
+func claudeCodexClientModel(model string) string {
+	if strings.TrimSpace(model) == "" {
+		return "gpt-6.1-sol"
+	}
+	return model
 }
 
 func resolveClaudeCodexEffort(effort string) (string, error) {

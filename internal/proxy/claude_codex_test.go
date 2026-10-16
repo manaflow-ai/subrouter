@@ -43,8 +43,8 @@ func TestTranslateClaudeRequestUsesGPT56SolMediumAndTools(t *testing.T) {
 	if err := json.Unmarshal(translated, &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload["model"] != claudeCodexModel {
-		t.Fatalf("model = %v, want %s", payload["model"], claudeCodexModel)
+	if payload["model"] != "gpt-5.6-sol" {
+		t.Fatalf("model = %v, want gpt-5.6-sol", payload["model"])
 	}
 	reasoning, _ := payload["reasoning"].(map[string]any)
 	if reasoning["effort"] != claudeCodexReasoningEffort {
@@ -125,6 +125,57 @@ func TestTranslateClaudeRequestRoutesModelAndEffort(t *testing.T) {
 			}
 			if payload.Model != test.wantModel || payload.Reasoning.Effort != test.wantEffort {
 				t.Fatalf("route = %s/%s, want %s/%s", payload.Model, payload.Reasoning.Effort, test.wantModel, test.wantEffort)
+			}
+		})
+	}
+}
+
+func TestTranslateClaudeRequestAcceptsClaudeModelAliases(t *testing.T) {
+	for _, test := range []struct {
+		alias string
+		want  string
+	}{
+		{alias: "opus", want: "gpt-5.6-sol"},
+		{alias: "sonnet", want: "gpt-5.6-terra"},
+		{alias: "haiku", want: "gpt-5.6-luna"},
+	} {
+		t.Run(test.alias, func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hello"}]}`, test.alias))
+			translated, _, err := translateClaudeRequest(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload struct {
+				Model string `json:"model"`
+			}
+			if err := json.Unmarshal(translated, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.Model != test.want {
+				t.Fatalf("model = %q, want %q", payload.Model, test.want)
+			}
+		})
+	}
+}
+
+func TestTranslateClaudeRequestRoutesAllCodexPickerModels(t *testing.T) {
+	models := []string{"gpt-6.1-sol", "gpt-6-astra", "gpt-6-astra-ultrafast", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"}
+	for _, model := range models {
+		t.Run(model, func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hello"}]}`, model))
+			translated, _, err := translateClaudeRequest(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(translated, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["model"] == "" {
+				t.Fatalf("missing upstream model: %#v", payload)
+			}
+			if model == "gpt-6-astra-ultrafast" && payload["service_tier"] != "ultrafast" {
+				t.Fatalf("service tier = %#v, want ultrafast", payload["service_tier"])
 			}
 		})
 	}
@@ -303,7 +354,7 @@ func TestClaudeCodexBridgeRoutesThroughCodexOAuthAccount(t *testing.T) {
 	if upstreamAuth != "Bearer chatgpt-token" || upstreamAccount != "acct_pro" {
 		t.Fatalf("upstream auth/account = %q/%q", upstreamAuth, upstreamAccount)
 	}
-	if upstreamPayload["model"] != claudeCodexModel {
+	if upstreamPayload["model"] != "gpt-5.6-sol" {
 		t.Fatalf("upstream model = %v", upstreamPayload["model"])
 	}
 	if upstreamPayload["prompt_cache_key"] != "claude-codex:claude-session-1" {
@@ -320,7 +371,7 @@ func TestClaudeCodexBridgeRoutesThroughCodexOAuthAccount(t *testing.T) {
 	if err := json.Unmarshal(body, &message); err != nil {
 		t.Fatal(err)
 	}
-	if message["model"] != "claude-codex-sol" {
+	if message["model"] != claudeCodexModel {
 		t.Fatalf("Claude-facing model = %v", message["model"])
 	}
 }
