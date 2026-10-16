@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -548,6 +549,24 @@ func pickRoutingAccount(scheduler selectacct.Scheduler, candidates []accounts.Ac
 		}
 	}
 	return accounts.Account{}, fmt.Errorf("scheduler returned unknown account %q", picked.ID)
+}
+
+// pickAndReserveRoutingAccount keeps the original provider identity while the
+// scheduler atomically chooses from the complete, already-filtered candidate
+// pool and records the pending placement. Reserving only the winner after a
+// separate pick would leave concurrent callers choosing from stale live load.
+func pickAndReserveRoutingAccount(ctx context.Context, scheduler selectacct.Scheduler, ref *selectacct.SchedulerRef, candidates []accounts.Account) (accounts.Account, *selectacct.PlacementReservation, error) {
+	picked, reservation, err := ref.PickAndReserveContext(ctx, scheduler, SchedulerAccounts(candidates))
+	if err != nil {
+		return accounts.Account{}, nil, err
+	}
+	for _, candidate := range candidates {
+		if candidate.ID == picked.ID && accountProviderFor(candidate.Provider) == picked.Provider {
+			return candidate, reservation, nil
+		}
+	}
+	reservation.Release()
+	return accounts.Account{}, nil, fmt.Errorf("scheduler returned unknown account %q", picked.ID)
 }
 
 func schedulerAccountProvider(provider accounts.Provider) accounts.Provider {

@@ -9099,6 +9099,11 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		}
 	}
 
+	// A fresh lease reserves as part of its full-pool pick, before session
+	// persistence or credential preparation. Keep ownership local until the
+	// assignment tail hands it to the caller, releasing on every early error.
+	var placementReservation *selectacct.PlacementReservation
+	defer func() { placementReservation.Release() }()
 	var account accounts.Account
 	if picked == nil && options.preferredAccountID != "" {
 		preferred, ok := findAccount(availableAccounts, options.preferredAccountID)
@@ -9121,7 +9126,11 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			// reassignment decisions made above.
 			placementCandidates = claudeNewSessionCandidatesFromScores(base, scheduler, availableAccounts, poolModel)
 		}
-		account, err = pickRoutingAccount(scheduler, placementCandidates)
+		if previousAccountID == "" && options.placementReservation != nil && s.SchedulerRef != nil {
+			account, placementReservation, err = pickAndReserveRoutingAccount(r.Context(), scheduler, s.SchedulerRef, placementCandidates)
+		} else {
+			account, err = pickRoutingAccount(scheduler, placementCandidates)
+		}
 		if err != nil {
 			return accounts.Account{}, sessionID, userEmail, err
 		}
@@ -9131,6 +9140,10 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		if !ok {
 			return accounts.Account{}, sessionID, userEmail, s.poolExhaustedError(provider, availableAccounts, poolModel)
 		}
+		// Paid fallback may choose a different account. Its reservation must
+		// follow that account rather than leave load attached to the rejected pick.
+		placementReservation.Release()
+		placementReservation = nil
 		account = fallback
 	}
 	if account.AuthMode == accounts.AuthModeAPIKey && provider == accounts.ProviderClaude &&
@@ -9168,11 +9181,15 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		}
 	}
 	if options.placementReservation != nil && s.SchedulerRef != nil {
-		_, reservation, reserveErr := s.SchedulerRef.PickAndReserve(scheduler, SchedulerAccounts([]accounts.Account{account}))
-		if reserveErr != nil {
-			return accounts.Account{}, sessionID, userEmail, reserveErr
+		if placementReservation == nil {
+			_, reservation, reserveErr := s.SchedulerRef.PickAndReserveContext(r.Context(), scheduler, SchedulerAccounts([]accounts.Account{account}))
+			if reserveErr != nil {
+				return accounts.Account{}, sessionID, userEmail, reserveErr
+			}
+			placementReservation = reservation
 		}
-		*options.placementReservation = reservation
+		*options.placementReservation = placementReservation
+		placementReservation = nil // The caller now commits or releases it.
 	}
 	if options.pendingSessionCommit != nil && previousAccountID != "" && previousAccountID != account.ID {
 		*options.pendingSessionCommit = true
