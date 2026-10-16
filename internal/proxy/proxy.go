@@ -5730,11 +5730,11 @@ func (s Server) proxyHandler() http.Handler {
 		// touching the subscription pool. A non-2xx or unreachable Bedrock restores
 		// the body and falls through to the normal pool path (which still carries
 		// its own Bedrock/API-key fallback), so this never hard-fails Fable.
-		// ClaudeBedrockPrimary serves every Claude Messages call that is not
-		// pinned to an account, whatever its retry policy: Bedrock is one
+		// ClaudeBedrockPrimary serves every Claude Messages call, also one
+		// pinned to an account by sr and whatever its retry policy: Bedrock is one
 		// attempt, and the pool behind it may be switched off.
 		claudeBedrockPrimary := s.ClaudeBedrockPrimary && requestProvider == accounts.ProviderClaude &&
-			!forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
+			boundLease == nil && s.CredentialBroker == nil &&
 			r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
 		if (claudeBedrockPrimary || preferredAccountID == "" && s.FableBedrockPrimary && fableFallbackConfigured && claudeFableModel(requestModel)) && s.Bedrock != nil && s.Bedrock.configured() {
 			if s.serveRecorded(w, r, agentTypeForProviderSession(agentType, requestProvider), sessionID, "fable-bedrock-primary", s.serveClaudeFableBedrockPrimary) {

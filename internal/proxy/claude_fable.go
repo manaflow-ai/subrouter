@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -58,6 +59,17 @@ func (s Server) claudeFableRequest(r *http.Request) bool {
 // normal pool path (which keeps its own Bedrock/API-key fallback). This makes
 // Bedrock the primary Fable route without ever hard-failing when Bedrock is
 // throttled or unreachable.
+// writeAnthropicError writes an Anthropic-format error body.
+func writeAnthropicError(w http.ResponseWriter, status int, errorType, message string) {
+	body, _ := json.Marshal(map[string]any{
+		"type":  "error",
+		"error": map[string]string{"type": errorType, "message": message},
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
 func (s Server) serveClaudeFableBedrockPrimary(w http.ResponseWriter, r *http.Request) bool {
 	body, err := io.ReadAll(io.LimitReader(r.Body, replayablePostMaxBodyBytes))
 	if err != nil {
@@ -71,12 +83,23 @@ func (s Server) serveClaudeFableBedrockPrimary(w http.ResponseWriter, r *http.Re
 	resp, err := s.claudeFableBedrockResponse(r.Context(), body)
 	if err != nil {
 		if s.Logger != nil && r.Context().Err() == nil {
-			s.Logger.Warn("fable bedrock-primary request failed, falling through to pool", "error", err)
+			s.Logger.Warn("fable bedrock-primary request failed", "error", err, "surfaced", s.ClaudeBedrockPrimary)
+		}
+		if s.ClaudeBedrockPrimary {
+			// Bedrock is the Claude route, so its refusal is the answer;
+			// the pool behind it may be switched off and would only hide it.
+			writeAnthropicError(w, http.StatusServiceUnavailable, "overloaded_error", "subrouter Bedrock route unavailable: "+err.Error())
+			return true
 		}
 		restore()
 		return false
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if resp.StatusCode == http.StatusBadRequest && s.Logger != nil {
+		// Roles and block types only, no content: enough to add the next
+		// Bedrock shape rewrite.
+		s.Logger.Warn("claude bedrock 400 request shape", "shape", bedrockMessageShape(stripBedrockUnsupportedFields(body)))
+	}
+	if (resp.StatusCode < 200 || resp.StatusCode >= 300) && !s.ClaudeBedrockPrimary {
 		if s.Logger != nil {
 			s.Logger.Warn("fable bedrock-primary non-2xx, falling through to pool", "status", resp.StatusCode)
 		}
@@ -294,12 +317,24 @@ func stripBedrockUnsupportedFields(body []byte) []byte {
 		var messages []map[string]json.RawMessage
 		if json.Unmarshal(raw, &messages) == nil {
 			stripped := false
+			kept := messages[:0]
 			for _, message := range messages {
 				if _, ok := message["output_config"]; ok {
 					delete(message, "output_config")
 					stripped = true
 				}
+				content, contentChanged, keep := bedrockMessageContent(message)
+				if !keep {
+					stripped = true
+					continue
+				}
+				if contentChanged {
+					message["content"] = content
+					stripped = true
+				}
+				kept = append(kept, message)
 			}
+			messages = kept
 			if stripped {
 				if rebuilt, err := json.Marshal(messages); err == nil {
 					payload["messages"] = rebuilt
@@ -332,6 +367,114 @@ func stripBedrockUnsupportedFields(body []byte) []byte {
 		return rebuilt
 	}
 	return body
+}
+
+// bedrockMessageContent rewrites one message's content into a shape Bedrock
+// accepts. Anthropic takes a mid-conversation system message with string
+// content and "tool_addition" blocks; Bedrock refuses both ("system content
+// must contain at least one block", "Input tag 'tool_addition' ... does not
+// match"). keep is false for a system message with nothing left in it.
+func bedrockMessageContent(message map[string]json.RawMessage) (json.RawMessage, bool, bool) {
+	raw, ok := message["content"]
+	if !ok {
+		return nil, false, true
+	}
+	var role string
+	_ = json.Unmarshal(message["role"], &role)
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		if role != "system" {
+			return nil, false, true
+		}
+		if strings.TrimSpace(text) == "" {
+			return nil, false, false
+		}
+		blocks, err := json.Marshal([]map[string]string{{"type": "text", "text": text}})
+		if err != nil {
+			return nil, false, true
+		}
+		return blocks, true, true
+	}
+	var blocks []map[string]json.RawMessage
+	if json.Unmarshal(raw, &blocks) != nil {
+		return nil, false, true
+	}
+	changed := false
+	out := blocks[:0]
+	for _, block := range blocks {
+		var blockType string
+		_ = json.Unmarshal(block["type"], &blockType)
+		if blockType == "tool_addition" {
+			changed = true
+			continue
+		}
+		out = append(out, block)
+	}
+	if len(out) == 0 {
+		if role == "system" {
+			return nil, false, false
+		}
+		if !changed {
+			return nil, false, true
+		}
+		out = append(out, map[string]json.RawMessage{
+			"type": json.RawMessage(`"text"`),
+			"text": json.RawMessage(`"(tool list updated)"`),
+		})
+	}
+	if !changed {
+		return nil, false, true
+	}
+	rebuilt, err := json.Marshal(out)
+	if err != nil {
+		return nil, false, true
+	}
+	return rebuilt, true, true
+}
+
+// bedrockMessageShape lists each message's role and content block types.
+func bedrockMessageShape(body []byte) string {
+	var payload struct {
+		System   json.RawMessage `json:"system"`
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return "unparsed"
+	}
+	var b strings.Builder
+	b.WriteString("system=" + rawKind(payload.System))
+	for i, message := range payload.Messages {
+		fmt.Fprintf(&b, " %d:%s=%s", i, message.Role, rawKind(message.Content))
+		if b.Len() > 3000 {
+			b.WriteString(" ...")
+			break
+		}
+	}
+	return b.String()
+}
+
+func rawKind(raw json.RawMessage) string {
+	var blocks []struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &blocks) == nil {
+		types := make([]string, len(blocks))
+		for i, block := range blocks {
+			types[i] = block.Type
+		}
+		return "[" + strings.Join(types, ",") + "]"
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return fmt.Sprintf("string(%d)", len(text))
+	}
+	if len(raw) == 0 {
+		return "none"
+	}
+	return "other"
 }
 
 // bodyModel is the model a Messages request body names.
