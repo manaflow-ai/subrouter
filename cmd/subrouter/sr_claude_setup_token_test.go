@@ -71,7 +71,7 @@ func TestClaudeAddRequiresExplicitProfileName(t *testing.T) {
 		errOut:      &out,
 		verifyToken: func(context.Context, string) error { return nil },
 	}
-	err := runner.run(t.Context(), []string{"add"})
+	err := runner.run(t.Context(), []string{"add", "--setup-token"})
 	if err == nil || !strings.Contains(err.Error(), "profile name is required") {
 		t.Fatalf("add without name error = %v, want explicit profile-name error", err)
 	}
@@ -102,7 +102,7 @@ func readStoredClaudeCredential(t *testing.T, store claude.Store, name string) c
 	return raw.ClaudeAIOAuth
 }
 
-func TestClaudeAddDefaultsToSetupTokenAndRecordsExpiry(t *testing.T) {
+func TestClaudeAddSetupTokenRecordsExpiry(t *testing.T) {
 	root := t.TempDir()
 	// The account generation marker lives under <store>/accounts, so the ref
 	// must be opened on the same root the claude store publishes to.
@@ -142,7 +142,7 @@ func TestClaudeAddDefaultsToSetupTokenAndRecordsExpiry(t *testing.T) {
 			return nil
 		},
 	}
-	if err := runner.run(t.Context(), []string{"add", "work"}); err != nil {
+	if err := runner.run(t.Context(), []string{"add", "work", "--setup-token"}); err != nil {
 		t.Fatalf("add: %v\n%s", err, out.String())
 	}
 	if verified != testSetupToken {
@@ -287,14 +287,16 @@ func TestParseClaudeAddArgs(t *testing.T) {
 		want    claudeAddOptions
 		wantErr bool
 	}{
-		{nil, claudeAddOptions{}, false},
-		{[]string{"work"}, claudeAddOptions{name: "work"}, false},
+		// Browser OAuth is the default; only --setup-token or --token opt out.
+		{nil, claudeAddOptions{oauth: true}, false},
+		{[]string{"work"}, claudeAddOptions{name: "work", oauth: true}, false},
 		{[]string{"--token", "tok", "work"}, claudeAddOptions{name: "work", token: "tok"}, false},
 		{[]string{"work", "--token=tok"}, claudeAddOptions{name: "work", token: "tok"}, false},
 		{[]string{"--token", "-"}, claudeAddOptions{tokenFromStdin: true}, false},
 		{[]string{"--oauth", "work"}, claudeAddOptions{name: "work", oauth: true}, false},
-		{[]string{"--setup-token", "work"}, claudeAddOptions{name: "work"}, false},
+		{[]string{"--setup-token", "work"}, claudeAddOptions{name: "work", setupToken: true}, false},
 		{[]string{"--oauth", "--token", "tok"}, claudeAddOptions{}, true},
+		{[]string{"--oauth", "--setup-token"}, claudeAddOptions{}, true},
 		{[]string{"--token"}, claudeAddOptions{}, true},
 		{[]string{"a", "b"}, claudeAddOptions{}, true},
 		{[]string{"--bogus"}, claudeAddOptions{}, true},
@@ -321,13 +323,13 @@ func TestDisplayClaudeProfilesShowsSetupTokenExpiry(t *testing.T) {
 	if line := setupTokenStatusLine(claude.ProfileInfo{Name: "oauth", Credential: &oauth}, false, now); line != "" {
 		t.Fatalf("OAuth profile line = %q, want none", line)
 	}
-	if line := setupTokenStatusLine(claude.ProfileInfo{Name: "fresh", Credential: &fresh}, false, now); line != "setup token, expires 2027-09-02 (in 365 days)" {
+	if line := setupTokenStatusLine(claude.ProfileInfo{Name: "fresh", Credential: &fresh}, false, now); line != "setup token, expires 2027-09-02 (in 365 days); no plan or Opus/Sonnet usage (switch with: sr claude login fresh)" {
 		t.Fatalf("fresh line = %q", line)
 	}
-	if line := setupTokenStatusLine(claude.ProfileInfo{Name: "soon", Credential: &soon}, false, now); !strings.Contains(line, "expires 2026-09-12 (in 10 days)") || !strings.Contains(line, "sr add claude soon") {
+	if line := setupTokenStatusLine(claude.ProfileInfo{Name: "soon", Credential: &soon}, false, now); !strings.Contains(line, "expires 2026-09-12 (in 10 days)") || !strings.Contains(line, "sr claude login soon") {
 		t.Fatalf("soon line = %q", line)
 	}
-	if line := setupTokenStatusLine(claude.ProfileInfo{Name: "old", Credential: &expired}, false, now); !strings.Contains(line, "expired 2026-09-01") || !strings.Contains(line, "sr add claude old") {
+	if line := setupTokenStatusLine(claude.ProfileInfo{Name: "old", Credential: &expired}, false, now); !strings.Contains(line, "expired 2026-09-01") || !strings.Contains(line, "sr claude login old") {
 		t.Fatalf("expired line = %q", line)
 	}
 
@@ -341,7 +343,7 @@ func TestDisplayClaudeProfilesShowsSetupTokenExpiry(t *testing.T) {
 }
 
 func TestSRClaudeHelpDocumentsSetupTokenAndLogin(t *testing.T) {
-	for _, want := range []string{"sr add claude <name>", "setup token", "--token TOKEN|-", "--oauth", "sr claude login [name]"} {
+	for _, want := range []string{"sr add claude [name]", "--setup-token", "setup token", "--token TOKEN|-", "--oauth", "sr claude login [name]"} {
 		if !strings.Contains(srClaudeHelp, want) {
 			t.Errorf("help is missing %q", want)
 		}
