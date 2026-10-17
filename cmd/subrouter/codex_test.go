@@ -812,6 +812,19 @@ func TestCodexChildEnvMarksSubrouterResumeCommand(t *testing.T) {
 	}
 }
 
+func TestCodexChildEnvUsesSentinelForRemoteLaunch(t *testing.T) {
+	got := strings.Join(codexChildEnv([]string{
+		"A=1",
+		"SUBROUTER_CODEX_DUMMY_API_KEY=stale",
+	}, "", "sr"), "\n")
+	if !strings.Contains(got, "SUBROUTER_CODEX_DUMMY_API_KEY=subrouter") {
+		t.Fatalf("remote child did not receive the non-secret sentinel: %s", got)
+	}
+	if strings.Contains(got, "SUBROUTER_CODEX_DUMMY_API_KEY=stale") {
+		t.Fatalf("stale sentinel survived remote launch: %s", got)
+	}
+}
+
 func TestCodexChildEnvOnlyTrustsKnownLauncherAliases(t *testing.T) {
 	for _, test := range []struct {
 		launcher string

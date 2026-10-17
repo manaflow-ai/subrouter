@@ -454,13 +454,15 @@ func codexChildEnv(environ []string, localProxyToken, launcher string) []string 
 	launcher = trustedCodexLauncher(launcher)
 	environ = upsertEnv(environ, subrouterCodexLauncherEnv, launcher+" codex")
 	environ = upsertEnv(environ, subrouterCodexResumeCommandEnv, launcher+" codex resume")
-	if localProxyToken != "" {
-		environ = upsertEnv(
-			environ,
-			"SUBROUTER_CODEX_DUMMY_API_KEY",
-			localProxyToken,
-		)
+	// Codex requires an env-backed credential whenever the authoritative
+	// provider block selects env_key. A remote Subrouter launch has no local
+	// relay token, but still needs the non-secret sentinel so fresh and
+	// resumed cmux sessions do not fail before reaching the proxy.
+	dummyAPIKey := localProxyToken
+	if dummyAPIKey == "" {
+		dummyAPIKey = "subrouter"
 	}
+	environ = upsertEnv(environ, "SUBROUTER_CODEX_DUMMY_API_KEY", dummyAPIKey)
 	return environ
 }
 
