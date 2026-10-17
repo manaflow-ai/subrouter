@@ -219,9 +219,13 @@ func (t codexEgressFallbackTransport) RoundTrip(req *http.Request) (*http.Respon
 	// account, whatever the layers below switched to for the pool attempt.
 	addressed := t.attempt.current()
 	// A pinned session skips the pool that already failed it. Should every
-	// egress fail as well, the pool gets one more chance below.
+	// egress fail as well, the pool gets one more chance below. Both passes
+	// share one MaxAttempts budget, so a pinned session in a global shortage
+	// does not get twice the replays.
+	budget := t.server.CodexEgress.maxAttempts()
 	if pinned, found := t.server.codexEgressSessions.lookup(t.sessionKey); found {
-		response, err, served := t.tryEgress(req, addressed, pinned, true, "pinned")
+		response, err, served, used := t.tryEgress(req, addressed, pinned, true, budget, "pinned")
+		budget -= used
 		if served && !codexEgressAccountFailure(response) {
 			return response, err
 		}
@@ -252,7 +256,7 @@ func (t codexEgressFallbackTransport) RoundTrip(req *http.Request) (*http.Respon
 		reason = why
 	}
 	start := azureCodexEndpointIndex(t.sessionKey, len(transports))
-	fallback, fallbackErr, served := t.tryEgress(req, addressed, start, false, reason)
+	fallback, fallbackErr, served, _ := t.tryEgress(req, addressed, start, false, budget, reason)
 	if !served {
 		if retry, ok := t.server.codexFallbackRetryRequest(req, t.attempt, response); ok && !t.server.AzureCodex.configured() {
 			if response != nil && response.Body != nil {
@@ -271,21 +275,23 @@ func (t codexEgressFallbackTransport) RoundTrip(req *http.Request) (*http.Respon
 	return fallback, fallbackErr
 }
 
-// tryEgress replays the request through up to MaxAttempts egresses, healthy
+// tryEgress replays the request through up to `budget` egresses, healthy
 // ones first, walking the ring from `start` (first regardless when
 // keepStart). It reports served=true with the first response that is not a
 // pool failure, pinning the session to that egress. A response that fails
 // the same way is closed, the egress is marked cooling, and the next is tried.
-func (t codexEgressFallbackTransport) tryEgress(req *http.Request, addressed accounts.Account, start int, keepStart bool, reason string) (*http.Response, error, bool) {
+// used counts the replays sent.
+func (t codexEgressFallbackTransport) tryEgress(req *http.Request, addressed accounts.Account, start int, keepStart bool, budget int, reason string) (*http.Response, error, bool, int) {
 	transports := t.server.codexEgressTransports
 	count := len(transports)
-	if count == 0 {
-		return nil, nil, false
+	if count == 0 || budget <= 0 {
+		return nil, nil, false, 0
 	}
 	health := t.server.codexEgressHealth
+	used := 0
 	var lastResponse *http.Response
 	var lastErr error
-	for _, index := range health.order(count, start, t.server.CodexEgress.maxAttempts(), keepStart) {
+	for _, index := range health.order(count, start, budget, keepStart) {
 		if req.Context().Err() != nil {
 			break
 		}
@@ -297,12 +303,16 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, addressed acc
 		// The egress transports replace the wrapped base, so they need their
 		// own in-flight wrapper to count this physical attempt.
 		response, err := t.attempt.send(inflightAttemptTransport{base: transports[index], attempt: t.attempt}, replay, addressed)
+		used++
 		if lastResponse != nil && lastResponse.Body != nil {
 			_ = lastResponse.Body.Close()
 		}
 		lastResponse, lastErr = response, err
 		if err != nil {
-			health.failed(index)
+			// A client that went away is not the region's fault.
+			if req.Context().Err() == nil {
+				health.failed(index)
+			}
 			t.server.logCodexEgress("codex egress attempt failed", reason, egress, 0, err)
 			continue
 		}
@@ -324,7 +334,7 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, addressed acc
 				// 429-shaped account failure so the caller drops the pin
 				// and the usage-limit layers reroute it.
 				lastResponse = codexEgressQuotaAsStatus(replaced)
-				return lastResponse, nil, true
+				return lastResponse, nil, true, used
 			}
 		}
 		if capacity, replaced := codexCapacityBody(lastResponse); capacity {
@@ -336,18 +346,18 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, addressed acc
 		// Only pin a successful response. Auth, quota, redirects, and other
 		// non-2xx results belong to the account/pool layers above this one.
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			return response, nil, true
+			return response, nil, true, used
 		}
 		health.served(index)
 		t.server.codexEgressSessions.pin(t.sessionKey, index)
 		t.server.logCodexEgress("serving codex via regional egress", reason, egress, lastResponse.StatusCode, nil)
-		return lastResponse, nil, true
+		return lastResponse, nil, true, used
 	}
 	if lastResponse != nil && lastResponse.Body != nil {
 		_ = lastResponse.Body.Close()
 	}
 	_ = lastErr
-	return nil, nil, false
+	return nil, nil, false, used
 }
 
 func (s *Server) logCodexEgress(message, reason, egress string, status int, err error) {

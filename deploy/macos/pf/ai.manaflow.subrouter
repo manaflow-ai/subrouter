@@ -11,7 +11,8 @@
 #    inbound connections are stateful and bypass this via the inbound pass state.
 #    Tailscale MagicDNS (100.100.100.100:53) is exempted or the router loses DNS.
 #
-# Tables/macros are expanded by subrouter-pf.sh before loading.
+# The egress table is read from ai.manaflow.subrouter.egress next to this file
+# (one tailnet IPv4 per line); subrouter-pf.sh creates it empty when missing.
 
 table <subrouter_egress> persist file "/etc/pf.anchors/ai.manaflow.subrouter.egress"
 

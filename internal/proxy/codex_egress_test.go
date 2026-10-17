@@ -397,10 +397,46 @@ func TestCodexEgressSkipsCoolingRegionForNewSessions(t *testing.T) {
 			t.Fatalf("session %d: status=%d body=%s, want the Tokyo stream", index, status, body)
 		}
 	}
-	if fraCalls.Load() > 1 {
-		t.Fatalf("fra calls=%d, want at most the one that marked it cooling", fraCalls.Load())
+	if fraCalls.Load() != 1 {
+		t.Fatalf("fra calls=%d, want exactly the one that marked it cooling", fraCalls.Load())
 	}
 	if tyoCalls.Load() != 12 {
 		t.Fatalf("tyo calls=%d, want 12", tyoCalls.Load())
+	}
+}
+
+// A pinned session whose egress, pool and every other region fail shares one
+// budget across the pinned pass and the fallback pass.
+func TestCodexEgressPinnedSessionSharesAttemptBudget(t *testing.T) {
+	var shortage atomic.Bool
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if region := r.Header.Get(codexEgressHeader); region != "" && !shortage.Load() {
+			codexEgressWriteCompleted(w, region)
+			return
+		}
+		codexEgressWriteOverloaded(w)
+	}))
+	defer pool.Close()
+	poolURL, _ := url.Parse(pool.URL)
+	var calls atomic.Int32
+	proxies := make([]*url.URL, 0, 6)
+	for index := range 6 {
+		proxies = append(proxies, codexEgressTestProxy(t, fmt.Sprintf("region-%d", index), &calls))
+	}
+	server := codexEgressServer(t, poolURL, proxies, 1)
+	server.CodexEgress.MaxAttempts = 3
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	if status, body := codexEgressPost(t, proxy.URL, "session-budget"); status != http.StatusOK || !strings.Contains(body, "served-from-") {
+		t.Fatalf("first turn status=%d body=%s, want an egress stream that pins the session", status, body)
+	}
+	shortage.Store(true)
+	calls.Store(0)
+	if status, _ := codexEgressPost(t, proxy.URL, "session-budget"); status != http.StatusServiceUnavailable {
+		t.Fatalf("second turn status=%d, want the capacity failure", status)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("egress calls=%d, want 3 across both passes", calls.Load())
 	}
 }
