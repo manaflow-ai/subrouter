@@ -283,7 +283,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	path := "/model/" + modelID + "/" + endpoint
 	var resp *http.Response
 	// usedModel is the profile that served (for logs and cost); attemptModel
-	// is the attempt's own Model, which keys the throttle cool-down.
+	// keys the throttle cool-down (attemptCoolKey).
 	var sourceName, region, usedModel, attemptModel string
 	started := time.Now()
 	for attempt := 1; ; attempt++ {
@@ -293,7 +293,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		if err != nil {
 			return nil, err
 		}
-		sourceName, region, usedModel, attemptModel = served.Source.Name, served.Region, served.modelOr(modelID), served.Model
+		sourceName, region, usedModel, attemptModel = served.Source.Name, served.Region, served.modelOr(modelID), attemptCoolKey(served, path)
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if s.Logger != nil {
 				s.Logger.Warn("bedrock throttled", "model", usedModel, "path", path, "bedrock_source", sourceName, "region", region)
@@ -573,7 +573,7 @@ func (s Server) signAndForwardBedrockFrom(ctx context.Context, attempts []bedroc
 // An attempt with a Model sends that inference profile in the path.
 func (s Server) forwardBedrockAttempts(ctx context.Context, attempts []bedrockAttempt, method, basePath, rawQuery string, headers http.Header, body []byte) (*http.Response, bedrockAttempt, error) {
 	cfg := s.Bedrock
-	attempts = cfg.uncooledFirst(attempts)
+	attempts = cfg.uncooledFirst(attempts, basePath)
 	var firstErr error
 	for i, attempt := range attempts {
 		upstreamPath := bedrockPathWithModel(basePath, attempt.Model)
@@ -592,7 +592,19 @@ func (s Server) forwardBedrockAttempts(ctx context.Context, attempts []bedrockAt
 		// your request"): both are specific to this source's account/endpoint
 		// and another source may serve the request fine.
 		if resp.StatusCode == http.StatusTooManyRequests {
+			cfg.markThrottled(attempt.Region, attempt.Source.Name, attemptCoolKey(attempt, upstreamPath))
+		}
+		// Claude targets send different profiles to different regions, so a
+		// 403/404 (no model access, profile not offered from this source
+		// region) is specific to this target: try the next one and keep the
+		// target at the back while it cools down.
+		if attempt.Model != "" && (resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound) && i+1 < len(attempts) {
+			if s.Logger != nil {
+				s.Logger.Warn("bedrock target refused, trying next target", "bedrock_source", attempt.Source.Name, "region", attempt.Region, "model", attempt.Model, "status", resp.StatusCode)
+			}
 			cfg.markThrottled(attempt.Region, attempt.Source.Name, attempt.Model)
+			resp.Body.Close()
+			continue
 		}
 		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) && i+1 < len(attempts) {
 			if s.Logger != nil {
@@ -610,6 +622,16 @@ func (s Server) forwardBedrockAttempts(ctx context.Context, attempts []bedrockAt
 		return nil, bedrockAttempt{}, firstErr
 	}
 	return nil, bedrockAttempt{}, io.ErrUnexpectedEOF
+}
+
+// attemptCoolKey is the profile a cool-down is keyed on: the attempt's own
+// Claude target profile, else the model in the request path, so a gateway
+// throttle on one model does not reorder traffic for another.
+func attemptCoolKey(a bedrockAttempt, path string) string {
+	if a.Model != "" {
+		return a.Model
+	}
+	return bedrockModelFromPath(path)
 }
 
 func (a bedrockAttempt) modelOr(fallback string) string {
@@ -796,7 +818,7 @@ func (cfg *BedrockConfig) markThrottled(region, sourceName, model string) {
 // A stall retry can therefore go back to the pair that stalled when the
 // pair after it is cooling; a pair that throttled a moment ago is the worse
 // choice of the two.
-func (cfg *BedrockConfig) uncooledFirst(attempts []bedrockAttempt) []bedrockAttempt {
+func (cfg *BedrockConfig) uncooledFirst(attempts []bedrockAttempt, path string) []bedrockAttempt {
 	if len(attempts) <= 1 {
 		return attempts
 	}
@@ -805,7 +827,7 @@ func (cfg *BedrockConfig) uncooledFirst(attempts []bedrockAttempt) []bedrockAtte
 	cooling := make([]bool, len(attempts))
 	anyCooling := false
 	for i, attempt := range attempts {
-		key := bedrockAttemptKey{region: attempt.Region, source: attempt.Source.Name, model: attempt.Model}
+		key := bedrockAttemptKey{region: attempt.Region, source: attempt.Source.Name, model: attemptCoolKey(attempt, path)}
 		until, ok := cfg.coolingUntil[key]
 		if !ok {
 			continue

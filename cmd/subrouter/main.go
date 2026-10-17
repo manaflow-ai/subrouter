@@ -2085,6 +2085,9 @@ func parseClaudeBedrockTargets(spec string) ([]proxy.BedrockTarget, error) {
 		if !ok || region == "" || model == "" {
 			return nil, fmt.Errorf("entry %q is not region=profile", entry)
 		}
+		if err := claudeBedrockTargetFits(region, model); err != nil {
+			return nil, fmt.Errorf("entry %q: %w", entry, err)
+		}
 		t := proxy.BedrockTarget{Region: region, Model: model}
 		if seen[t] {
 			return nil, fmt.Errorf("entry %q repeats", entry)
@@ -2096,4 +2099,30 @@ func parseClaudeBedrockTargets(spec string) ([]proxy.BedrockTarget, error) {
 		return nil, errors.New("no region=profile entries")
 	}
 	return out, nil
+}
+
+// claudeBedrockTargetFits refuses a geo profile sent to a region outside its
+// geography (Bedrock answers that with a 400): us. only to us-/ca- regions,
+// eu. only to eu-, apac./jp./au. only to ap-. global. and bare model ids
+// go anywhere.
+func claudeBedrockTargetFits(region, model string) error {
+	prefixes := map[string][]string{
+		"us.":   {"us-", "ca-"},
+		"eu.":   {"eu-"},
+		"apac.": {"ap-"},
+		"jp.":   {"ap-"},
+		"au.":   {"ap-"},
+	}
+	for geo, regions := range prefixes {
+		if !strings.HasPrefix(model, geo) {
+			continue
+		}
+		for _, r := range regions {
+			if strings.HasPrefix(region, r) {
+				return nil
+			}
+		}
+		return fmt.Errorf("profile %s is not offered in %s", model, region)
+	}
+	return nil
 }
