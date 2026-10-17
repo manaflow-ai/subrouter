@@ -282,7 +282,9 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	}
 	path := "/model/" + modelID + "/" + endpoint
 	var resp *http.Response
-	var sourceName, region, usedModel string
+	// usedModel is the profile that served (for logs and cost); attemptModel
+	// is the attempt's own Model, which keys the throttle cool-down.
+	var sourceName, region, usedModel, attemptModel string
 	started := time.Now()
 	for attempt := 1; ; attempt++ {
 		started = time.Now()
@@ -291,7 +293,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		if err != nil {
 			return nil, err
 		}
-		sourceName, region, usedModel = served.Source.Name, served.Region, served.modelOr(modelID)
+		sourceName, region, usedModel, attemptModel = served.Source.Name, served.Region, served.modelOr(modelID), served.Model
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if s.Logger != nil {
 				s.Logger.Warn("bedrock throttled", "model", usedModel, "path", path, "bedrock_source", sourceName, "region", region)
@@ -401,7 +403,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		}
 		_ = resp.Body.Close()
 		if bedrockPeekThrottled(peek) {
-			cfg.markThrottled(region, sourceName, usedModel)
+			cfg.markThrottled(region, sourceName, attemptModel)
 		}
 		s.recordClaudeFableBedrockCost(started, region, usedModel, http.StatusServiceUnavailable, bedrockUsage{}, false)
 		if retryable && attempt < claudeFableBedrockStreamAttempts && bedrockRetryBackoff(ctx, attempt) {
