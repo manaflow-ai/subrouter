@@ -3,10 +3,12 @@ package accounts
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 type codexUsageTestTransport func(*http.Request) (*http.Response, error)
@@ -60,6 +62,38 @@ func TestFetchCodexUsageKeepsExplicitZeroAndReached(t *testing.T) {
 		} else if details.Windows[0].UsedPercent != 0 {
 			t.Fatalf("explicit zero utilization = %+v", details.Windows)
 		}
+	}
+}
+
+func TestFetchCodexUsageThrottlePreservesRetryAfter(t *testing.T) {
+	now := time.Now()
+	client := &http.Client{Transport: codexUsageTestTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429 Too Many Requests",
+			Header:     http.Header{"Retry-After": []string{"1800"}},
+			Body:       io.NopCloser(strings.NewReader(`{"type":"error"}`)),
+		}, nil
+	})}
+	_, err := FetchCodexUsageDetails(context.Background(), client, Account{AuthMode: AuthModeOAuth, Token: "test-token"})
+	var throttle *CodexUsageThrottleError
+	if !errors.As(err, &throttle) {
+		t.Fatalf("error = %v, want CodexUsageThrottleError", err)
+	}
+	if throttle.RetryAt.Before(now.Add(1799*time.Second)) || throttle.RetryAt.After(now.Add(1801*time.Second)) {
+		t.Fatalf("RetryAt = %s, want about 1800s after request", throttle.RetryAt)
+	}
+}
+
+func TestCodexUsageRetryAfterParsesHTTPDate(t *testing.T) {
+	now := time.Date(2030, time.January, 2, 3, 4, 5, 0, time.UTC)
+	want := now.Add(5 * time.Minute)
+	got := codexUsageRetryAfter(want.Format(http.TimeFormat), now)
+	if !got.Equal(want) {
+		t.Fatalf("RetryAt = %s, want %s", got, want)
+	}
+	if got := codexUsageRetryAfter("9223372036854775807", now); !got.After(now) {
+		t.Fatalf("overflowing Retry-After = %s, want a future saturated deadline", got)
 	}
 }
 

@@ -239,6 +239,48 @@ func TestUsageStatusRefreshChecksProviderAfterCachedThrottle(t *testing.T) {
 	}
 }
 
+func TestCodexUsageWindowsCacheHonorsRetryAfterAcrossRefreshes(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{
+		{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429 Too Many Requests",
+			Header:     http.Header{"Retry-After": []string{"1800"}},
+			Body:       io.NopCloser(strings.NewReader(`{"type":"error"}`)),
+		},
+		usageOKResponse(),
+	}}
+	ref := &AccountRef{client: &http.Client{Transport: transport}}
+	account := accounts.Account{ID: "codex@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "access-token"}
+	_, _, _, _, err := ref.FetchUsageWindowsCachedWithObservation(context.Background(), ref.client, account)
+	if err == nil || transport.calls != 1 {
+		t.Fatalf("initial Codex throttle: err=%v calls=%d", err, transport.calls)
+	}
+	ref.usageWindowsMu.Lock()
+	var retryAt time.Time
+	for _, failure := range ref.usageWindowsFailures {
+		retryAt = failure.retryAt
+		break
+	}
+	ref.usageWindowsMu.Unlock()
+	if retryAt.Before(time.Now().Add(1799 * time.Second)) {
+		t.Fatalf("Codex Retry-After deadline = %s, want at least 1800s", retryAt)
+	}
+	_, _, _, _, err = ref.FetchUsageWindowsCachedWithObservation(context.Background(), ref.client, account)
+	if err == nil || transport.calls != 1 {
+		t.Fatalf("Codex Retry-After was ignored: err=%v calls=%d", err, transport.calls)
+	}
+	ref.usageWindowsMu.Lock()
+	for key, failure := range ref.usageWindowsFailures {
+		failure.retryAt = time.Now().Add(-time.Second)
+		ref.usageWindowsFailures[key] = failure
+	}
+	ref.usageWindowsMu.Unlock()
+	windows, _, _, _, err := ref.FetchUsageWindowsCachedWithObservation(context.Background(), ref.client, account)
+	if err != nil || len(windows) == 0 || transport.calls != 2 {
+		t.Fatalf("Codex usage did not recover after cooldown: windows=%+v err=%v calls=%d", windows, err, transport.calls)
+	}
+}
+
 func TestUsageStatusThrottleSurvivesOAuthRefreshAndClearsOnReLogin(t *testing.T) {
 	transport := &usageRoundTripper{responses: []*http.Response{
 		{
