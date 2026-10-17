@@ -221,6 +221,7 @@ type Server struct {
 	CodexEgress           *CodexEgressConfig
 	codexEgressSessions   *azureCodexSticky
 	codexEgressTransports []http.RoundTripper
+	codexEgressHealth     *codexEgressHealth
 	// codexCapacity keeps per-account capacity history for the live failover
 	// policy and its diagnostics report.
 	codexCapacity         *codexCapacityStats
@@ -2918,6 +2919,9 @@ func (s Server) Handler() http.Handler {
 	}
 	if s.codexEgressTransports == nil {
 		s.codexEgressTransports = codexEgressTransports(s.CodexEgress)
+	}
+	if s.codexEgressHealth == nil && s.CodexEgress.configured() {
+		s.codexEgressHealth = newCodexEgressHealth(len(s.CodexEgress.Proxies))
 	}
 	if s.codexOverloadRerouteCounts == nil {
 		s.codexOverloadRerouteCounts = newCodexOverloadReroutes()
