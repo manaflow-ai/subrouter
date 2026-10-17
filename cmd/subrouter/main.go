@@ -423,6 +423,7 @@ func serve(args []string) error {
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
 	bedrockProfiles := flags.String("bedrock-profiles", "", "comma-separated AWS profiles for the Bedrock gateway; defaults to SUBROUTER_BEDROCK_PROFILES or discovered awN profiles")
 	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
+	claudeBedrockTargets := flags.String("claude-bedrock-targets", "", "ordered region=profile list the Claude Bedrock path tries (e.g. us-east-1=us.anthropic.claude-opus-5-5,eu-west-1=eu.anthropic.claude-opus-5-5); replaces --bedrock-region x --claude-bedrock-model for Claude calls only; the first profile is the default --claude-bedrock-model; defaults to SUBROUTER_CLAUDE_BEDROCK_TARGETS")
 	claudeBedrockModel := flags.String("claude-bedrock-model", "", "Bedrock inference profile that serves every Claude model the subscription pool cannot serve (needs --bedrock and --claude-bedrock-budget-url); defaults to SUBROUTER_CLAUDE_BEDROCK_MODEL; empty keeps the fallback Fable-only")
 	claudeBedrockBudgetURL := flags.String("claude-bedrock-budget-url", "", "spend ledger (GET, JSON remainingUsd) that must admit each Claude Bedrock call; bearer token from SUBROUTER_CLAUDE_BEDROCK_BUDGET_TOKEN_FILE; defaults to SUBROUTER_CLAUDE_BEDROCK_BUDGET_URL")
 	claudeBedrockBudgetReserve := flags.Float64("claude-bedrock-budget-reserve-usd", 500, "remaining ledger balance in USD below which Claude Bedrock calls stop")
@@ -833,6 +834,24 @@ func serve(args []string) error {
 	claudeBedrockModelID := strings.TrimSpace(*claudeBedrockModel)
 	if claudeBedrockModelID == "" {
 		claudeBedrockModelID = strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_BEDROCK_MODEL"))
+	}
+	targetsSpec := strings.TrimSpace(*claudeBedrockTargets)
+	if targetsSpec == "" {
+		targetsSpec = strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_BEDROCK_TARGETS"))
+	}
+	if targetsSpec != "" {
+		targets, err := parseClaudeBedrockTargets(targetsSpec)
+		if err != nil {
+			return fmt.Errorf("--claude-bedrock-targets: %w", err)
+		}
+		if bedrockConfig == nil {
+			return errors.New("--claude-bedrock-targets needs --bedrock")
+		}
+		bedrockConfig.ClaudeTargets = targets
+		if claudeBedrockModelID == "" {
+			claudeBedrockModelID = targets[0].Model
+		}
+		slog.Info("claude bedrock targets", "targets", targetsSpec)
 	}
 	budgetURL := strings.TrimSpace(*claudeBedrockBudgetURL)
 	if budgetURL == "" {
@@ -2048,4 +2067,33 @@ func (l *stringList) String() string { return strings.Join(*l, ",") }
 func (l *stringList) Set(value string) error {
 	*l = append(*l, value)
 	return nil
+}
+
+// parseClaudeBedrockTargets parses "region=profile,region=profile". Every
+// entry needs both parts; a repeated pair is an error, so a typo cannot
+// silently weight one pool.
+func parseClaudeBedrockTargets(spec string) ([]proxy.BedrockTarget, error) {
+	var out []proxy.BedrockTarget
+	seen := map[proxy.BedrockTarget]bool{}
+	for _, entry := range strings.Split(spec, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		region, model, ok := strings.Cut(entry, "=")
+		region, model = strings.TrimSpace(region), strings.TrimSpace(model)
+		if !ok || region == "" || model == "" {
+			return nil, fmt.Errorf("entry %q is not region=profile", entry)
+		}
+		t := proxy.BedrockTarget{Region: region, Model: model}
+		if seen[t] {
+			return nil, fmt.Errorf("entry %q repeats", entry)
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no region=profile entries")
+	}
+	return out, nil
 }
