@@ -10,6 +10,15 @@ set -eu
 STATE_DIR=/var/lib/tailscale
 HOSTNAME="fly-egress-${FLY_REGION:?FLY_REGION unset}"
 mkdir -p "$STATE_DIR" /var/run/tailscale
+# Move the bootstrap key into a file before any child inherits the env.
+AUTHKEY_FILE=""
+if [ -n "${TS_AUTHKEY:-}" ]; then
+  umask 077
+  printf '%s' "$TS_AUTHKEY" >/run/ts-authkey
+  AUTHKEY_FILE=/run/ts-authkey
+  umask 022
+fi
+unset TS_AUTHKEY
 
 tailscaled --state="$STATE_DIR/tailscaled.state" \
   --socket=/var/run/tailscale/tailscaled.sock --tun=tailscale0 &
@@ -21,13 +30,10 @@ until tailscale status --json >/dev/null 2>&1; do
   sleep 0.1
 done
 
-if [ -n "${TS_AUTHKEY:-}" ]; then
-  umask 077
-  printf '%s' "$TS_AUTHKEY" >/run/ts-authkey
-  unset TS_AUTHKEY
-  tailscale up --auth-key=file:/run/ts-authkey --hostname="$HOSTNAME" \
+if [ -n "$AUTHKEY_FILE" ]; then
+  tailscale up --auth-key="file:$AUTHKEY_FILE" --hostname="$HOSTNAME" \
     --advertise-tags=tag:egress --accept-dns=false --accept-routes=false
-  rm -f /run/ts-authkey
+  rm -f "$AUTHKEY_FILE"
 else
   tailscale up --hostname="$HOSTNAME" --advertise-tags=tag:egress \
     --accept-dns=false --accept-routes=false

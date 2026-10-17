@@ -10,6 +10,7 @@
 #   fly-egress.sh build                     build and push the image
 #   fly-egress.sh up REGION...              create missing machines (needs the
 #                                           TS_AUTHKEY app secret for new ones)
+#   fly-egress.sh update [REGION...]        move existing machines to $IMAGE
 #   fly-egress.sh status                    machines and tailnet nodes
 #   fly-egress.sh proxies                   SUBROUTER_CODEX_EGRESS_PROXIES value
 #                                           for every online fly-egress node
@@ -69,7 +70,7 @@ cmd_up() {
 # tsadmin so the caller needs no Tailscale API token of its own.
 egress_nodes() {
   tsadmin devices | jq -c '.devices[] | select((.tags // []) | index("tag:egress"))
-    | {name: (.name | split(".")[0]), ip: ([.addresses[] | select(test("^100\\."))][0]),
+    | {name: (.name | split(".")[0]), ip: ([.addresses[] | select(test("^100\\."))][0] // null),
        seen: .lastSeen, connected: (.connectedToControl // false)}'
 }
 
@@ -85,20 +86,30 @@ cmd_proxies() {
 }
 
 cmd_pf_hosts() {
-  egress_nodes | jq -r '.ip' | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n
+  egress_nodes | jq -r '.ip // empty' | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n
 }
 
 # Every online tag:egress node, GCP and Fly, as the worker's proxy list.
+# Session pins are stored as list indexes, so the order already on the router
+# is kept and new nodes are appended.
 all_proxies() {
-  egress_nodes | jq -rs '[.[] | select(.connected) | "http://\(.name):3128"] | sort | join(",")'
+  local current="$1"
+  egress_nodes | jq -rs --arg current "$current" '
+    ($current | split(",") | map(select(. != ""))) as $have
+    | ([.[] | select(.connected) | "http://\(.name):3128"] | sort) as $want
+    | ([$have[] | select(. as $p | $want | index($p))] + [$want[] | select(. as $p | $have | index($p) | not)])
+    | join(",")'
 }
 
 cmd_sync_router() {
   local dry=0
   [ "${1:-}" = "--dry-run" ] && dry=1
-  local hosts proxies
+  local hosts proxies current
+  ssh "$ROUTER_HOST" "sudo pfctl -a ai.manaflow.subrouter -sr 2>/dev/null" | grep -q '<subrouter_egress>' \
+    || die "the live pf anchor on $ROUTER_HOST does not use <subrouter_egress>; install deploy/macos/pf first"
+  current="$(ssh "$ROUTER_HOST" "sudo python3 -c 'import json; print(json.load(open(\"/var/lib/subrouter/worker-config.json\")).get(\"env\", {}).get(\"SUBROUTER_CODEX_EGRESS_PROXIES\", \"\"))'")"
   hosts="$(cmd_pf_hosts)"
-  proxies="$(all_proxies)"
+  proxies="$(all_proxies "$current")"
   [ -n "$hosts" ] && [ -n "$proxies" ] || die "no tag:egress nodes found"
   echo "pf table:"; echo "$hosts" | sed 's/^/  /'
   echo "SUBROUTER_CODEX_EGRESS_PROXIES=$proxies"
@@ -107,21 +118,32 @@ cmd_sync_router() {
   # reachable proxy the worker does not list is harmless.
   printf '%s\n' "$hosts" | ssh "$ROUTER_HOST" "sudo install -m 644 -o root -g wheel /dev/stdin $PF_TABLE_FILE \
     && sudo pfctl -a ai.manaflow.subrouter -t subrouter_egress -T replace -f $PF_TABLE_FILE"
-  ssh "$ROUTER_HOST" "sudo env PROXIES='$proxies' python3 - <<'PY'
+  if [ "$proxies" = "$current" ]; then
+    echo "fly-egress: worker config already lists these proxies"; return 0
+  fi
+  # The candidate is written by root into a fresh root-only directory, never a
+  # shared /tmp path another local user could pre-create.
+  ssh "$ROUTER_HOST" "dir=\$(sudo mktemp -d /var/lib/subrouter/.fly-egress.XXXXXX) || exit 1
+sudo env PROXIES='$proxies' OUT=\"\$dir/worker-config.json\" python3 - <<'PY' || { sudo rm -rf \"\$dir\"; exit 1; }
 import json, os
-live = '/var/lib/subrouter/worker-config.json'
-doc = json.load(open(live))
-env = doc.setdefault('env', {})
-if env.get('SUBROUTER_CODEX_EGRESS_PROXIES') == os.environ['PROXIES']:
-    raise SystemExit('worker config already lists these proxies')
-env['SUBROUTER_CODEX_EGRESS_PROXIES'] = os.environ['PROXIES']
-fd = os.open('/tmp/worker-config.fly-egress.json', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+doc = json.load(open('/var/lib/subrouter/worker-config.json'))
+doc.setdefault('env', {})['SUBROUTER_CODEX_EGRESS_PROXIES'] = os.environ['PROXIES']
+fd = os.open(os.environ['OUT'], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
 with os.fdopen(fd, 'w') as out:
     json.dump(doc, out, indent=2)
 PY
-[ -f /tmp/worker-config.fly-egress.json ] || exit 0
-sudo /usr/local/bin/subrouter-deploy.sh reconfigure /tmp/worker-config.fly-egress.json; rc=\$?
-sudo rm -f /tmp/worker-config.fly-egress.json; exit \$rc"
+sudo /usr/local/bin/subrouter-deploy.sh reconfigure \"\$dir/worker-config.json\"; rc=\$?
+sudo rm -rf \"\$dir\"; exit \$rc"
+}
+
+cmd_update() {
+  [ "$#" -gt 0 ] || set -- $ALL_REGIONS
+  for region in "$@"; do
+    id="$(machine_in_region "$region")"
+    [ -n "$id" ] || { echo "fly-egress: no machine in $region"; continue; }
+    fly machine update "$id" -a "$APP" --image "$IMAGE" --yes >/dev/null
+    echo "fly-egress: $region now runs $IMAGE"
+  done
 }
 
 cmd_destroy() {
@@ -136,6 +158,7 @@ cmd_destroy() {
 case "${1:-}" in
   build) shift; cmd_build "$@" ;;
   up) shift; cmd_up "$@" ;;
+  update) shift; cmd_update "$@" ;;
   status) shift; cmd_status "$@" ;;
   proxies) shift; cmd_proxies "$@" ;;
   pf-hosts) shift; cmd_pf_hosts "$@" ;;

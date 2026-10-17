@@ -9,6 +9,7 @@ set -u
 
 ANCHOR="ai.manaflow.subrouter"
 ANCHOR_FILE="/etc/pf.anchors/${ANCHOR}"
+EGRESS_FILE="${ANCHOR_FILE}.egress"
 
 log() { echo "subrouter-pf: $*"; }
 
@@ -16,6 +17,11 @@ if [ ! -f "${ANCHOR_FILE}" ]; then
   log "anchor file missing: ${ANCHOR_FILE} (nothing to load)"
   exit 0
 fi
+
+# The anchor's egress table reads this file. A missing file fails the whole
+# ruleset load below, which would leave the router port open to the LAN, so
+# an absent list means no egress, never no pf.
+[ -f "${EGRESS_FILE}" ] || install -m 644 -o root -g wheel /dev/null "${EGRESS_FILE}" 2>/dev/null || true
 
 # Enable pf if it is not already on. -E bumps a reference count and is safe to
 # call when pf is already enabled by something else.
