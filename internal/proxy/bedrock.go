@@ -44,8 +44,40 @@ type BedrockConfig struct {
 	CostLogPath string
 	// Bumper, when set, requests a Service Quotas increase when Bedrock throttles
 	// (HTTP 429), deduped per quota with a cooldown.
-	Bumper      *bedrockQuotaBumper
-	nextAttempt atomic.Uint64
+	Bumper *bedrockQuotaBumper
+	// ClaudeTargets, when set, is the ordered (region, inference profile)
+	// list the Claude Messages path tries instead of Regions with the one
+	// ClaudeBedrockModelID. Each geo profile has its own quota pool (us.*
+	// routes inside the US, eu.* inside the EU, global.* anywhere), so a
+	// list that spans pools keeps serving while one pool throttles. The
+	// /bedrock/* gateway keeps Regions and the client's model.
+	ClaudeTargets []BedrockTarget
+	// ThrottleCooldown is how long a region/source pair that answered a
+	// throttle is moved to the back of the attempt order, so new requests
+	// start on a pair that is not throttled. Zero uses
+	// defaultBedrockThrottleCooldown. A cooling pair is still tried, after
+	// the others, so one request still makes one full pass over every pair.
+	ThrottleCooldown time.Duration
+	nextAttempt      atomic.Uint64
+	coolingMu        sync.Mutex
+	coolingUntil     map[bedrockAttemptKey]time.Time
+}
+
+// defaultBedrockThrottleCooldown is short on purpose: the fable path keeps
+// steady traffic on the primary region for its prompt cache, so traffic must
+// go back to the primary soon after its throttle clears.
+const defaultBedrockThrottleCooldown = 30 * time.Second
+
+type bedrockAttemptKey struct {
+	region string
+	source string
+	model  string
+}
+
+// BedrockTarget is one region and the inference profile sent to it.
+type BedrockTarget struct {
+	Region string
+	Model  string
 }
 
 type BedrockCredentialSource struct {
@@ -59,6 +91,9 @@ const bedrockService = "bedrock"
 type bedrockAttempt struct {
 	Region string
 	Source BedrockCredentialSource
+	// Model, when set, replaces the model segment of the request path for
+	// this attempt (Claude targets).
+	Model string
 }
 
 func (s Server) bedrockHandler() http.Handler {
@@ -247,19 +282,23 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	}
 	path := "/model/" + modelID + "/" + endpoint
 	var resp *http.Response
-	var sourceName, region string
+	// usedModel is the profile that served (for logs and cost); attemptModel
+	// keys the throttle cool-down (attemptCoolKey).
+	var sourceName, region, usedModel, attemptModel string
 	started := time.Now()
 	for attempt := 1; ; attempt++ {
 		started = time.Now()
-		resp, sourceName, region, err = s.signAndForwardBedrock(ctx, attempt-1, http.MethodPost, path, newBody)
+		var served bedrockAttempt
+		resp, served, err = s.forwardBedrockAttempts(ctx, cfg.claudeAttempts(attempt-1), http.MethodPost, path, "", http.Header{"Content-Type": []string{"application/json"}}, newBody)
 		if err != nil {
 			return nil, err
 		}
+		sourceName, region, usedModel, attemptModel = served.Source.Name, served.Region, served.modelOr(modelID), attemptCoolKey(served, path)
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if s.Logger != nil {
-				s.Logger.Warn("bedrock throttled", "model", modelID, "path", path, "bedrock_source", sourceName, "region", region)
+				s.Logger.Warn("bedrock throttled", "model", usedModel, "path", path, "bedrock_source", sourceName, "region", region)
 			}
-			cfg.onThrottle(sourceName, region, modelID)
+			cfg.onThrottle(sourceName, region, usedModel)
 		}
 		if !stream || resp.StatusCode != http.StatusOK {
 			break
@@ -314,6 +353,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 			streamStarted := started
 			streamRegion := region
 			streamSource := sourceName
+			streamModel := usedModel
 			body := resp.Body
 			peeked := peek.peeked
 			commitReason := peek.commitReason
@@ -330,7 +370,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 				watchdog.stop()
 				_ = body.Close()
 				_ = pw.Close()
-				s.recordClaudeFableBedrockCost(streamStarted, streamRegion, http.StatusOK, result.Usage, result.HaveUsage)
+				s.recordClaudeFableBedrockCost(streamStarted, streamRegion, streamModel, http.StatusOK, result.Usage, result.HaveUsage)
 			}()
 			return &http.Response{
 				Status:        "200 OK",
@@ -362,7 +402,10 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 			s.Logger.Warn("claude-fable bedrock stream failed before content", attrs...)
 		}
 		_ = resp.Body.Close()
-		s.recordClaudeFableBedrockCost(started, region, http.StatusServiceUnavailable, bedrockUsage{}, false)
+		if bedrockPeekThrottled(peek) {
+			cfg.markThrottled(region, sourceName, attemptModel)
+		}
+		s.recordClaudeFableBedrockCost(started, region, usedModel, http.StatusServiceUnavailable, bedrockUsage{}, false)
 		if retryable && attempt < claudeFableBedrockStreamAttempts && bedrockRetryBackoff(ctx, attempt) {
 			// The next loop iteration passes a higher retry index to
 			// signAndForwardBedrock, so the retry starts one region/source
@@ -395,10 +438,10 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		if len(preview) > 512 {
 			preview = preview[:512]
 		}
-		s.Logger.Warn("claude-fable bedrock error response", "status", resp.StatusCode, "bedrock_source", sourceName, "region", region, "body", string(preview))
+		s.Logger.Warn("claude-fable bedrock error response", "status", resp.StatusCode, "bedrock_source", sourceName, "region", region, "model", usedModel, "body", string(preview))
 	}
 	usage, haveUsage := parseBedrockInvokeUsage(respBody)
-	s.recordClaudeFableBedrockCost(started, region, resp.StatusCode, usage, haveUsage)
+	s.recordClaudeFableBedrockCost(started, region, usedModel, resp.StatusCode, usage, haveUsage)
 	return &http.Response{
 		Status:        resp.Status,
 		StatusCode:    resp.StatusCode,
@@ -488,8 +531,10 @@ func stripBedrockUnsupportedTools(body []byte) ([]byte, int) {
 	return rebuilt, dropped
 }
 
-func (s Server) recordClaudeFableBedrockCost(started time.Time, region string, status int, usage bedrockUsage, haveUsage bool) {
-	modelID := s.claudeBedrockModelID()
+func (s Server) recordClaudeFableBedrockCost(started time.Time, region, modelID string, status int, usage bedrockUsage, haveUsage bool) {
+	if modelID == "" {
+		modelID = s.claudeBedrockModelID()
+	}
 	if haveUsage {
 		s.ClaudeBedrockBudget.Record(usage.costUSD(modelID))
 	}
@@ -511,20 +556,6 @@ func (s Server) recordClaudeFableBedrockCost(started time.Time, region string, s
 	appendBedrockCostRecord(cfg.CostLogPath, record)
 }
 
-// signAndForwardBedrock SigV4-signs a JSON body to bedrock-runtime and returns
-// the raw response plus the Bedrock source name that handled it. Used by the
-// fable path. retryIndex selects where the region/source order starts: 0 (a
-// request's first attempt) keeps the CONFIGURED order, so steady-state fable
-// traffic always lands on the primary region and its per-region prompt cache
-// (agent sessions carry huge cached contexts; splitting turns across regions
-// shatters that cache); 1+ (stream-stall retries) start one tuple further
-// along, so a retry escalates to a different region/source instead of
-// re-drawing from the endpoint that just stalled.
-func (s Server) signAndForwardBedrock(ctx context.Context, retryIndex int, method, upstreamPath string, body []byte) (*http.Response, string, string, error) {
-	headers := http.Header{"Content-Type": []string{"application/json"}}
-	return s.signAndForwardBedrockFrom(ctx, s.Bedrock.orderedAttempts(retryIndex), method, upstreamPath, "", headers, body)
-}
-
 // signAndForwardBedrockWithHeaders serves the /bedrock/* gateway path, which
 // keeps its round-robin start across region/source pairs to spread load and
 // per-account TPM.
@@ -533,9 +564,19 @@ func (s Server) signAndForwardBedrockWithHeaders(ctx context.Context, method, up
 }
 
 func (s Server) signAndForwardBedrockFrom(ctx context.Context, attempts []bedrockAttempt, method, upstreamPath, rawQuery string, headers http.Header, body []byte) (*http.Response, string, string, error) {
+	resp, served, err := s.forwardBedrockAttempts(ctx, attempts, method, upstreamPath, rawQuery, headers, body)
+	return resp, served.Source.Name, served.Region, err
+}
+
+// forwardBedrockAttempts tries each attempt in order (pairs in a throttle
+// cool-down last) and returns the response with the attempt that served it.
+// An attempt with a Model sends that inference profile in the path.
+func (s Server) forwardBedrockAttempts(ctx context.Context, attempts []bedrockAttempt, method, basePath, rawQuery string, headers http.Header, body []byte) (*http.Response, bedrockAttempt, error) {
 	cfg := s.Bedrock
+	attempts = cfg.uncooledFirst(attempts, basePath)
 	var firstErr error
 	for i, attempt := range attempts {
+		upstreamPath := bedrockPathWithModel(basePath, attempt.Model)
 		resp, err := s.signAndForwardBedrockWithSource(ctx, attempt.Source, attempt.Region, method, upstreamPath, rawQuery, headers, body)
 		if err != nil {
 			if firstErr == nil {
@@ -550,6 +591,21 @@ func (s Server) signAndForwardBedrockFrom(ctx context.Context, attempts []bedroc
 		// TPM) or a Bedrock-side 5xx (e.g. 503 "Bedrock is unable to process
 		// your request"): both are specific to this source's account/endpoint
 		// and another source may serve the request fine.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			cfg.markThrottled(attempt.Region, attempt.Source.Name, attemptCoolKey(attempt, upstreamPath))
+		}
+		// Claude targets send different profiles to different regions, so a
+		// 403/404 (no model access, profile not offered from this source
+		// region) is specific to this target: try the next one and keep the
+		// target at the back while it cools down.
+		if attempt.Model != "" && (resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound) && i+1 < len(attempts) {
+			if s.Logger != nil {
+				s.Logger.Warn("bedrock target refused, trying next target", "bedrock_source", attempt.Source.Name, "region", attempt.Region, "model", attempt.Model, "status", resp.StatusCode)
+			}
+			cfg.markThrottled(attempt.Region, attempt.Source.Name, attempt.Model)
+			resp.Body.Close()
+			continue
+		}
 		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) && i+1 < len(attempts) {
 			if s.Logger != nil {
 				s.Logger.Warn("bedrock source unusable, retrying next source", "bedrock_source", attempt.Source.Name, "region", attempt.Region, "path", upstreamPath, "status", resp.StatusCode)
@@ -560,12 +616,81 @@ func (s Server) signAndForwardBedrockFrom(ctx context.Context, attempts []bedroc
 			resp.Body.Close()
 			continue
 		}
-		return resp, attempt.Source.Name, attempt.Region, nil
+		return resp, attempt, nil
 	}
 	if firstErr != nil {
-		return nil, "", "", firstErr
+		return nil, bedrockAttempt{}, firstErr
 	}
-	return nil, "", "", io.ErrUnexpectedEOF
+	return nil, bedrockAttempt{}, io.ErrUnexpectedEOF
+}
+
+// attemptCoolKey is the profile a cool-down is keyed on: the attempt's own
+// Claude target profile, else the model in the request path, so a gateway
+// throttle on one model does not reorder traffic for another.
+func attemptCoolKey(a bedrockAttempt, path string) string {
+	if a.Model != "" {
+		return a.Model
+	}
+	return bedrockModelFromPath(path)
+}
+
+func (a bedrockAttempt) modelOr(fallback string) string {
+	if a.Model != "" {
+		return a.Model
+	}
+	return fallback
+}
+
+// bedrockPathWithModel replaces the model segment of /model/<id>/<op>.
+func bedrockPathWithModel(path, model string) string {
+	if model == "" {
+		return path
+	}
+	parts := strings.SplitN(strings.TrimPrefix(path, "/"), "/", 3)
+	if len(parts) < 2 || parts[0] != "model" {
+		return path
+	}
+	parts[1] = model
+	return "/" + strings.Join(parts, "/")
+}
+
+// claudeAttempts is the Claude Messages path's attempt order: ClaudeTargets
+// x sources when targets are set, else Regions x sources. start rotates the
+// order like orderedAttempts (0 keeps the configured order for the prompt
+// cache; a stall retry starts one further along).
+func (cfg *BedrockConfig) claudeAttempts(start int) []bedrockAttempt {
+	var targets []BedrockTarget
+	for _, t := range cfg.ClaudeTargets {
+		t.Region, t.Model = strings.TrimSpace(t.Region), strings.TrimSpace(t.Model)
+		if t.Region != "" && t.Model != "" {
+			targets = append(targets, t)
+		}
+	}
+	if len(targets) == 0 {
+		return cfg.orderedAttempts(start)
+	}
+	sources := cfg.sources()
+	if len(sources) == 0 {
+		return nil
+	}
+	attempts := make([]bedrockAttempt, 0, len(targets)*len(sources))
+	for _, t := range targets {
+		for _, source := range sources {
+			attempts = append(attempts, bedrockAttempt{Region: t.Region, Source: source, Model: t.Model})
+		}
+	}
+	return rotateBedrockAttempts(attempts, start)
+}
+
+func rotateBedrockAttempts(attempts []bedrockAttempt, start int) []bedrockAttempt {
+	if len(attempts) <= 1 || start%len(attempts) == 0 {
+		return attempts
+	}
+	start = start % len(attempts)
+	ordered := make([]bedrockAttempt, 0, len(attempts))
+	ordered = append(ordered, attempts[start:]...)
+	ordered = append(ordered, attempts[:start]...)
+	return ordered
 }
 
 func (s Server) signAndForwardBedrockWithSource(ctx context.Context, source BedrockCredentialSource, region, method, upstreamPath, rawQuery string, headers http.Header, body []byte) (*http.Response, error) {
@@ -661,19 +786,75 @@ func (cfg *BedrockConfig) orderedAttempts(start int) []bedrockAttempt {
 			attempts = append(attempts, bedrockAttempt{Region: region, Source: source})
 		}
 	}
-	if len(attempts) <= 1 || start%len(attempts) == 0 {
-		return attempts
-	}
-	start = start % len(attempts)
-	ordered := make([]bedrockAttempt, 0, len(attempts))
-	ordered = append(ordered, attempts[start:]...)
-	ordered = append(ordered, attempts[:start]...)
-	return ordered
+	return rotateBedrockAttempts(attempts, start)
 }
 
 // roundRobinAttempts rotates the start across calls (gateway path only).
 func (cfg *BedrockConfig) roundRobinAttempts() []bedrockAttempt {
 	return cfg.orderedAttempts(int(cfg.nextAttempt.Add(1) - 1))
+}
+
+func (cfg *BedrockConfig) throttleCooldown() time.Duration {
+	if cfg.ThrottleCooldown > 0 {
+		return cfg.ThrottleCooldown
+	}
+	return defaultBedrockThrottleCooldown
+}
+
+// markThrottled starts the cool-down of one region/source pair.
+func (cfg *BedrockConfig) markThrottled(region, sourceName, model string) {
+	cfg.coolingMu.Lock()
+	defer cfg.coolingMu.Unlock()
+	if cfg.coolingUntil == nil {
+		cfg.coolingUntil = make(map[bedrockAttemptKey]time.Time)
+	}
+	cfg.coolingUntil[bedrockAttemptKey{region: region, source: sourceName, model: model}] = time.Now().Add(cfg.throttleCooldown())
+}
+
+// uncooledFirst keeps the given order but moves every pair that is in its
+// throttle cool-down behind the pairs that are not. No pair is removed, so a
+// request still tries every pair once, and a 429 reaches the client only
+// after every pair throttled.
+// A stall retry can therefore go back to the pair that stalled when the
+// pair after it is cooling; a pair that throttled a moment ago is the worse
+// choice of the two.
+func (cfg *BedrockConfig) uncooledFirst(attempts []bedrockAttempt, path string) []bedrockAttempt {
+	if len(attempts) <= 1 {
+		return attempts
+	}
+	now := time.Now()
+	cfg.coolingMu.Lock()
+	cooling := make([]bool, len(attempts))
+	anyCooling := false
+	for i, attempt := range attempts {
+		key := bedrockAttemptKey{region: attempt.Region, source: attempt.Source.Name, model: attemptCoolKey(attempt, path)}
+		until, ok := cfg.coolingUntil[key]
+		if !ok {
+			continue
+		}
+		if now.Before(until) {
+			cooling[i] = true
+			anyCooling = true
+		} else {
+			delete(cfg.coolingUntil, key)
+		}
+	}
+	cfg.coolingMu.Unlock()
+	if !anyCooling {
+		return attempts
+	}
+	out := make([]bedrockAttempt, 0, len(attempts))
+	for i, attempt := range attempts {
+		if !cooling[i] {
+			out = append(out, attempt)
+		}
+	}
+	for i, attempt := range attempts {
+		if cooling[i] {
+			out = append(out, attempt)
+		}
+	}
+	return out
 }
 
 func (cfg *BedrockConfig) onThrottle(sourceName, region, model string) {
@@ -1074,6 +1255,22 @@ func peekBedrockStreamUntilCommit(src io.Reader) bedrockStreamPeek {
 // bedrockPeekFailureRetryable reports whether a fresh attempt may succeed:
 // transport errors, throttles, and capacity errors qualify; validation and
 // auth errors fail identically everywhere and do not.
+// bedrockPeekThrottled reports a throttle in the first stream frame, as a
+// Bedrock throttlingException or as an Anthropic rate_limit_error event.
+func bedrockPeekThrottled(peek bedrockStreamPeek) bool {
+	frame := peek.errorFrame
+	if strings.Contains(strings.ToLower(frame.exceptionType), "throttl") {
+		return true
+	}
+	var ev struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	return json.Unmarshal(frame.payload, &ev) == nil && ev.Type == "error" && ev.Error.Type == "rate_limit_error"
+}
+
 func bedrockPeekFailureRetryable(peek bedrockStreamPeek) bool {
 	if peek.outcome == bedrockPeekReadErr {
 		return true
