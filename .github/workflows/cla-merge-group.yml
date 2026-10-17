@@ -28,7 +28,7 @@ jobs:
   CLAMergeGroup:
     name: "CLA Assistant v3"
     if: github.repository == 'manaflow-ai/subrouter'
-    runs-on: ubuntu-24.04 # github-hosted-required: CLA policy jobs
+    runs-on: ubuntu-24.04 # runner-policy-exception: CLA policy jobs fail closed unless runner.environment is github-hosted
     timeout-minutes: 10
     permissions:
       actions: read # Read the native cla.yml run and job behind each check.
