@@ -345,3 +345,62 @@ func TestCodexEgressPinDropsOnUsageLimitAndFailsOverAccount(t *testing.T) {
 		t.Fatal("pin should be dropped after an account-level failure")
 	}
 }
+
+// With an egress in every region, a global capacity shortage must not walk
+// the whole ring in series: one request tries at most MaxAttempts regions.
+func TestCodexEgressCapsAttemptsPerRequest(t *testing.T) {
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		codexEgressWriteOverloaded(w)
+	}))
+	defer pool.Close()
+	poolURL, _ := url.Parse(pool.URL)
+	var calls atomic.Int32
+	proxies := make([]*url.URL, 0, 8)
+	for index := range 8 {
+		proxies = append(proxies, codexEgressTestProxy(t, fmt.Sprintf("region-%d", index), &calls))
+	}
+	server := codexEgressServer(t, poolURL, proxies, 1)
+	server.CodexEgress.MaxAttempts = 3
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	status, _ := codexEgressPost(t, proxy.URL, "session-cap")
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want the pool's capacity failure", status)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("egress calls=%d, want 3", calls.Load())
+	}
+}
+
+// A region that just failed for capacity is tried after the healthy ones, so
+// new sessions stop starting there while it cools.
+func TestCodexEgressSkipsCoolingRegionForNewSessions(t *testing.T) {
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if region := r.Header.Get(codexEgressHeader); region == "tyo" {
+			codexEgressWriteCompleted(w, region)
+			return
+		}
+		codexEgressWriteOverloaded(w)
+	}))
+	defer pool.Close()
+	poolURL, _ := url.Parse(pool.URL)
+	var fraCalls, tyoCalls atomic.Int32
+	fra := codexEgressTestProxy(t, "fra", &fraCalls)
+	tyo := codexEgressTestProxy(t, "tyo", &tyoCalls)
+	proxy := httptest.NewServer(codexEgressServer(t, poolURL, []*url.URL{fra, tyo}, 1).Handler())
+	defer proxy.Close()
+
+	for index := range 12 {
+		status, body := codexEgressPost(t, proxy.URL, fmt.Sprintf("session-cool-%d", index))
+		if status != http.StatusOK || !strings.Contains(body, "served-from-tyo") {
+			t.Fatalf("session %d: status=%d body=%s, want the Tokyo stream", index, status, body)
+		}
+	}
+	if fraCalls.Load() > 1 {
+		t.Fatalf("fra calls=%d, want at most the one that marked it cooling", fraCalls.Load())
+	}
+	if tyoCalls.Load() != 12 {
+		t.Fatalf("tyo calls=%d, want 12", tyoCalls.Load())
+	}
+}
