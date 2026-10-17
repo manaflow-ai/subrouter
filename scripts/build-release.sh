@@ -4,7 +4,15 @@ set -euo pipefail
 version="${1:-0.1.0}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out_dir="${root}/dist/release"
-commit="$(git -C "${root}" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+commit="$(git -C "${root}" rev-parse HEAD 2>/dev/null || echo unknown)"
+if [[ ! "${commit}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "cannot build a release without a full Git revision" >&2
+  exit 1
+fi
+if [[ -n "$(git -C "${root}" status --porcelain --untracked-files=all)" ]]; then
+  echo "refusing to build a release from a dirty checkout" >&2
+  exit 1
+fi
 build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 mainline="local-build"
 if git -C "${root}" show-ref --verify --quiet refs/remotes/origin/main && git -C "${root}" merge-base --is-ancestor "${commit}" origin/main 2>/dev/null; then mainline="origin/main"; fi
