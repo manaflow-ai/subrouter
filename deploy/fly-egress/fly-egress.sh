@@ -116,7 +116,7 @@ cmd_sync_router() {
   [ "$dry" -eq 1 ] && return 0
   # pf first: a proxy the worker cannot reach only wastes an attempt, but a
   # reachable proxy the worker does not list is harmless.
-  printf '%s\n' "$hosts" | ssh "$ROUTER_HOST" "sudo install -m 644 -o root -g wheel /dev/stdin $PF_TABLE_FILE \
+  printf '%s\n' "$hosts" | ssh "$ROUTER_HOST" "sudo sh -c 'umask 022; cat >$PF_TABLE_FILE.new && mv $PF_TABLE_FILE.new $PF_TABLE_FILE' \
     && sudo pfctl -a ai.manaflow.subrouter -t subrouter_egress -T replace -f $PF_TABLE_FILE"
   if [ "$proxies" = "$current" ]; then
     echo "fly-egress: worker config already lists these proxies"; return 0
