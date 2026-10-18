@@ -47,3 +47,26 @@ tailnet IP after the key is revoked.
 `SUBROUTER_CODEX_EGRESS_MAX_ATTEMPTS` (default 4) caps how many regions one
 request tries. A region that fails for capacity cools for one minute: new
 requests try healthy regions first, then cooling ones.
+
+## Region rotation and capacity tracking
+
+The router keeps health per (model, region): `local` is its own uplink, the
+rest are these egresses. A region that just answered a model with a capacity
+failure cools for a minute. Every retry (same-account ladder, account
+failover, transport replay) leaves from the next healthy region, websocket
+dials go through the egress too, and a new session skips a cooling local
+uplink. Responses carry `X-Subrouter-Region`.
+
+Every capacity failure is a line in `codex-capacity-events.jsonl` next to the
+session store (`attempt_failed` per region, then `absorbed`,
+`client_visible` or `failed_other` per request or turn). Summary:
+
+```bash
+ssh cmux-lawrence 'curl -sS http://127.0.0.1:31415/_subrouter/codex-capacity' | jq '.events, .regions'
+```
+
+Live test: `live-regions.py` sends real turns from loopback with
+`X-Subrouter-Test-Fault: capacity=<regions>`, which keeps those regions out of
+the request (nothing is synthesized and nothing is sent from them). Enable
+`SUBROUTER_CODEX_FAULT_INJECTION=1` with `subrouter-deploy.sh reconfigure`,
+run it on cmux-lawrence, then reconfigure again without it.
