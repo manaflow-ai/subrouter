@@ -444,6 +444,12 @@ type CodexCapacityReport struct {
 	// TaintRule states the pool-removal rule in words.
 	TaintRule string                      `json:"taint_rule"`
 	Accounts  []CodexCapacityAccountStats `json:"accounts"`
+	// Regions is per (model, region) health: local is the router's own
+	// uplink, the rest are regional egresses (codex_regions.go).
+	Regions []CodexRegionReport `json:"regions,omitempty"`
+	// Events counts capacity failures by outcome and region, with the
+	// recent client-visible ones (codex_capacity_events.go).
+	Events *CodexCapacityEventsReport `json:"events,omitempty"`
 }
 
 func (s *codexCapacityStats) snapshot(labels map[string]accounts.Account) CodexCapacityReport {
@@ -638,7 +644,10 @@ func (s Server) handleCodexCapacity(w http.ResponseWriter, r *http.Request) {
 	if s.codexCapacity == nil {
 		s.codexCapacity = newCodexCapacityStats()
 	}
-	writeJSON(w, s.codexCapacity.snapshot(labels))
+	report := s.codexCapacity.snapshot(labels)
+	report.Regions = s.codexRegions.snapshot()
+	report.Events = s.codexCapacityEvents.snapshot()
+	writeJSON(w, report)
 }
 
 // codexCapacitySwitchAvailable reports whether a Codex account other than

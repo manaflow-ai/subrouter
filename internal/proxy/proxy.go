@@ -209,10 +209,21 @@ type Server struct {
 	// same prompt cache. It never preempts the pool.
 	AzureCodex *AzureCodexConfig
 	// azureCodexSessions holds those pins.
-	azureCodexSessions    *azureCodexSticky
-	CodexEgress           *CodexEgressConfig
+	azureCodexSessions *azureCodexSticky
+	CodexEgress        *CodexEgressConfig
+	// CodexCapacityEventsPath is the JSONL file of Codex capacity events
+	// (codex_capacity_events.go). Empty keeps them in memory only.
+	CodexCapacityEventsPath string
+	// CodexFaultInjection honors X-Subrouter-Test-Fault from loopback
+	// (codex_regions.go). Off in production except for a live test.
+	CodexFaultInjection   bool
 	codexEgressSessions   *azureCodexSticky
 	codexEgressTransports []http.RoundTripper
+	codexRegions          *codexRegionHealth
+	// codexEgressWebSocketDialers are outboundWebSocketDialer through each
+	// egress, by proxy index.
+	codexEgressWebSocketDialers []*websocket.Dialer
+	codexCapacityEvents         *codexCapacityEventLog
 	// codexCapacity keeps per-account capacity history for the live failover
 	// policy and its diagnostics report.
 	codexCapacity         *codexCapacityStats
@@ -2906,6 +2917,15 @@ func (s Server) Handler() http.Handler {
 	}
 	if s.codexEgressTransports == nil {
 		s.codexEgressTransports = codexEgressTransports(s.CodexEgress)
+	}
+	if s.codexRegions == nil && s.CodexEgress.configured() {
+		s.codexRegions = newCodexRegionHealth(s.CodexEgress)
+	}
+	if s.codexEgressWebSocketDialers == nil {
+		s.codexEgressWebSocketDialers = codexEgressWebSocketDialers(s.CodexEgress)
+	}
+	if s.codexCapacityEvents == nil {
+		s.codexCapacityEvents = newCodexCapacityEventLog(s.CodexCapacityEventsPath)
 	}
 	if s.codexOverloadRerouteCounts == nil {
 		s.codexOverloadRerouteCounts = newCodexOverloadReroutes()
@@ -5636,6 +5656,7 @@ func (s Server) proxyHandler() http.Handler {
 			agentType = "codex-realtime"
 			sessionID += ":" + callID
 		}
+		r = s.withCodexFault(r)
 		routingRequest := r
 		if modelCatalogRequest && boundLease == nil {
 			var pinnedCatalogAccount string
@@ -5931,18 +5952,16 @@ func (s Server) proxyHandler() http.Handler {
 			var azureDivert func(model string) bool
 			if !realtimeSocket && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				requestProvider == accounts.ProviderCodex && s.CodexEgress.configured() {
-				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
-				if _, pinned := s.codexEgressSessions.lookup(key); pinned {
-					// Same contract as the Azure pin: 426 moves the session
-					// to the HTTP transport, where the egress pin applies.
-					http.Error(w, "codex session is pinned to a regional egress; retry over https", http.StatusUpgradeRequired)
-					return
+				// The dial itself goes out of the session's region: its pinned
+				// egress, else a region that is not cooling for the model.
+				if plan := s.planCodexWebSocketRegions(r.Context(), sessionAgentType, sessionID, retryPoolModel); plan != nil {
+					r = r.WithContext(withCodexWebSocketRegionPlan(r.Context(), plan))
 				}
 				// The divert parameter is named for Azure but any capacity
 				// divert fits: egress first, since it is the same model on
 				// the same account, then Azure.
 				azureDivert = func(model string) bool {
-					if s.codexEgressWebSocketDivert(sessionAgentType, sessionID) {
+					if s.codexEgressWebSocketDivert(sessionAgentType, sessionID, model) {
 						return true
 					}
 					if !autonomousRetry && s.AzureCodex.configured() {
@@ -6119,6 +6138,11 @@ func (s Server) proxyHandler() http.Handler {
 			}
 			codexEgressReady := !noRetry && s.CodexEgress.configured() &&
 				requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path)
+			// Region rotation and the capacity outcome record cover every
+			// Codex Responses request, with or without a fixed account.
+			layers.codexRegional = !noRetry && s.CodexEgress.configured() && requestProvider == accounts.ProviderCodex &&
+				azureCodexRequest(r.Method, r.URL.Path) && s.CredentialBroker == nil
+			layers.codexOutcome = layers.codexRegional
 			if codexEgressReady {
 				layers.codexEgress = &codexEgressFallbackTransport{
 					sessionKey: azureCodexSessionKeyFor(sessionAgentType, sessionID),
@@ -6139,6 +6163,9 @@ func (s Server) proxyHandler() http.Handler {
 					model: retryPoolModel, agent: sessionAgentType, session: sessionID, account: account.ID,
 					budget: requestRetryBudget, retriesPerPass: requestMaxAttempts - 1,
 				}
+			}
+			if layers.codexOutcome {
+				transport = codexCapacityOutcomeTransport{base: transport, attempt: attempt}
 			}
 		} else if (s.SchedulerRef != nil || s.admission != nil) && s.CredentialBroker == nil {
 			// Non-replayable requests bypass the retry stack, so give their
@@ -6615,7 +6642,12 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	r = r.WithContext(withTranscriptRequestID(r.Context(), transcriptRequestID))
 	s.recordWebSocketMeta(r, transcriptRequestID, upstreamURL, headers, agentType, sessionID, userEmail, account, upstream)
 
-	upstreamConn, response, err := outboundWebSocketDialer().Dial(upstreamURL.String(), headers)
+	regionPlan := codexWebSocketRegionPlanFrom(r.Context())
+	if regionPlan != nil && regionPlan.allFaulted {
+		http.Error(w, errCodexRegionsFaulted.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	upstreamConn, response, upstreamSlot, err := s.dialCodexWebSocket(r.Context(), regionPlan, upstreamURL.String(), headers)
 	if err != nil {
 		status := 502
 		if response != nil {
@@ -6633,6 +6665,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 				"session", sessionID,
 				"account", account.ID,
 				"upstream", upstreamURL.Host,
+				"region", s.codexRegions.name(upstreamSlot),
 				"path", upstreamURL.Path,
 				"status", status,
 				"error", err,
@@ -6658,6 +6691,8 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		return
 	}
 	link := newWebSocketUpstreamLink(upstreamConn)
+	link.setRegion(upstreamSlot)
+	link.regional = regionPlan != nil
 	defer link.close()
 	if response != nil && response.Body != nil {
 		defer response.Body.Close()
@@ -6667,6 +6702,9 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	responseHeader := http.Header{}
 	if response != nil {
 		responseHeader = cloneWebSocketResponseHeaders(response.Header)
+	}
+	if regionPlan != nil {
+		responseHeader.Set(codexRegionHeader, s.codexRegions.name(upstreamSlot))
 	}
 	clientConn, err := upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
@@ -6692,9 +6730,22 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		capacityRetryable:  r.Header.Get(CodexCapacityRetryableHeader) == "1",
 		autonomousRetrying: autonomousRetry && account.Provider == accounts.ProviderCodex,
 	}
-	if modelState.autonomousRetrying {
+	// A connection that could dial other regions retries a self-contained
+	// turn there behind the open socket, a few times, before falling back
+	// to the 1012 reconnect a non-autonomous client sees.
+	modelState.regionRetry = !modelState.autonomousRetrying && link.regional && !modelState.realtime &&
+		account.Provider == accounts.ProviderCodex
+	if modelState.autonomousRetrying || modelState.regionRetry {
+		regionKey := azureCodexSessionKeyFor(agentType, sessionID)
 		link.redial = func(ctx context.Context) (*websocket.Conn, error) {
-			conn, response, err := outboundWebSocketDialer().DialContext(ctx, upstreamURL.String(), headers)
+			slot := link.nextRedialSlot(s.codexRegions, webSocketTurnModel(modelState, compatibilityModel), codexFaultFrom(r.Context()), regionKey)
+			conn, response, err := s.codexWebSocketDialer(slot).DialContext(ctx, upstreamURL.String(), headers)
+			if err == nil {
+				link.setRegion(slot)
+			} else if response == nil && slot != codexRegionLocalSlot && ctx.Err() == nil {
+				s.codexRegions.note(webSocketTurnModel(modelState, compatibilityModel), slot, true)
+				link.markRegionTried(slot)
+			}
 			if response != nil && response.Body != nil {
 				_ = response.Body.Close()
 			}
@@ -6834,6 +6885,11 @@ type webSocketModelState struct {
 	// autonomousRetrying lets pooled launches keep pre-output capacity turns
 	// alive without consuming a server-side reconnect budget.
 	autonomousRetrying bool
+	// regionRetry lets a non-autonomous connection that can dial other
+	// regions retry a self-contained pre-output capacity turn in another
+	// region, up to codexWebSocketRegionRetries times per turn.
+	regionRetry       bool
+	regionRetriesUsed int
 	// pendingBodies parallels pending with each response.create's body, kept
 	// only on autonomous connections so a failed turn can be resent upstream
 	// without the client reconnecting.
@@ -6949,7 +7005,7 @@ func (s *webSocketModelState) observe(body []byte) {
 	}
 	s.pending = append(s.pending, model)
 	s.pendingTiers = append(s.pendingTiers, tier)
-	if s.autonomousRetrying {
+	if s.autonomousRetrying || s.regionRetry {
 		// The observed body is a pooled buffer released after forwarding.
 		s.pendingBodies = append(s.pendingBodies, bytes.Clone(body))
 	}
@@ -6996,6 +7052,7 @@ func (s *webSocketModelState) complete() {
 	s.outputForwarded = false
 	s.turnCapacityAccount = ""
 	s.turnCapacityFailures = 0
+	s.regionRetriesUsed = 0
 }
 
 // pendingCreate is the response.create of the turn in flight, nil when none
@@ -7014,7 +7071,40 @@ func (s *webSocketModelState) pendingCreate() []byte {
 func (s *webSocketModelState) turnRetryable() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.autonomousRetrying && len(s.pendingBodies) > 0 && !s.outputForwarded
+	if len(s.pendingBodies) == 0 || s.outputForwarded {
+		return false
+	}
+	if s.autonomousRetrying {
+		return true
+	}
+	return s.regionRetry && s.regionRetriesUsed < codexWebSocketRegionRetries &&
+		!codexWebSocketCreateChained(s.pendingBodies[0])
+}
+
+// codexWebSocketRegionRetries bounds the region retries of one turn on a
+// non-autonomous connection: its client did not opt into an open-ended wait.
+const codexWebSocketRegionRetries = 3
+
+// regionRetryLeft reports a non-autonomous region retry still in budget.
+func (s *webSocketModelState) regionRetryLeft() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.regionRetry && s.regionRetriesUsed < codexWebSocketRegionRetries
+}
+
+// spendRegionRetry takes one region retry of the turn in flight; false when
+// the connection is autonomous (no budget) or the budget is spent.
+func (s *webSocketModelState) spendRegionRetry() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.autonomousRetrying {
+		return true
+	}
+	if !s.regionRetry || s.regionRetriesUsed >= codexWebSocketRegionRetries {
+		return false
+	}
+	s.regionRetriesUsed++
+	return true
 }
 
 // codexWebSocketRequestServiceTier reads service_tier from a response.create
@@ -7095,10 +7185,24 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			if provider == accounts.ProviderCodex && !codexChatGPTModelUnsupportedJSON(body) {
 				failureClass = codexTurnFailureClass(body)
 			}
+			capacityEvent := func(outcome string, attempts int) {
+				s.recordCodexCapacityEvent(CodexCapacityEvent{
+					Transport: "websocket", Region: s.codexRegions.name(link.currentRegion()), Account: accountID,
+					Model: webSocketTurnModel(modelState, poolModel), Tier: modelState.currentTier(),
+					Reason: codexCapacityReason(body, "websocket"), Agent: agentType, Session: sessionID,
+					Outcome: outcome, Attempts: attempts,
+				})
+			}
 			if failureClass == codexFailureServer {
 				s.noteCodexSessionCapacityFailure(agentType, sessionID, accountID)
+				s.codexRegions.note(webSocketTurnModel(modelState, poolModel), link.currentRegion(), true)
+				capacityEvent(codexCapacityOutcomeAttempt, 0)
+				link.noteTurnCapacityFailure()
 			}
 			if failureClass != codexFailureNone && modelState.hasForwardedOutput() {
+				if failureClass == codexFailureServer {
+					capacityEvent(codexCapacityOutcomeClientVisible, link.takeTurnCapacityFailures())
+				}
 				// The client already has part of this response. Rerouting
 				// now would replay response.create elsewhere and duplicate
 				// that output, so the failure reaches the client as is. The
@@ -7147,7 +7251,10 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 						// it, so the 1012 reconnect lands on another account.
 						// Only an explicit capacity failure moves the session,
 						// and only when another account can take the model.
+						// A region retry still in budget comes first: it keeps the
+						// account (and its prompt cache) and moves only the region.
 						if s.CodexOverloadFailover.enabled() && codexCapacityFailureJSON(body) &&
+							!modelState.regionRetryLeft() &&
 							modelState.noteTurnCapacityFailure(accountID) > codexCapacitySameAccountRetries &&
 							s.codexCapacitySwitchAvailable(ctx, agentType, sessionID, accountID, model, tier) {
 							if s.Logger != nil {
@@ -7187,6 +7294,8 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 							return errCodexWebSocketCapacityRetry
 						}
 					}
+					// No layer took the turn: the failure goes to the client.
+					capacityEvent(codexCapacityOutcomeClientVisible, link.takeTurnCapacityFailures())
 				}
 			}
 			switch {
@@ -7216,6 +7325,23 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				modelState.noteUpstreamMessage(time.Now())
 				s.recordWebSocketTokenUsage(provider, accountID, modelState.usageSessionKey, modelState, poolModel, body)
 				if codexWebSocketResponseCompleted(body) {
+					region := link.currentRegion()
+					s.codexRegions.note(webSocketTurnModel(modelState, poolModel), region, false)
+					if failures := link.takeTurnCapacityFailures(); failures > 0 {
+						s.recordCodexCapacityEvent(CodexCapacityEvent{
+							Transport: "websocket", Region: s.codexRegions.name(region), Account: accountID,
+							Model: webSocketTurnModel(modelState, poolModel), Tier: modelState.currentTier(),
+							Agent: agentType, Session: sessionID, Outcome: codexCapacityOutcomeAbsorbed, Attempts: failures,
+						})
+					}
+					if link.regional && region == codexRegionLocalSlot {
+						// Served at home again: a leftover egress pin would only
+						// keep the next reconnect away from the closest region.
+						key := azureCodexSessionKeyFor(agentType, sessionID)
+						if _, pinned := s.codexEgressSessions.lookup(key); pinned {
+							s.codexEgressSessions.unpin(key)
+						}
+					}
 					s.clearAccountCapacity(accountID, webSocketTurnModel(modelState, poolModel))
 					s.noteCodexCapacitySuccess(accountID, azureCodexSessionKeyFor(agentType, sessionID))
 					s.noteCodexSessionCapacitySuccess(agentType, sessionID, accountID)
@@ -7223,19 +7349,33 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				}
 				if codexWebSocketResponseFinished(body) {
 					modelState.complete()
+					// A turn's capacity count ends with the turn.
+					link.takeTurnCapacityFailures()
 				}
 			}
 		}
 		return nil
 	}
 	toUpstream := direction == "client_to_upstream"
+	// reconnectVisible records a 1012 close that ends a turn which hit
+	// capacity: the client sees the turn fail and reconnects.
+	reconnectVisible := func() {
+		if failures := link.takeTurnCapacityFailures(); failures > 0 {
+			s.recordCodexCapacityEvent(CodexCapacityEvent{
+				Transport: "websocket", Region: s.codexRegions.name(link.currentRegion()), Account: accountID,
+				Model: webSocketTurnModel(modelState, poolModel), Tier: modelState.currentTier(),
+				Reason: "reconnect_1012", Agent: agentType, Session: sessionID,
+				Outcome: codexCapacityOutcomeClientVisible, Attempts: failures,
+			})
+		}
+	}
 	for {
 		src, dst := client, link.current()
 		openWriter := func(messageType int) (io.WriteCloser, error) { return link.openWriter(messageType) }
 		if !toUpstream {
 			src, dst = link.current(), client
 			openWriter = func(messageType int) (io.WriteCloser, error) {
-				if modelState.autonomousRetrying {
+				if modelState.autonomousRetrying || modelState.regionRetry {
 					return &bufferedWebSocketWriter{conn: client, messageType: messageType}, nil
 				}
 				return client.NextWriter(messageType)
@@ -7244,7 +7384,9 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 		err := s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, openWriter, observeMessage)
 		if err != nil {
 			if !toUpstream && provider == accounts.ProviderCodex &&
-				(errors.Is(err, errCodexWebSocketTurnRetry) || (modelState.turnRetryable() && webSocketUpstreamLost(err))) {
+				// A region retry covers capacity failures only: an upstream drop
+				// or refusal still reaches a non-autonomous client as before.
+				(errors.Is(err, errCodexWebSocketTurnRetry) || (modelState.autonomousRetrying && modelState.turnRetryable() && webSocketUpstreamLost(err))) {
 				// A failure event leaves the upstream socket usable; any
 				// other error here is the upstream (or client) going away.
 				if s.retryCodexWebSocketTurn(ctx, link, modelState, agentType, sessionID, accountID, errors.Is(err, errCodexWebSocketTurnRetry)) {
@@ -7255,18 +7397,22 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					return
 				default:
 				}
+				reconnectVisible()
 				closeWebSocketWithServiceRestart(dst, "codex capacity retry; reconnect")
 				return
 			}
 			if errors.Is(err, errAzureCodexWebSocketDivert) {
+				reconnectVisible()
 				closeWebSocketWithServiceRestart(dst, "codex pool is at capacity; reconnect")
 				return
 			}
 			if errors.Is(err, errCodexWebSocketReroute) {
+				reconnectVisible()
 				closeWebSocketWithServiceRestart(dst, "codex account exhausted; reconnect")
 				return
 			}
 			if errors.Is(err, errCodexWebSocketCapacityRetry) {
+				reconnectVisible()
 				closeWebSocketWithServiceRestart(dst, "codex capacity retry; reconnect")
 				return
 			}
@@ -10213,6 +10359,9 @@ func retryableResponsesPostRequest(r *http.Request) bool {
 	path := r.URL.Path
 	return path == "/responses" ||
 		path == "/v1/responses" ||
+		// A chatgpt_base_url client's /backend-api/codex/responses, after
+		// pathForUpstream strips /backend-api for an OAuth account.
+		path == "/codex/responses" ||
 		path == "/responses/compact" ||
 		path == "/v1/responses/compact" ||
 		// Codex's web-search backend. The body carries a query, so replaying it
