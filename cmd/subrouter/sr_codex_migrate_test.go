@@ -521,6 +521,81 @@ func TestCodexIsolationJSONCheckRejectsTrustedOriginSharingInteractiveChain(t *t
 	}
 }
 
+func TestCodexIsolationJSONCheckAllowsExplicitTrustedSharedActiveException(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.DefaultCodexStore()
+	auth := testCodexAuth("shared@example.com", "acct-shared")
+	auth.Tokens.RefreshToken = "shared-refresh"
+	if err := accounts.WriteActiveCodexAuth(auth); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:                 "shared@example.com",
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginServerAttested,
+		Auth:                  auth,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	err := runner.codexAccount(context.Background(), []string{
+		"isolation-check", "--json", "--allow-shared-active", "shared@example.com",
+	})
+	if err != nil {
+		t.Fatalf("check error = %v, want explicit exception to pass", err)
+	}
+	var result codexIsolationCheckResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("decode isolation result %q: %v", out.String(), err)
+	}
+	if !result.OK || result.AccountsRequiringMigration != 0 || result.AccountsAllowedShared != 1 {
+		t.Fatalf("check result = %#v", result)
+	}
+}
+
+func TestCodexIsolationJSONCheckReadsSharedActiveExceptionFromEnvironment(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(codexIsolationAllowSharedEnv, "acct-shared")
+	store := accounts.DefaultCodexStore()
+	auth := testCodexAuth("shared@example.com", "acct-shared")
+	auth.Tokens.RefreshToken = "shared-refresh"
+	if err := accounts.WriteActiveCodexAuth(auth); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:                 "shared@example.com",
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginServerAttested,
+		Auth:                  auth,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := runCodexIsolationJSONCheck(t, store)
+	if err != nil || !result.OK || result.AccountsAllowedShared != 1 {
+		t.Fatalf("check result = %#v, err=%v", result, err)
+	}
+}
+
+func TestCodexIsolationJSONCheckNeverAllowsUntrustedSharedActiveException(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(codexIsolationAllowSharedEnv, "legacy@example.com")
+	store := accounts.DefaultCodexStore()
+	auth := testCodexAuth("legacy@example.com", "acct-legacy")
+	auth.Tokens.RefreshToken = "shared-refresh"
+	if err := accounts.WriteActiveCodexAuth(auth); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveStored(accounts.StoredCodexAccount{Email: "legacy@example.com", Auth: auth}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := runCodexIsolationJSONCheck(t, store)
+	if !errors.Is(err, errCodexIsolationCheckFailed) || result.OK || result.AccountsRequiringMigration != 1 || result.AccountsAllowedShared != 0 {
+		t.Fatalf("check result = %#v, err=%v", result, err)
+	}
+}
+
 func TestCodexIsolationJSONCheckRemainsAvailableWithMalformedRoutingConfig(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	configPath := filepath.Join(t.TempDir(), "cloud.json")
@@ -669,6 +744,7 @@ func TestCodexIsolationComparisonFailsClosedAndDoesNotMutate(t *testing.T) {
 		wantDuplicateChains             int
 		wantCandidateDuplicateSelectors int
 		wantRetiringDuplicateSelectors  int
+		allowShared                     string
 	}{
 		{name: "zero inventory", wantRootsDistinct: true, wantStoreAnchored: true, wantStoresDistinct: true, wantOriginsTrusted: true},
 		{
@@ -698,6 +774,13 @@ func TestCodexIsolationComparisonFailsClosedAndDoesNotMutate(t *testing.T) {
 			setup: func(t *testing.T, candidate, retiring accounts.CodexStore) {
 				saveComparisonCodexAccount(t, candidate, "account-a", "shared-chain", accounts.CodexOAuthOriginIsolatedServerLogin)
 				saveComparisonCodexAccount(t, retiring, "account-a", "shared-chain", "")
+			},
+		},
+		{
+			name: "allowlisted trusted shared refresh chain", allowShared: "account-a", wantOK: true, wantCandidate: 1, wantRetiring: 1, wantInventory: true, wantRootsDistinct: true, wantStoreAnchored: true, wantStoresDistinct: true, wantOriginsTrusted: true,
+			setup: func(t *testing.T, candidate, retiring accounts.CodexStore) {
+				saveComparisonCodexAccount(t, candidate, "account-a", "shared-chain", accounts.CodexOAuthOriginServerAttested)
+				saveComparisonCodexAccount(t, retiring, "account-a", "shared-chain", accounts.CodexOAuthOriginServerAttested)
 			},
 		},
 		{
@@ -796,9 +879,11 @@ func TestCodexIsolationComparisonFailsClosedAndDoesNotMutate(t *testing.T) {
 
 			var output bytes.Buffer
 			runner := srRunner{store: candidateStore, out: &output, errOut: &output}
-			err := runner.codexAccount(context.Background(), []string{
-				"isolation-check", "--json", "--retiring-state-dir", retiringRoot,
-			})
+			args := []string{"isolation-check", "--json", "--retiring-state-dir", retiringRoot}
+			if test.allowShared != "" {
+				args = append(args, "--allow-shared-active", test.allowShared)
+			}
+			err := runner.codexAccount(context.Background(), args)
 			var result codexIsolationCheckResult
 			if decodeErr := json.Unmarshal(output.Bytes(), &result); decodeErr != nil {
 				t.Fatalf("decode comparison %q: %v", output.String(), decodeErr)

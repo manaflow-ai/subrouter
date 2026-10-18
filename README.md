@@ -21,7 +21,7 @@ A shared server autoupdates its worker. A laptop does not, so clients drift behi
 curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/deploy/macos/install-cli-autoupdate.sh | bash
 ```
 
-It installs a LaunchAgent that checks daily, compares the release tag against `~/.subrouter/cli-version`, and exits without downloading when they match. Updates go through `install.sh`, so the release checksum is verified, and a missing binary forces a reinstall even when the marker looks current. Logs land in `~/Library/Logs/subrouter-cli-autoupdate.log`. Remove it with `launchctl bootout gui/$(id -u)/ai.manaflow.subrouter-cli-autoupdate`.
+It installs a LaunchAgent that checks daily, compares the release tag against `~/.subrouter/cli-version`, and exits without downloading when they match. Updates go through `install.sh`, so the release checksum is verified, and a missing binary forces a reinstall even when the marker looks current. Once the installed `sr` has `sr update --auto`, the LaunchAgent hands each run to it instead (same checksum, plus a backup, an idle check, a health check and automatic restore; details in `~/.subrouter/logs/auto-update.log`); install.sh remains the path for older CLIs and for a daemon LaunchAgent that runs a different binary than `~/bin/subrouter`. A Mac that installed the LaunchAgent before this runs its own copy of the updater; rerun the command above to pick up the hand-over. Logs land in `~/Library/Logs/subrouter-cli-autoupdate.log`. Remove it with `launchctl bootout gui/$(id -u)/ai.manaflow.subrouter-cli-autoupdate`.
 
 ### GCP setup prompt
 
@@ -195,6 +195,7 @@ POST /_subrouter/account-status
 GET /_subrouter/account-import
 POST /_subrouter/account-import
 GET /_subrouter/usage-status
+GET /_subrouter/device-usage
 GET /_subrouter/sessions
 GET /_subrouter/dashboard
 GET /_subrouter/transcripts
@@ -215,6 +216,8 @@ When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to
 A server with neither credential configured rejects every account import, including `sr add`. That state is reported as `"account_import": "disabled"` by `/_subrouter/health` and logged as a warning at startup, and `sr doctor` runs the same preflight `sr add` runs against the selected server.
 
 Serving processes accept and refresh only Codex OAuth credentials created by an isolated Subrouter login. This keeps proxy refresh-token chains independent from interactive `~/.codex/auth.json`. After upgrading a local store that contains older accounts without provenance metadata, run `sr codex migrate-isolation` (or add `--device-auth`) once; it enumerates the affected accounts, requires each login to match the expected identity, and leaves the active Codex login unchanged. For a shared server use `sr server sync <name> --all`, or repair an individual hosted credential with `sr account repair <account-id>`. Complete this migration before starting the upgraded serving process: upgraded serving rejects affected credentials immediately rather than continuing to use them until their access tokens expire. `sr doctor` and `sr status` report the remaining local migration count without exposing credential material.
+
+Canary preflight has one explicit quarantine exception for a trusted server-attested account that is known to share the machine's interactive refresh chain but is already excluded from routing. Pass `--allow-shared-active ACCOUNT` to `sr codex isolation-check`, or set the host-local `SUBROUTER_CODEX_ISOLATION_ALLOW_SHARED` environment variable to a comma-separated account email or immutable account ID. This exception changes only the preflight result; serving still rejects the shared chain before refresh. Keep the selector in private host configuration and never commit it to a public repository.
 
 For a sensitive migration, choose one credential layout deliberately:
 
@@ -267,7 +270,21 @@ Transcript recording is off by default. To persist raw Subrouter transcripts, pa
 subrouter serve --transcripts ~/.subrouter/transcripts
 ```
 
-Transcripts are JSONL files keyed by agent type and session id under `by-agent/<agent-type>/by-session/<agent-session-id>.jsonl`. They include Subrouter metadata, redacted headers, HTTP/SSE body chunks, HTTP/SSE body summaries, and WebSocket message payloads as base64 with byte counts and SHA-256 hashes. Each event includes `agent_type` and `agent_session_id`; Codex events also include `codex_session_id` for matching `~/.codex/sessions` JSONL files. This is intentionally storage-heavy and can contain sensitive request/response payloads. Authorization-style headers are redacted, but bodies are stored in full.
+To keep every model call without local disk, stream transcripts to an Azure blob container instead: `--transcript-azure-container-url https://<account>.blob.core.windows.net/<container>` (or `SUBROUTER_TRANSCRIPT_AZURE_CONTAINER_URL`) with a create+write SAS in `SUBROUTER_TRANSCRIPT_AZURE_SAS_FILE` (or an account key in `SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE`). When both are set the recorder and `recompress` use the SAS (the key variables are shared with the raw-file syncer and may name another account), and `export`/`verify` use the key. The SAS never needs read, list or delete: every blob name is new.
+
+- **Bodies.** Each agent session gets a segment blob, `bodies/v1/YYYY/MM/DD/HH/<host>/<agent>/<session>/<segment>.zst`: JSON lines of events in independent zstd frames (16 MiB of events each, best level) followed by a seekable-format seek table, staged as 4 MiB blocks while the session runs and committed after 15 idle minutes, one hour, or 256 MiB compressed. Each block carries its Content-MD5, which the service checks; each frame is decoded and compared before it is staged. Bodies are text when they are UTF-8; a request body is a `delta` (copy and insert operations) against one of the session's previous bodies whenever that is smaller, proven to rebuild before it is written, with chains capped at 48 so one call never needs more than that; compressed request bodies (Codex sends zstd) are stored decoded with their encoding and wire SHA-256. Every body carries its SHA-256.
+- **Index.** Every model call is one JSON row in `index/v1/YYYY/MM/DD/HH/<host>-<pid>-<n>.jsonl.zst`, written every ten minutes once the segments it points into are committed: time, `client_node`/`client_user`/`client_ip` (tailnet whois, resolved on the writer goroutine and cached; `unknown` when unresolvable), agent, session, provider, upstream, route (`fable-bedrock-primary`, `fable-fallback`, `azure-codex`), `served_by` (from response headers: `bedrock`, `azure`, `anthropic`, `openai`), account and serving account, model, method, path, status, ttfb and duration, input/cached/cache-write/output/reasoning tokens (input is the whole prompt), stop reason, the client's own session and turn ids from its headers (`client_session_id`, `client_turn_id`, for joining to local Claude Code and Codex trajectories) and `session_grouping` (`fallback` when the request named no session), the requested reasoning settings (`thinking_type`, `thinking_display`, `thinking_budget_tokens`, `reasoning_effort`, `reasoning_summary`) and where the response's reasoning went (`thinking_blocks`, visible `thinking_chars`, `thinking_signature_bytes`, `redacted_thinking_bytes`, `reasoning_encrypted_bytes`, `reasoning_summary_chars`; sizes only, nothing is decrypted), request and response SHA-256 and size, and the blob plus byte range of the request (from the first frame its delta chain needs) and of the response. Websocket turns are one row per client message.
+- **Bounded.** Events wait in a 256 MiB queue and blocks in a 512 MiB upload backlog; open frames and delta bases are capped at 1 GiB by committing the least active sessions early. Past a cap events are dropped and counted, never waited for; blocks retry with backoff. `/_subrouter/transcript-stats` reports drops, commits, lost segments and backlog.
+
+Query the index in place with DuckDB:
+
+```bash
+duckdb -c "INSTALL azure; LOAD azure; CREATE SECRET (TYPE azure, PROVIDER credential_chain, ACCOUNT_NAME 'cmuxmodeltranscripts'); SELECT client_node, model, count(*) AS calls, sum(output_tokens) AS output FROM read_json('az://calls/index/v1/2026/10/*/*/*.jsonl.zst') GROUP BY ALL ORDER BY calls DESC"
+```
+
+`subrouter transcripts export --container URL --from 2026-10-15 [--to ...] [--session ID] [--call REQUEST_ID]` rebuilds calls from the index, reading only each row's byte ranges, and writes one JSON line per call (row, request body, response body); `subrouter transcripts verify` checks every rebuilt body against its SHA-256 and fails on any mismatch. Both also replay whole segment files given as arguments. Reading needs a read+list SAS or the account key. `subrouter transcripts recompress --local-dir DIR [--delete]` converts a raw spool written by the local format into segments (deleting each file only after its segments are committed), and `--source URL` converts the old append blobs without touching them; `--dry-run` measures without uploading.
+
+Without a container URL, `--transcripts DIR` writes JSONL files keyed by agent type and session id under `by-agent/<agent-type>/by-session/<agent-session-id>.jsonl`. They include Subrouter metadata, redacted headers, HTTP/SSE body chunks, HTTP/SSE body summaries, and WebSocket message payloads as base64 with byte counts and SHA-256 hashes. Each event includes `agent_type` and `agent_session_id`; Codex events also include `codex_session_id` for matching `~/.codex/sessions` JSONL files. This is intentionally storage-heavy and can contain sensitive request/response payloads. Authorization-style headers are redacted, but bodies are stored in full. The dashboard's transcript list and the GCS and append-blob syncers below apply to this format only.
 
 The synthetic model-catalog session is never recorded. Every Codex client polls `/models` continuously, all of it lands under one session id, and each poll would write the request metadata plus the whole catalog body: on the team server that single file reached 30 GB in two days, dwarfed every real transcript, saturated the upload, and filled the disk. Its responses are still inspected for quota signals; they are just not written down.
 
@@ -1046,6 +1063,16 @@ curl -s -H "Authorization: Bearer $SUBROUTER_ADMIN_TOKEN" \
 ```
 
 `since` takes a duration (`24h`, the default) or an RFC3339 time, and reaches back at most 30 days. The reply is `{"since", "generated_at", "rows": [...]}`, one row per hour, provider, `account_id`, model, and client, with `requests`, `requests_without_usage`, `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, and `reasoning_output_tokens`. The endpoint needs admin access.
+
+For a team rollup by computer and connected account, use the private
+`/_subrouter/device-usage` endpoint with the same `since` parameter. It
+aggregates the retained rows by provider, serving account, model, and client
+label and returns first/last hour, request and token totals, account switches,
+and upstream errors. `X-Subrouter-Client` is the client label; the `sr`
+launchers use the machine's short host name by default, or
+`SUBROUTER_CLIENT_NAME` when a team wants a stable enrolled label. This view
+contains counters only and is admin-gated; it does not store or return
+prompts, completions, credentials, or raw IP addresses.
 
 Rows also carry these fields, each left out when zero, so older logs and older readers still work:
 

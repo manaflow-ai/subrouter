@@ -289,6 +289,7 @@ type sessionStatusView struct {
 	AccountID      string
 	Label          string
 	Plan           string
+	AuthMode       accounts.AuthMode
 	Pinned         bool
 	Windows        []accounts.UsageWindow
 	UsageFetchedAt time.Time
@@ -403,6 +404,13 @@ func renderSessionStatusWith(view sessionStatusView, now time.Time, compact bool
 	}
 	if view.Pinned && !compact {
 		parts[0] += " (pinned)"
+	}
+	if view.AuthMode == accounts.AuthModeAPIKey {
+		if view.Pinned {
+			parts = append(parts, "API key pinned")
+		} else {
+			parts = append(parts, "API key fallback")
+		}
 	}
 	short, weekly := accountQuotaWindows(view.Windows)
 	if text := formatQuotaWindowWith("5h", short, view.UsageFetchedAt, now, compact); text != "" {
@@ -520,6 +528,7 @@ func (r srRunner) observeSession(ctx context.Context, ledger sessionLedger, laun
 	view.Unreachable = observation.LookupError == sessionLookupUnreachable
 	if view.AccountID != "" {
 		if status, ok := usageStatusForAccount(statuses, provider, view.AccountID); ok {
+			view.AuthMode = status.AuthMode
 			view.Plan = status.PlanType
 			view.Windows = status.Windows
 			view.UsageFetchedAt = status.UsageFetchedAt
@@ -571,6 +580,7 @@ func localSessionView(ledger sessionLedger, launch sessionLaunchRecord, agent, s
 	haveCache, _ := readLedgerJSON(usagePath, &cache)
 	if haveCache && view.AccountID != "" {
 		if status, ok := usageStatusForAccount(cache.Statuses, ledgerProvider(agent), view.AccountID); ok {
+			view.AuthMode = status.AuthMode
 			view.Plan = status.PlanType
 			view.Windows = status.Windows
 			view.UsageFetchedAt = status.UsageFetchedAt

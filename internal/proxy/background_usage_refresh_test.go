@@ -79,11 +79,16 @@ func multiProfileAccountRef(t *testing.T, transport http.RoundTripper, n int) (*
 	if err := os.WriteFile(filepath.Join(claudeDir, "claude.json"), body, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return &AccountRef{
+	ref := &AccountRef{
 		store:       accounts.CodexStore{Dir: filepath.Join(dir, "codex-accounts")},
 		claudeStore: agentclaude.Store{Dir: claudeDir},
 		client:      &http.Client{Transport: transport},
-	}, accts
+	}
+	// These tests exercise status-sweep coordination, not credential-health
+	// persistence. Keep last-ok updates in memory so asynchronous disk writes
+	// cannot outlive the sweep and race TempDir cleanup.
+	ref.claudeHealthTracker.Store(newClaudeCredentialHealth("", nil))
+	return ref, accts
 }
 
 func waitStarted(t *testing.T, g *gatedUsageTransport) {

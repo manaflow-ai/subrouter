@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -293,15 +294,14 @@ func TestClaudeForcedAccount429DoesNotFailOver(t *testing.T) {
 	}
 }
 
-func TestReplayablePostRetryBudgetIsAggregateWithoutFallback(t *testing.T) {
+func TestReplayablePostTransient429StopsBeforeWalkingPool(t *testing.T) {
 	const accountCount = replayablePostMaxAttempts * 2
-	upstreamHits := 0
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		upstreamHits++
-		if upstreamHits%replayablePostMaxAttempts == 0 {
-			http.Error(w, "request timeout", http.StatusRequestTimeout)
-			return
-		}
+	var upstreamMu sync.Mutex
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamMu.Lock()
+		auths = append(auths, r.Header.Get("Authorization"))
+		upstreamMu.Unlock()
 		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "allowed_warning")
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, realisticAnthropic429Body)
@@ -342,11 +342,21 @@ func TestReplayablePostRetryBudgetIsAggregateWithoutFallback(t *testing.T) {
 
 	handler.ServeHTTP(response, req)
 
-	if response.Code != http.StatusRequestTimeout {
-		t.Fatalf("status = %d, want final upstream 408; body=%s", response.Code, response.Body.String())
+	upstreamMu.Lock()
+	defer upstreamMu.Unlock()
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want transient 429; body=%s", response.Code, response.Body.String())
 	}
-	if upstreamHits != replayablePostMaxAttempts {
-		t.Fatalf("upstream hits = %d, want aggregate cap %d across account failover and POST replay", upstreamHits, replayablePostMaxAttempts)
+	if want := claudeTransient429MaxRetries + 2; len(auths) != want {
+		t.Fatalf("upstream hits = %d, want %d (initial attempt, short retries, one alternate)", len(auths), want)
+	}
+	for i := 1; i <= claudeTransient429MaxRetries; i++ {
+		if auths[i] != auths[0] {
+			t.Fatalf("transient retry %d used %q, want original account %q", i, auths[i], auths[0])
+		}
+	}
+	if auths[len(auths)-1] == auths[0] {
+		t.Fatalf("last attempt used %q, want one alternate account", auths[0])
 	}
 }
 
@@ -669,9 +679,14 @@ func TestClaude429FailoverUsesPoolSizedQuotaBudget(t *testing.T) {
 		}
 		accountsList = append(accountsList, accounts.Account{ID: id, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-" + id})
 		headroom := 0.90 - float64(i)*0.01
-		// Distinct ExpiryPressure values (descending with i) make each
-		// account its own pressure band, so the failover walk order is
-		// deterministic: cooked-0 .. cooked-6, then fresh-7.
+		// New-session placement spreads across every roomy account, so the
+		// cooked accounts are walked in random order. The healthy account
+		// sits below the new-session floor, which ranks it after every
+		// roomy account: it is reached only once all seven cooked accounts
+		// were tried, which is what proves the budget is pool-sized.
+		if i == 7 {
+			headroom = 0.30
+		}
 		reset := int64((i + 1) * 3600)
 		scores = append(scores, selectacct.Score{
 			AccountID: id, Provider: accounts.ProviderClaude,
@@ -1473,22 +1488,21 @@ func TestClaudeFailoverSkipsDeadTokenAccount(t *testing.T) {
 			{ID: "fresh@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"},
 		},
 		Sessions: store,
-		// Seed the ref with the same pressure-ordered scores as the stub:
-		// UsageScoreTTL is 0 here, so the retry path never refreshes and
-		// picks straight from this snapshot. Distinct pressures make the
-		// failover order deterministic (dead before fresh) despite placement
-		// spreading within equal-pressure bands.
+		// Seed the ref with the same scores as the stub: UsageScoreTTL is 0
+		// here, so the retry path never refreshes and picks straight from
+		// this snapshot. fresh sits below the new-session floor, which ranks
+		// it after dead whatever placement spreading samples, so failover
+		// must meet the dead token first.
 		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
 			{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
 			{AccountID: "dead@example.com", Provider: accounts.ProviderClaude, Headroom: 1.0, ShortHeadroom: 1.0, ShortResetAfterSeconds: 3600, ExpiryPressure: 1.0 / 3600},
-			{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0.9, ShortHeadroom: 0.9, ShortResetAfterSeconds: 4 * 3600, ExpiryPressure: 0.9 / (4 * 3600)},
+			{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0.3, ShortHeadroom: 0.3, ShortResetAfterSeconds: 4 * 3600, ExpiryPressure: 0.3 / (4 * 3600)},
 		})),
-		// Pick order among untried candidates: dead strictly before fresh
-		// (distinct ExpiryPressure values form singleton bands, so the order
-		// is deterministic despite placement spreading), so failover tries
-		// the dead-token account first and must skip it.
+		// Pick order among untried candidates: dead (room for a new session)
+		// strictly before fresh (below the floor), so failover tries the
+		// dead-token account first and must skip it.
 		ScoreAccounts: func(ctx context.Context, available []accounts.Account) ([]selectacct.Score, int) {
-			h := map[string]float64{"cooked@example.com": 0, "dead@example.com": 1.0, "fresh@example.com": 0.9}
+			h := map[string]float64{"cooked@example.com": 0, "dead@example.com": 1.0, "fresh@example.com": 0.3}
 			reset := map[string]int64{"dead@example.com": 3600, "fresh@example.com": 4 * 3600}
 			scores := make([]selectacct.Score, 0, len(available))
 			for _, a := range available {

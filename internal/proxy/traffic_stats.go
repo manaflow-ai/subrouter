@@ -47,8 +47,84 @@ type TrafficStats struct {
 	responseOth atomic.Uint64
 	proxy5xx    atomic.Uint64
 	upstream5xx atomic.Uint64
-	failuresMu  sync.Mutex
-	failures    []TrafficFailure
+	// clientAborts counts proxy-generated 5xx written after the client had
+	// already gone; they are in no response class.
+	clientAborts atomic.Uint64
+	failuresMu   sync.Mutex
+	failures     []TrafficFailure
+
+	clientVersionsMu sync.Mutex
+	// clientVersions counts requests by the sr build that sent them. At most
+	// trafficClientVersionCap real versions are kept; later ones count as
+	// "other", so a misbehaving client cannot grow the map.
+	clientVersions map[string]uint64
+	// clientVersionsDistinct is how many real versions clientVersions holds,
+	// not counting the "unknown" and "other" buckets.
+	clientVersionsDistinct int
+}
+
+// ClientVersionHeader is the sr build version a client sends with every
+// request it forwards to a subrouter server. It only feeds the
+// client_versions histogram in /_subrouter/traffic; it grants nothing, and
+// session.StripSubrouterHeaders removes it before any upstream sees it.
+const ClientVersionHeader = "X-Subrouter-Client-Version"
+
+const (
+	trafficClientVersionCap     = 64
+	trafficClientVersionMaxLen  = 48
+	trafficClientVersionUnknown = "unknown"
+	trafficClientVersionOther   = "other"
+)
+
+// NormalizeClientVersion returns value when it looks like a build version
+// ("v0.1.174", "devel+abc123def456-dirty"), else "". It must start with a
+// letter or digit, be at most 48 bytes, and use only letters, digits, and
+// ".", "-", "+", "_".
+func NormalizeClientVersion(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > trafficClientVersionMaxLen {
+		return ""
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		alnum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if i == 0 && !alnum {
+			return ""
+		}
+		if !alnum && c != '.' && c != '-' && c != '+' && c != '_' {
+			return ""
+		}
+	}
+	switch value {
+	case trafficClientVersionUnknown, trafficClientVersionOther:
+		return ""
+	}
+	return value
+}
+
+// observeClientVersion counts one request under the client's reported
+// version, "unknown" when it sent none or an invalid one, or "other" once
+// the histogram is full.
+func (t *TrafficStats) observeClientVersion(raw string) {
+	label := NormalizeClientVersion(raw)
+	if label == "" {
+		label = trafficClientVersionUnknown
+	}
+	t.clientVersionsMu.Lock()
+	defer t.clientVersionsMu.Unlock()
+	if t.clientVersions == nil {
+		t.clientVersions = make(map[string]uint64)
+	}
+	if label != trafficClientVersionUnknown {
+		if _, seen := t.clientVersions[label]; !seen {
+			if t.clientVersionsDistinct >= trafficClientVersionCap {
+				label = trafficClientVersionOther
+			} else {
+				t.clientVersionsDistinct++
+			}
+		}
+	}
+	t.clientVersions[label]++
 }
 
 // TrafficFailure is a bounded diagnostic sample for a failed client request.
@@ -74,16 +150,27 @@ func NewTrafficStats(now time.Time) *TrafficStats {
 
 // TrafficSnapshot is the /_subrouter/traffic payload.
 type TrafficSnapshot struct {
-	StartedAt     string            `json:"started_at,omitempty"`
-	UptimeSeconds int64             `json:"uptime_seconds"`
-	Version       string            `json:"version"`
-	Requests      uint64            `json:"requests"`
-	Responses     TrafficByClass    `json:"responses"`
-	Proxy5xx      uint64            `json:"proxy_5xx"`
-	Upstream5xx   uint64            `json:"upstream_5xx"`
-	Streams       StreamDropSummary `json:"stream_drops"`
-	Failures      []TrafficFailure  `json:"failures,omitempty"`
-	Admission     admissionSnapshot `json:"admission,omitempty"`
+	StartedAt     string         `json:"started_at,omitempty"`
+	UptimeSeconds int64          `json:"uptime_seconds"`
+	Version       string         `json:"version"`
+	Requests      uint64         `json:"requests"`
+	Responses     TrafficByClass `json:"responses"`
+	Proxy5xx      uint64         `json:"proxy_5xx"`
+	Upstream5xx   uint64         `json:"upstream_5xx"`
+	// ClientAborts is requests the client cancelled before subrouter could
+	// answer; the error the proxy then writes reaches nobody and is not a
+	// proxy failure.
+	ClientAborts uint64 `json:"client_aborts"`
+	// ClientVersions counts requests by the sr build that sent them
+	// (X-Subrouter-Client-Version): at most 64 versions, then "other";
+	// "unknown" is a request with no valid version.
+	ClientVersions map[string]uint64 `json:"client_versions,omitempty"`
+	Streams        StreamDropSummary `json:"stream_drops"`
+	Failures       []TrafficFailure  `json:"failures,omitempty"`
+	Admission      admissionSnapshot `json:"admission,omitempty"`
+	// CodexCapacity is the live Codex capacity marks (accounts hashed) and
+	// what the capacity retry has done in this process.
+	CodexCapacity *codexCapacityTraffic `json:"codex_capacity,omitempty"`
 }
 
 // TrafficByClass groups completed responses by status class.
@@ -123,9 +210,18 @@ func (t *TrafficStats) Snapshot(drops *StreamDropStats, now time.Time) TrafficSn
 	}
 	snapshot.Proxy5xx = t.proxy5xx.Load()
 	snapshot.Upstream5xx = t.upstream5xx.Load()
+	snapshot.ClientAborts = t.clientAborts.Load()
 	t.failuresMu.Lock()
 	snapshot.Failures = append([]TrafficFailure(nil), t.failures...)
 	t.failuresMu.Unlock()
+	t.clientVersionsMu.Lock()
+	if len(t.clientVersions) > 0 {
+		snapshot.ClientVersions = make(map[string]uint64, len(t.clientVersions))
+		for version, count := range t.clientVersions {
+			snapshot.ClientVersions[version] = count
+		}
+	}
+	t.clientVersionsMu.Unlock()
 	return snapshot
 }
 
@@ -258,6 +354,7 @@ func (t *TrafficStats) trafficCounted(next http.Handler) http.Handler {
 		}
 		record := &trafficRecord{method: r.Method, path: r.URL.Path, retryPath: "none"}
 		t.requests.Add(1)
+		t.observeClientVersion(r.Header.Get(ClientVersionHeader))
 		writer := &trafficResponseWriter{ResponseWriter: w}
 		defer func() {
 			recovered := recover()
@@ -272,9 +369,15 @@ func (t *TrafficStats) trafficCounted(next http.Handler) http.Handler {
 					status = http.StatusOK
 				}
 			}
-			t.observe(status, writer.upstream)
-			if status >= 500 {
-				t.recordFailure(record, status, time.Now())
+			switch {
+			case status >= 500 && !writer.upstream && errors.Is(r.Context().Err(), context.Canceled):
+				// The client hung up first; the proxy's error went nowhere.
+				t.clientAborts.Add(1)
+			default:
+				t.observe(status, writer.upstream)
+				if status >= 500 {
+					t.recordFailure(record, status, time.Now())
+				}
 			}
 			if recovered != nil {
 				panic(recovered)
@@ -346,5 +449,6 @@ func (s Server) handleTraffic(w http.ResponseWriter, _ *http.Request) {
 	if s.admission != nil {
 		snapshot.Admission = s.admission.snapshot()
 	}
+	snapshot.CodexCapacity = s.codexCapacityTrafficSnapshot()
 	writeJSON(w, snapshot)
 }

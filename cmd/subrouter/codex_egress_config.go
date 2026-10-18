@@ -15,6 +15,8 @@ import (
 // comma-separated list of HTTP CONNECT proxy URLs in other regions
 // (for example http://cmux-egress-fra:3128,http://cmux-egress-tyo:3128).
 // Unset or empty means the feature is off and the Codex path is unchanged.
+// SUBROUTER_CODEX_EGRESS_MAX_ATTEMPTS caps the egresses one request tries
+// (default proxy.DefaultCodexEgressMaxAttempts).
 func codexEgressConfigFromEnvironment(sessionPath string) (*proxy.CodexEgressConfig, error) {
 	raw := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_EGRESS_PROXIES"))
 	if raw == "" {
@@ -27,10 +29,18 @@ func codexEgressConfigFromEnvironment(sessionPath string) (*proxy.CodexEgressCon
 	if len(proxies) == 0 {
 		return nil, nil
 	}
-	return &proxy.CodexEgressConfig{
+	config := &proxy.CodexEgressConfig{
 		Proxies:      proxies,
 		PinStorePath: filepath.Join(filepath.Dir(sessionPath), "codex-egress-pins.json"),
-	}, nil
+	}
+	if raw := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_EGRESS_MAX_ATTEMPTS")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("SUBROUTER_CODEX_EGRESS_MAX_ATTEMPTS=%q: want a positive integer", raw)
+		}
+		config.MaxAttempts = n
+	}
+	return config, nil
 }
 
 // codexOverloadFailoverConfigFromEnvironment reads the Codex capacity retry
@@ -43,10 +53,11 @@ func codexEgressConfigFromEnvironment(sessionPath string) (*proxy.CodexEgressCon
 // Account failover is opt-in with SUBROUTER_CODEX_OVERLOAD_FAILOVER=1. The
 // default keeps a live session on its account and waits through capacity instead
 // (~10s ladder), with optional SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS and
-// SUBROUTER_CODEX_OVERLOAD_MARK_TTL (Go duration). A conversation of more
-// than SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT estimated input tokens
-// (default 32000; 0 = no limit) keeps its account and its prompt cache: it
-// takes the same-account wait even with the failover on.
+// SUBROUTER_CODEX_OVERLOAD_MARK_TTL (Go duration, default 5m). A conversation
+// that hits capacity itself switches whatever its size; one of more than
+// SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT estimated input tokens
+// (default 32000; 0 = no limit) is only kept from being evicted at placement
+// by marks other sessions left, which would re-bill its prompt cache.
 // Persistent retry is enabled by default for up to
 // SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET (default 10m): on the same
 // account, or across accounts with the failover on. The per-request

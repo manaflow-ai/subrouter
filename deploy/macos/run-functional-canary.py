@@ -89,6 +89,11 @@ class _DarwinBSDInfo(ctypes.Structure):
     ]
 
 
+# <sys/proc_info.h> PROC_FLAG_INEXIT and <sys/proc.h> SZOMB.
+_DARWIN_PROC_FLAG_INEXIT = 0x4
+_DARWIN_SZOMB = 5
+
+
 class _DarwinAuditToken(ctypes.Structure):
     _fields_ = [("val", ctypes.c_uint32 * 8)]
 
@@ -675,21 +680,45 @@ def _process_snapshot(*, include_environment: bool = False) -> dict[int, _Proces
     return processes
 
 
+def _darwin_bsd_info(pid: int) -> _DarwinBSDInfo | None:
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        proc_pidinfo = libproc.proc_pidinfo
+        proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        proc_pidinfo.restype = ctypes.c_int
+        info = _DarwinBSDInfo()
+        size = ctypes.sizeof(info)
+        if proc_pidinfo(pid, 3, 0, ctypes.byref(info), size) != size:  # PROC_PIDTBSDINFO
+            return None
+        return info
+    except (AttributeError, OSError):
+        return None
+
+
+def _process_is_signalable(pid: int, started: str) -> bool:
+    """Report whether the exact process generation is alive and not exiting.
+
+    A Darwin process that has begun exit still answers proc_pidinfo with its
+    original start identity, but its Mach task is already terminated, so
+    task_name_for_pid or task_info fails for it. Such a process needs no
+    signal; treating it like a live one turned a normal leg exit during
+    cleanup into a spurious identity-token failure.
+    """
+    if sys.platform == "darwin":
+        info = _darwin_bsd_info(pid)
+        if info is None or f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}" != started:
+            return False
+        return not (info.pbi_flags & _DARWIN_PROC_FLAG_INEXIT) and info.pbi_status != _DARWIN_SZOMB
+    return _process_start_identity(pid) == started
+
+
 def _process_start_identity(pid: int, ps_started: str = "") -> str | None:
     """Return a start identity finer than PID lifetime on supported cutover hosts."""
     if sys.platform == "darwin":
-        try:
-            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-            proc_pidinfo = libproc.proc_pidinfo
-            proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
-            proc_pidinfo.restype = ctypes.c_int
-            info = _DarwinBSDInfo()
-            size = ctypes.sizeof(info)
-            if proc_pidinfo(pid, 3, 0, ctypes.byref(info), size) != size:
-                return None
-            return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
-        except (AttributeError, OSError):
+        info = _darwin_bsd_info(pid)
+        if info is None:
             return None
+        return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
     if sys.platform.startswith("linux"):
         try:
             fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
@@ -780,7 +809,7 @@ def _identity_exists(pid: int, started: str, snapshot: dict[int, _ProcessInfo] |
 
 def _signal_process_identity(pid: int, started: str, sent_signal: signal.Signals) -> bool:
     """Signal one exact process generation, never a numerically reused PID."""
-    if _process_start_identity(pid) != started:
+    if not _process_is_signalable(pid, started):
         return False
     if sys.platform == "darwin":
         libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
@@ -791,7 +820,7 @@ def _signal_process_identity(pid: int, started: str, sent_signal: signal.Signals
         task_name_for_pid.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.POINTER(ctypes.c_uint)]
         task_name_for_pid.restype = ctypes.c_int
         if task_name_for_pid(self_task, pid, ctypes.byref(task)) != 0:
-            if _process_start_identity(pid) != started:
+            if not _process_is_signalable(pid, started):
                 return False
             raise CanaryError("could not bind canary child process identity")
         try:
@@ -803,16 +832,22 @@ def _signal_process_identity(pid: int, started: str, sent_signal: signal.Signals
                 ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
             ]
             task_info.restype = ctypes.c_int
-            if task_info(
+            task_info_ok = task_info(
                 task.value,
                 15,  # TASK_AUDIT_TOKEN
                 ctypes.cast(ctypes.byref(token), ctypes.POINTER(ctypes.c_uint32)),
                 ctypes.byref(count),
-            ) != 0 or count.value != 8:
-                raise CanaryError("could not read canary child process identity token")
+            ) == 0 and count.value == 8
         finally:
             libsystem.mach_port_deallocate(self_task, task.value)
-        if token.val[5] != pid or _process_start_identity(pid) != started:
+        if not task_info_ok:
+            # The process can begin exiting after the check above; its task
+            # then rejects task_info. That is a process that needs no signal,
+            # not a failure to bind one that does.
+            if not _process_is_signalable(pid, started):
+                return False
+            raise CanaryError("could not read canary child process identity token")
+        if token.val[5] != pid or not _process_is_signalable(pid, started):
             return False
         proc_signal = libproc.proc_signal_with_audittoken
         proc_signal.argtypes = [ctypes.POINTER(_DarwinAuditToken), ctypes.c_int]

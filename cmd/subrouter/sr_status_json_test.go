@@ -92,6 +92,35 @@ func TestSRStatusUsableMatchesTextMarkers(t *testing.T) {
 	}
 }
 
+// TestSRStatusClaudeCreditCooldownIsTemporary keeps capacity state separate
+// from credential health in both text and machine-readable status.
+func TestSRStatusClaudeCreditCooldownIsTemporary(t *testing.T) {
+	row := srUsageRow{
+		email:                 "claude-key",
+		provider:              accounts.ProviderClaude,
+		authMode:              accounts.AuthModeAPIKey,
+		providerHealth:        "auth ok",
+		creditsExhaustedUntil: time.Now().Add(time.Hour),
+	}
+	if got := usageGridState(row); got != "temp, credit cooldown" {
+		t.Fatalf("text state = %q, want temporary credit cooldown", got)
+	}
+	if got := srStatusAccountState(row); got != srStatusStateTemp {
+		t.Fatalf("JSON state = %q, want %q", got, srStatusStateTemp)
+	}
+	if got := compactPickReason(row); !strings.Contains(got, "credit cooldown") {
+		t.Fatalf("Use = %q, want credit cooldown", got)
+	}
+	if recommendedForNewSession(row) {
+		t.Fatal("a Claude API key in an active credit cooldown must not be recommended")
+	}
+
+	row.creditsExhaustedUntil = time.Now().Add(-time.Second)
+	if got := usageGridState(row); got != "API key fallback" {
+		t.Fatalf("expired cooldown state = %q, want API key fallback", got)
+	}
+}
+
 func decodeSRStatusJSON(t *testing.T, text string) (srStatusJSON, map[string]any) {
 	t.Helper()
 	var typed srStatusJSON

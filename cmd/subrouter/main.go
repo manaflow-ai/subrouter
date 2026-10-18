@@ -35,7 +35,6 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 	"github.com/manaflow-ai/subrouter/internal/tailnet"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
-	"github.com/manaflow-ai/subrouter/internal/transcript"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 )
@@ -186,6 +185,7 @@ func runForProgram(program string, args []string) error {
 		printVersion(versionOut, program)
 		return nil
 	}
+	maybeStartAutoUpdate(program, args)
 	switch args[0] {
 	case "update":
 		return runUpdateCommand(program, args[1:])
@@ -215,6 +215,8 @@ func runForProgram(program string, args []string) error {
 		return probe(args[1:])
 	case "accounts":
 		return listAccounts()
+	case "transcripts":
+		return runTranscriptsCommand(args[1:])
 	case "codex":
 		return codex(args[1:])
 	case "cx":
@@ -383,9 +385,15 @@ func serve(args []string) error {
 	transcriptLocalRetention := flags.Duration("transcript-local-retention", 0, "delete local transcript files older than this after successful GCS sync; 0 disables")
 	transcriptMaxLocalBytesRaw := flags.String("transcript-max-local-bytes", "0", "max bytes to keep in the local transcript spool after successful GCS sync; supports KiB/MiB/GiB suffixes; 0 disables")
 	transcriptAzureRate := flags.String("transcript-azure-max-bytes-per-second", "2MiB", "cap on Azure transcript upload throughput; supports KiB/MiB/GiB suffixes; 0 disables the cap")
+	transcriptStoreURL := flags.String("transcript-azure-container-url", "", "stream transcripts straight to this Azure blob container (https://<account>.blob.core.windows.net/<container>), with no local files; credential from SUBROUTER_TRANSCRIPT_AZURE_SAS_FILE (create+write SAS) or SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE; defaults to SUBROUTER_TRANSCRIPT_AZURE_CONTAINER_URL")
+	transcriptHost := flags.String("transcript-host", "", "host name recorded in transcript blob names and index rows; default the machine host name")
+	transcriptSegmentAge := flags.Duration("transcript-segment-max-age", time.Hour, "commit a session's transcript segment at this age")
+	transcriptSegmentIdle := flags.Duration("transcript-segment-idle", 15*time.Minute, "commit a session's transcript segment after this long without events")
+	transcriptIndexFlush := flags.Duration("transcript-index-flush", 10*time.Minute, "write transcript index rows this often")
 	transcriptAzureURL := flags.String("transcript-azure-url", "", "optional Azure blob container URL (https://<account>.blob.core.windows.net/<container>[/<prefix>]) for background transcript sync; defaults to SUBROUTER_TRANSCRIPT_AZURE_URL")
 	srSwitchInterval := defaultSRSwitchInterval
 	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for refreshing OAuth usage scores used by routing; non-positive disables scheduled refresh")
+	flags.Float64Var(&selectacct.MinNewSessionHeadroom, "min-new-session-headroom", selectacct.MinNewSessionHeadroom, "headroom fraction (0-1) an account needs to take a new session; lower spreads new sessions over more accounts")
 	flags.DurationVar(&srSwitchInterval, "cx-switch-interval", defaultSRSwitchInterval, "compatibility alias for --sr-switch-interval")
 	resetCreditInterval := flags.Duration("reset-credit-interval", time.Hour, "how often to check cooked accounts for a rate-limit reset credit worth spending now (early in the weekly window, or expiring before the next chance); non-positive disables")
 	resetCreditAutospendRaw := flags.String("reset-credit-autospend", string(proxy.ResetCreditAutospendWarn), "what the reset-credit sweep does with a credit worth spending now (early cook, expiring before the next chance, or a blocked Codex pool with demand): off (evaluate nothing), warn (log it and show reset_advice in /_subrouter/usage-status, spend nothing), or spend (redeem it). The redeem lock is per process: two hosts in spend mode that share accounts could both redeem for the same reset")
@@ -419,6 +427,9 @@ func serve(args []string) error {
 	cloudCredentialSource := flags.String("cloud-credential-source", "", "override the credential source loaded from the cloud config: team, local, or legacy")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if selectacct.MinNewSessionHeadroom <= 0 || selectacct.MinNewSessionHeadroom >= 1 {
+		return fmt.Errorf("--min-new-session-headroom must be between 0 and 1, got %v", selectacct.MinNewSessionHeadroom)
 	}
 	resetCreditAutospend, err := proxy.ParseResetCreditAutospend(*resetCreditAutospendRaw)
 	if err != nil {
@@ -744,6 +755,13 @@ func serve(args []string) error {
 	// window before fresh scores land.
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(codexAccounts)))
 	schedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, initialSchedulerCredentialAccounts(initialAccounts))
+	// Route Claude on the previous worker's saved windows until the first live
+	// sweep; without them every Claude account reads as fully healthy at
+	// start. This runs before the Codex startup score tasks begin, so it can
+	// neither overwrite their fresh scores nor invalidate their publication.
+	if seeded := (proxy.Server{AccountRef: accountRef, SchedulerRef: schedulerRef, Logger: slog.Default()}).SeedScoresFromRestoredUsage(time.Now()); seeded > 0 {
+		slog.Info("seeded Claude usage scores from the saved snapshot", "accounts", seeded)
+	}
 	activeGenerationCtx, stopActiveGenerationTasks := context.WithCancel(context.Background())
 	defer stopActiveGenerationTasks()
 	autoSwitchScoresEnabled := srSwitchInterval > 0 && *fetchUsage && credentialBroker == nil
@@ -848,10 +866,36 @@ func serve(args []string) error {
 	tokenUsageCtx, stopTokenUsage := context.WithCancel(context.Background())
 	defer stopTokenUsage()
 	tokenUsage.RunFlushLoop(tokenUsageCtx)
+	// Same lifetime as token usage: a retiring worker still records the
+	// failures of the streams it finishes.
+	errorEvents := proxy.NewErrorEventLog(filepath.Join(filepath.Dir(*sessionPath), "error-events.jsonl"), slog.Default())
+	go errorEvents.Run(tokenUsageCtx)
 
+	transcriptAzureKey, err := secretFromEnvironment("SUBROUTER_TRANSCRIPT_AZURE_KEY", "SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE")
+	if err != nil {
+		return fmt.Errorf("transcript azure key: %w", err)
+	}
+	transcriptAzureMaxBytesPerSecond, err := parseByteSize(*transcriptAzureRate)
+	if err != nil {
+		return fmt.Errorf("transcript-azure-max-bytes-per-second: %w", err)
+	}
+	if transcriptAzureMaxBytesPerSecond == 0 {
+		// The syncer reads zero as "use the default", so an explicit 0 from the
+		// operator has to say "no cap" in the syncer's own terms.
+		transcriptAzureMaxBytesPerSecond = -1
+	}
+	transcriptRecorder, transcriptSegmentMode, err := newServeTranscriptRecorder(serveTranscriptOptions{
+		dir: *transcriptDir, storeURL: *transcriptStoreURL, host: *transcriptHost,
+		maxSegmentAge: *transcriptSegmentAge, idleSeal: *transcriptSegmentIdle, indexFlush: *transcriptIndexFlush,
+		whois: tokenUsageWhoIs,
+	})
+	if err != nil {
+		return err
+	}
 	server := proxy.Server{
 		StreamDrops:              &proxy.StreamDropStats{},
 		TokenUsage:               tokenUsage,
+		ErrorEvents:              errorEvents,
 		Traffic:                  proxy.NewTrafficStats(time.Now()),
 		ReleaseStatePath:         strings.TrimSpace(*releaseStatePath),
 		Upstream:                 upstream,
@@ -898,63 +942,27 @@ func serve(args []string) error {
 		ClaudeFableCacheTTLUpgradeOff: envTrue("SUBROUTER_FABLE_CACHE_1H_OFF"),
 		AzureCodex:                    azureCodexConfig,
 		CodexEgress:                   codexEgressConfig,
+		CodexCapacityEventsPath:       filepath.Join(filepath.Dir(*sessionPath), "codex-capacity-events.jsonl"),
+		CodexFaultInjection:           envTrue("SUBROUTER_CODEX_FAULT_INJECTION"),
 		CodexOverloadFailover:         codexOverloadConfig,
 		ClaudeOverloadReroute:         claudeOverloadReroute,
 		ClaudeOverloadRetry:           claudeOverloadRetry,
 		FableBedrockPrimary:           fableBedrockEnabled,
-		Transcripts:                   transcript.NewRecorder(*transcriptDir),
+		Transcripts:                   transcriptRecorder,
 	}
 	if err := server.ValidateCredentialUpstreams(); err != nil {
 		return err
 	}
-	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
-		SourceDir:      *transcriptDir,
-		Destination:    *transcriptGCSURI,
-		Interval:       *transcriptGCSSyncInterval,
-		Timeout:        *transcriptGCSSyncTimeout,
-		LocalRetention: *transcriptLocalRetention,
-		MaxLocalBytes:  transcriptMaxLocalBytes,
-		Logger:         slog.Default(),
-	})
-	if transcriptGCSSyncer.Enabled() {
-		go transcriptGCSSyncer.Run(context.Background())
-	}
-	transcriptAzureKey, err := secretFromEnvironment("SUBROUTER_TRANSCRIPT_AZURE_KEY", "SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE")
-	if err != nil {
-		return fmt.Errorf("transcript azure key: %w", err)
-	}
-	transcriptAzureMaxBytesPerSecond, err := parseByteSize(*transcriptAzureRate)
-	if err != nil {
-		return fmt.Errorf("transcript-azure-max-bytes-per-second: %w", err)
-	}
-	if transcriptAzureMaxBytesPerSecond == 0 {
-		// The syncer reads zero as "use the default", so an explicit 0 from the
-		// operator has to say "no cap" in the syncer's own terms.
-		transcriptAzureMaxBytesPerSecond = -1
-	}
-	transcriptAzureSyncer := transcript.NewAzureBlobSyncer(transcript.AzureBlobSyncerConfig{
-		MaxBytesPerSecond: transcriptAzureMaxBytesPerSecond,
-		SourceDir:         *transcriptDir,
-		Destination:       transcriptAzureDestination,
-		AccountKey:        transcriptAzureKey,
-		SASToken:          strings.TrimSpace(os.Getenv("SUBROUTER_TRANSCRIPT_AZURE_SAS")),
-		Interval:          *transcriptGCSSyncInterval,
-		Timeout:           *transcriptGCSSyncTimeout,
-		LocalRetention:    *transcriptLocalRetention,
-		MaxLocalBytes:     transcriptMaxLocalBytes,
-		Logger:            slog.Default(),
-	})
-	if transcriptAzureSyncer.Enabled() {
-		slog.Info("transcript azure sync enabled", "destination", transcriptAzureSyncer.Destination(), "interval", (*transcriptGCSSyncInterval).String())
-		go transcriptAzureSyncer.Run(context.Background())
-	} else if transcriptAzureDestination != "" {
-		// A destination that produces no syncer means the credential is missing
-		// or the URL is malformed. Saying so at startup is the difference
-		// between a broken pipeline and a silent one, which is how the last
-		// transcript sync stopped without anyone noticing.
-		slog.Warn("transcript azure sync is configured but not usable",
-			"destination", transcriptAzureDestination,
-			"fix", "set SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE (or SUBROUTER_TRANSCRIPT_AZURE_SAS) and check the container URL")
+	if !transcriptSegmentMode {
+		if err := startLegacyTranscriptSync(legacyTranscriptSyncOptions{
+			dir: *transcriptDir, gcsURI: *transcriptGCSURI, interval: *transcriptGCSSyncInterval, timeout: *transcriptGCSSyncTimeout,
+			retention: *transcriptLocalRetention, maxLocalBytes: transcriptMaxLocalBytes, azureDestination: transcriptAzureDestination,
+			azureKey: transcriptAzureKey, azureRate: transcriptAzureMaxBytesPerSecond,
+		}); err != nil {
+			return err
+		}
+	} else if strings.TrimSpace(*transcriptGCSURI) != "" {
+		slog.Warn("--transcript-gcs-uri only applies to --transcript-format jsonl; segments upload to Azure")
 	}
 	if autoSwitchScoresEnabled {
 		fetchScores := func(ctx context.Context, candidates []accounts.Account) ([]selectacct.Score, int) {
@@ -1891,7 +1899,7 @@ Usage:
   %[1]s reset [email]      Redeem a rate-limit reset credit (best candidate, or --all, or --dry-run)
   %[1]s usage [days]       Refresh and show API-key spend
   %[1]s trace <email>      Show OAuth refresh breadcrumbs for an account
-  %[1]s codex isolation-check [--json] [--retiring-state-dir PATH]
+  %[1]s codex isolation-check [--json] [--retiring-state-dir PATH] [--allow-shared-active ACCOUNT]...
                            Check serving credential isolation without changing credentials
   %[1]s codex migrate-isolation [--device-auth]
                            Re-enroll legacy Codex OAuth accounts without changing local Codex auth

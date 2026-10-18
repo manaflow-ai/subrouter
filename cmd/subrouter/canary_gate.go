@@ -39,6 +39,9 @@ type trafficWindow struct {
 	Responses5xx     uint64 `json:"responses_5xx"`
 	Proxy5xx         uint64 `json:"proxy_5xx"`
 	StreamProxyDrops uint64 `json:"stream_proxy_drops"`
+	// ClientAborts is requests the client cancelled first. They are shown,
+	// never gated on: how often clients hang up says nothing about the build.
+	ClientAborts uint64 `json:"client_aborts"`
 }
 
 func trafficWindowOf(snapshot proxy.TrafficSnapshot) trafficWindow {
@@ -47,6 +50,7 @@ func trafficWindowOf(snapshot proxy.TrafficSnapshot) trafficWindow {
 		Responses5xx:     snapshot.Responses.Class5xx,
 		Proxy5xx:         snapshot.Proxy5xx,
 		StreamProxyDrops: snapshot.Streams.Proxy,
+		ClientAborts:     snapshot.ClientAborts,
 	}
 }
 
@@ -54,7 +58,8 @@ func trafficWindowOf(snapshot proxy.TrafficSnapshot) trafficWindow {
 // the process restarted, so the whole current count is the window.
 func (w trafficWindow) since(base trafficWindow) trafficWindow {
 	if w.Requests < base.Requests || w.Responses5xx < base.Responses5xx ||
-		w.Proxy5xx < base.Proxy5xx || w.StreamProxyDrops < base.StreamProxyDrops {
+		w.Proxy5xx < base.Proxy5xx || w.StreamProxyDrops < base.StreamProxyDrops ||
+		w.ClientAborts < base.ClientAborts {
 		return w
 	}
 	return trafficWindow{
@@ -62,6 +67,7 @@ func (w trafficWindow) since(base trafficWindow) trafficWindow {
 		Responses5xx:     w.Responses5xx - base.Responses5xx,
 		Proxy5xx:         w.Proxy5xx - base.Proxy5xx,
 		StreamProxyDrops: w.StreamProxyDrops - base.StreamProxyDrops,
+		ClientAborts:     w.ClientAborts - base.ClientAborts,
 	}
 }
 
@@ -186,8 +192,8 @@ func evaluateCanaryGate(input gateInput, thresholds gateThresholds) gateDecision
 		return gateDecision{gatePromote, fmt.Sprintf("dwell passed with %d candidate requests, under the %d-request floor; only health and restarts were checked",
 			input.Candidate.Requests, thresholds.MinRequests)}
 	}
-	return gateDecision{gatePromote, fmt.Sprintf("%d candidate requests: proxy 5xx %d, all 5xx %d, proxy stream drops %d",
-		input.Candidate.Requests, input.Candidate.Proxy5xx, input.Candidate.Responses5xx, input.Candidate.StreamProxyDrops)}
+	return gateDecision{gatePromote, fmt.Sprintf("%d candidate requests: proxy 5xx %d, all 5xx %d, proxy stream drops %d, client aborts %d",
+		input.Candidate.Requests, input.Candidate.Proxy5xx, input.Candidate.Responses5xx, input.Candidate.StreamProxyDrops, input.Candidate.ClientAborts)}
 }
 
 func gatePercent(value float64) string {

@@ -456,6 +456,41 @@ func TestTokenUsageEndpointRequiresAdminAndKeepsShape(t *testing.T) {
 	}
 }
 
+func TestDeviceUsageEndpointAggregatesByClientAndAccount(t *testing.T) {
+	recorder := NewTokenUsageRecorder("", nil)
+	now := time.Date(2026, 9, 26, 10, 15, 0, 0, time.UTC)
+	recorder.now = fixedClock(now)
+	recorder.Record("claude", "leo@cmux.com", "claude-opus-5-5", "air-blue", tokenUsage{InputTokens: 10, CachedInputTokens: 4, OutputTokens: 2}, true)
+	recorder.now = fixedClock(now.Add(time.Hour))
+	recorder.Record("claude", "leo@cmux.com", "claude-opus-5-5", "air-blue", tokenUsage{InputTokens: 7, OutputTokens: 3}, true)
+	recorder.Record("claude", "leo@cmux.com", "claude-opus-5-5", "big-red", tokenUsage{InputTokens: 99}, true)
+
+	handler := Server{AdminToken: "admin-secret", TokenUsage: recorder}.Handler()
+	req := httptest.NewRequest(http.MethodGet, "http://subrouter.example/_subrouter/device-usage?since=48h", nil)
+	req.RemoteAddr = "203.0.113.5:4444"
+	req.Header.Set("Authorization", "Bearer admin-secret")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	var decoded struct {
+		Rows []DeviceUsageRow `json:"rows"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Rows) != 2 {
+		t.Fatalf("rows = %+v, want two client rollups", decoded.Rows)
+	}
+	if decoded.Rows[0].Client != "air-blue" || decoded.Rows[0].InputTokens != 17 || decoded.Rows[0].Requests != 2 {
+		t.Fatalf("air-blue row = %+v", decoded.Rows[0])
+	}
+	if decoded.Rows[0].FirstHour != "2026-09-26T10:00:00Z" || decoded.Rows[0].LastHour != "2026-09-26T11:00:00Z" {
+		t.Fatalf("air-blue hours = %+v", decoded.Rows[0])
+	}
+}
+
 func TestProxyRecordsTokenUsageForStreamedResponse(t *testing.T) {
 	const sse = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-5-codex\"}}\n\n" +
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5-codex\",\"usage\":{\"input_tokens\":40,\"input_tokens_details\":{\"cached_tokens\":30},\"output_tokens\":6,\"output_tokens_details\":{\"reasoning_tokens\":2}}}}\n\n"

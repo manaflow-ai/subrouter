@@ -134,6 +134,18 @@ func (s Server) poolNextAvailable(candidates []accounts.Account, poolModel strin
 
 var retryAfterTokenPattern = regexp.MustCompile(`retry after \d+s`)
 
+// accountSelectionFailureReason labels a failed account selection for the
+// traffic sample, the log, and X-Subrouter-Reason: pool_exhausted when every
+// account is out of quota, account_selection for anything else (a refresh
+// failure, a broker error, no account for the provider).
+func accountSelectionFailureReason(err error) string {
+	var exhausted *poolExhaustedError
+	if errors.As(err, &exhausted) {
+		return "pool_exhausted"
+	}
+	return "account_selection"
+}
+
 // writeAccountSelectionUnavailable answers a request whose account selection
 // failed. An exhausted pool with a known recovery time sets Retry-After to the
 // same N its message carries. A hosted broker's Retry-After is relayed, and

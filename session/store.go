@@ -42,10 +42,17 @@ type Store struct {
 	path string
 	mu   sync.Mutex
 	data map[string]Assignment
+	// seen is this process's last use of each assignment key. UpdatedAt is
+	// written at most once per sessionActivityWriteInterval, so it cannot
+	// tell a session that ran a minute ago from one idle for a day; seen can.
+	// It is memory only: the routing process is the one that touches. After
+	// a restart a running session older than the window counts as idle until
+	// its next request.
+	seen map[string]time.Time
 }
 
 func NewStore(path string) (*Store, error) {
-	store := &Store{path: path, data: map[string]Assignment{}}
+	store := &Store{path: path, data: map[string]Assignment{}, seen: map[string]time.Time{}}
 	lock, err := lockSessionStore(path)
 	if err != nil {
 		return nil, err
@@ -99,8 +106,43 @@ func (s *Store) Put(agentType, sessionID, accountID, userEmail string) (Assignme
 		}
 	}
 	s.data[key] = assignment
+	s.noteSeenLocked(key, now)
 	s.pruneLocked()
 	return assignment, s.saveLocked()
+}
+
+func (s *Store) noteSeenLocked(key string, now time.Time) {
+	if s.seen == nil {
+		s.seen = map[string]time.Time{}
+	}
+	s.seen[key] = now
+}
+
+// ActiveSince returns the assignments used at or after cutoff: by this
+// process (Put, Touch, CompareAndPut) or, failing that, by their stored
+// UpdatedAt. Placement counts these instead of every retained assignment, so
+// sessions that ended hours ago stop damping their account's share of new
+// sessions.
+func (s *Store) ActiveSince(cutoff time.Time) []Assignment {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reloadBestEffortLocked()
+	active := make([]Assignment, 0, len(s.data))
+	for key, assignment := range s.data {
+		last := assignment.UpdatedAt
+		if seen, ok := s.seen[key]; ok && seen.After(last) {
+			last = seen
+		}
+		if !last.Before(cutoff) {
+			active = append(active, assignment)
+		}
+	}
+	for key := range s.seen {
+		if _, ok := s.data[key]; !ok {
+			delete(s.seen, key)
+		}
+	}
+	return active
 }
 
 // Touch records recent use of an existing sticky assignment. Updates are
@@ -124,6 +166,7 @@ func (s *Store) Touch(agentType, sessionID string) (Assignment, bool, error) {
 		return Assignment{}, false, nil
 	}
 	now := time.Now().UTC()
+	s.noteSeenLocked(key, now)
 	if now.Sub(assignment.UpdatedAt) < sessionActivityWriteInterval {
 		return assignment, true, nil
 	}
@@ -178,6 +221,7 @@ func (s *Store) CompareAndPut(agentType, sessionID, expectedAccountID, accountID
 		s.data[key] = existing
 		return Assignment{}, false, err
 	}
+	s.noteSeenLocked(key, now)
 	return assignment, true, nil
 }
 

@@ -170,7 +170,7 @@ func TestClaudeNewSessionPlanFirstEarlyInPeriod(t *testing.T) {
 	}
 }
 
-func TestClaudeNewSessionPromotesBehindPaceKey(t *testing.T) {
+func TestClaudeNewSessionKeepsSubscriptionAheadOfPromotedKey(t *testing.T) {
 	now := time.Now().UTC()
 	server, _ := claudeCreditServer(t,
 		[]selectacct.Score{{AccountID: "plan", Headroom: 0.9, ShortHeadroom: 0.9, WeeklyHeadroom: 0.9}},
@@ -179,8 +179,8 @@ func TestClaudeNewSessionPromotesBehindPaceKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != "claude:behind" {
-		t.Fatalf("picked %q, want the behind-pace credit key ahead of plan quota", got.ID)
+	if got.ID != "plan" {
+		t.Fatalf("picked %q, want subscription quota ahead of a promoted API key", got.ID)
 	}
 	statuses := server.withClaudeCostTiers([]AccountUsageStatus{
 		{AccountStatus: AccountStatus{ID: "claude:behind", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey}},
@@ -191,7 +191,7 @@ func TestClaudeNewSessionPromotesBehindPaceKey(t *testing.T) {
 	}
 }
 
-func TestClaudeFinal48hKeyPromotedAndSoonestExpiryFirst(t *testing.T) {
+func TestClaudeFinal48hKeyStaysBehindSubscriptionAndSoonestExpiryFirst(t *testing.T) {
 	now := time.Now().UTC()
 	final := creditState(now.Add(30*time.Hour).AddDate(0, -1, 0), 120)
 	final.BurnUSDPerHour, final.BurnUpdatedAt = 50, now
@@ -203,8 +203,8 @@ func TestClaudeFinal48hKeyPromotedAndSoonestExpiryFirst(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != "claude:final" {
-		t.Fatalf("picked %q, want the key expiring within 48h first", got.ID)
+	if got.ID != "plan" {
+		t.Fatalf("picked %q, want subscription quota ahead of a key expiring within 48h", got.ID)
 	}
 
 	// Two ordinary (unpromoted) keys: the one expiring first is spent first.

@@ -1877,6 +1877,129 @@ func (s Server) handleTokenUsage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// DeviceUsageRow rolls the hourly token ledger up by provider, serving
+// account, model, and client label. It is intended for the private team
+// diagnostics surface; it contains counters only, never prompts or bodies.
+type DeviceUsageRow struct {
+	Provider                 string           `json:"provider"`
+	AccountID                string           `json:"account_id"`
+	Model                    string           `json:"model"`
+	Client                   string           `json:"client"`
+	FirstHour                string           `json:"first_hour"`
+	LastHour                 string           `json:"last_hour"`
+	Requests                 int64            `json:"requests"`
+	RequestsWithoutUsage     int64            `json:"requests_without_usage"`
+	InputTokens              int64            `json:"input_tokens"`
+	CachedInputTokens        int64            `json:"cached_input_tokens"`
+	CacheWriteInputTokens    int64            `json:"cache_write_input_tokens"`
+	OutputTokens             int64            `json:"output_tokens"`
+	ReasoningOutputTokens    int64            `json:"reasoning_output_tokens"`
+	AccountSwitches          int64            `json:"account_switches,omitempty"`
+	AccountSwitchInputTokens int64            `json:"account_switch_input_tokens,omitempty"`
+	AccountSwitchesInRequest int64            `json:"account_switches_in_request,omitempty"`
+	UpstreamErrors           map[string]int64 `json:"upstream_errors,omitempty"`
+}
+
+type deviceUsageKey struct {
+	Provider  string
+	AccountID string
+	Model     string
+	Client    string
+}
+
+func aggregateDeviceUsage(rows []TokenUsageRow) []DeviceUsageRow {
+	aggregates := make(map[deviceUsageKey]DeviceUsageRow, len(rows))
+	for _, row := range rows {
+		key := deviceUsageKey{Provider: row.Provider, AccountID: row.AccountID, Model: row.Model, Client: row.Client}
+		item := aggregates[key]
+		item.Provider, item.AccountID, item.Model, item.Client = key.Provider, key.AccountID, key.Model, key.Client
+		if item.FirstHour == "" || row.Hour < item.FirstHour {
+			item.FirstHour = row.Hour
+		}
+		if row.Hour > item.LastHour {
+			item.LastHour = row.Hour
+		}
+		item.Requests += row.Requests
+		item.RequestsWithoutUsage += row.RequestsWithoutUsage
+		item.InputTokens += row.InputTokens
+		item.CachedInputTokens += row.CachedInputTokens
+		item.CacheWriteInputTokens += row.CacheWriteInputTokens
+		item.OutputTokens += row.OutputTokens
+		item.ReasoningOutputTokens += row.ReasoningOutputTokens
+		item.AccountSwitches += row.AccountSwitches
+		item.AccountSwitchInputTokens += row.AccountSwitchInputTokens
+		item.AccountSwitchesInRequest += row.AccountSwitchesInRequest
+		for label, count := range row.UpstreamErrors {
+			if item.UpstreamErrors == nil {
+				item.UpstreamErrors = map[string]int64{}
+			}
+			item.UpstreamErrors[label] += count
+		}
+		aggregates[key] = item
+	}
+	keys := make([]deviceUsageKey, 0, len(aggregates))
+	for key := range aggregates {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].Client != keys[j].Client {
+			return keys[i].Client < keys[j].Client
+		}
+		if keys[i].Provider != keys[j].Provider {
+			return keys[i].Provider < keys[j].Provider
+		}
+		if keys[i].AccountID != keys[j].AccountID {
+			return keys[i].AccountID < keys[j].AccountID
+		}
+		return keys[i].Model < keys[j].Model
+	})
+	out := make([]DeviceUsageRow, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, aggregates[key])
+	}
+	return out
+}
+
+// handleDeviceUsage serves the private client-to-account usage rollup.
+func (s Server) handleDeviceUsage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	now := time.Now().UTC()
+	if s.TokenUsage != nil {
+		now = s.TokenUsage.clock().UTC()
+	}
+	since, err := parseTokenUsageSince(r.URL.Query().Get("since"), now)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if s.TokenUsage == nil {
+		writeJSON(w, struct {
+			Since       string           `json:"since"`
+			GeneratedAt string           `json:"generated_at"`
+			Rows        []DeviceUsageRow `json:"rows"`
+		}{Since: since.Format(time.RFC3339), GeneratedAt: now.Format(time.RFC3339), Rows: []DeviceUsageRow{}})
+		return
+	}
+	rows, err := s.TokenUsage.Rows(since)
+	if err != nil {
+		http.Error(w, "read token usage: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, struct {
+		Since       string           `json:"since"`
+		GeneratedAt string           `json:"generated_at"`
+		Rows        []DeviceUsageRow `json:"rows"`
+	}{
+		Since:       since.Format(time.RFC3339),
+		GeneratedAt: now.Format(time.RFC3339),
+		Rows:        aggregateDeviceUsage(rows),
+	})
+}
+
 // parseTokenUsageSince accepts a Go duration ("24h", "90m") or an RFC3339
 // time, defaults to 24h, and clamps to the 30-day retention window.
 func parseTokenUsageSince(value string, now time.Time) (time.Time, error) {

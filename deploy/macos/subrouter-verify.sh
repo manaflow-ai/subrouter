@@ -14,11 +14,43 @@
 # /var/lib/subrouter-verify/alerts.log; a summary to status.json.
 set -uo pipefail
 
+# Prints "<healthy> <total>" Claude accounts from a usage-status body on stdin,
+# "0 0" when it is not JSON. Matches ../gcp/subrouter-verify.sh: API keys have
+# no usage windows and usage-status never auth-checks them (auth_valid=false),
+# so a key counts unless its spent-credit hold is live; per-model Feature
+# windows do not cook a whole account.
+count_healthy_claude() {
+  python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("0 0"); sys.exit()
+rows = d if isinstance(d, list) else d.get("accounts", [])
+cl = [x for x in rows if x.get("provider") == "claude"]
+def healthy(x):
+    if x.get("error"):
+        return False
+    if x.get("auth_mode") == "apikey":
+        return (x.get("credit") or {}).get("pace") != "spent"
+    ws = [w for w in x.get("windows") or [] if not w.get("Feature")]
+    mx = max([w.get("UsedPercent", 0) for w in ws], default=0)
+    return bool(x.get("auth_valid")) and mx < 95
+print(sum(1 for x in cl if healthy(x)), len(cl))
+' 2>/dev/null || echo "0 0"
+}
+
+if [ "${1:-}" = "--count-healthy" ]; then
+  count_healthy_claude
+  exit 0
+fi
+
 LABEL="${SUBROUTER_LABEL:-ai.manaflow.subrouter-team}"
 HEALTH="${SUBROUTER_HEALTH_URL:-http://127.0.0.1:31415/_subrouter/health}"
 USAGE="${SUBROUTER_USAGE_URL:-http://127.0.0.1:31415/_subrouter/usage-status}"
 PROXY="${SUBROUTER_PROXY_URL:-http://127.0.0.1:31415/v1/messages}"
-LOGS=("/var/log/subrouter.err.log" "/var/log/subrouter.log")
+# SUBROUTER_VERIFY_LOGS is colon-separated, like PATH, so paths may hold spaces.
+IFS=: read -r -a LOGS <<<"${SUBROUTER_VERIFY_LOGS:-/var/log/subrouter.err.log:/var/log/subrouter.log}"
 STATE="${SUBROUTER_VERIFY_STATE:-/var/lib/subrouter-verify}"
 CANARY_STAMP="$STATE/canary.last"
 ALERTS="$STATE/alerts.log"
@@ -59,22 +91,21 @@ read_new_log() {
 }
 
 # --- healthy Claude account count from usage-status (for the invariant) ---
-counts=$(curl -fsS "$USAGE" 2>/dev/null | python3 -c '
-import sys, json
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print("0 0"); sys.exit()
-rows = d if isinstance(d, list) else d.get("accounts", [])
-cl = [x for x in rows if x.get("provider") == "claude"]
-def healthy(x):
-    ws = x.get("windows") or []
-    mx = max([w.get("UsedPercent", 0) for w in ws], default=0)
-    return bool(x.get("auth_valid")) and not x.get("error") and mx < 95
-print(sum(1 for x in cl if healthy(x)), len(cl))
-' 2>/dev/null || echo "0 0")
-healthy_claude=$(awk '{print $1}' <<<"$counts"); : "${healthy_claude:=0}"
-total_claude=$(awk '{print $2}' <<<"$counts"); : "${total_claude:=0}"
+# A failed fetch also counts "0 0"; usage_known keeps that apart from a pool
+# that is genuinely cooked, so the invariant below never excuses a failed
+# reroute on data it does not have.
+usage_known=1
+if ! usage_body=$(curl -fsS "$USAGE" 2>/dev/null); then
+  usage_known=0
+  usage_body=""
+fi
+healthy_counts=$(printf '%s' "$usage_body" | count_healthy_claude)
+healthy_claude=$(awk '{print $1}' <<<"$healthy_counts"); : "${healthy_claude:=0}"
+total_claude=$(awk '{print $2}' <<<"$healthy_counts"); : "${total_claude:=0}"
+[ "$total_claude" -eq 0 ] && usage_known=0
+if [ "$usage_known" -eq 0 ]; then
+  emit ALERT "usage-status unavailable or empty at $USAGE; healthy Claude accounts unknown"
+fi
 
 # --- 1. health + version (detect a down service or silent rollback) ---
 state_line=$(launchctl print "system/${LABEL}" 2>/dev/null | awk -F'= ' '/[^a-z]state = /{print $2; exit}')
@@ -195,7 +226,9 @@ while IFS= read -r l; do
     *"claude rate-limit returned to client after failover exhausted"*)
       reason=$(sed -n 's/.*reason=\([^ ]*\).*/\1/p' <<<"$l")
       tried=$(sed -n 's/.*tried_accounts=\([0-9]*\).*/\1/p' <<<"$l"); : "${tried:=0}"
-      if [ "$healthy_claude" -gt 0 ] && [ "$tried" -lt "$total_claude" ]; then
+      if [ "$usage_known" -eq 0 ]; then
+        emit ALERT "failed reroute while the pool state is unknown (usage-status unavailable): reason=$reason tried=$tried :: $l"
+      elif [ "$healthy_claude" -gt 0 ] && [ "$tried" -lt "$total_claude" ]; then
         emit ALERT "failed reroute while healthy accounts existed: reason=$reason tried=$tried total_claude=$total_claude healthy=$healthy_claude :: $l"
       else
         emit INFO "failover exhausted, pool genuinely constrained: reason=$reason tried=$tried healthy=$healthy_claude"

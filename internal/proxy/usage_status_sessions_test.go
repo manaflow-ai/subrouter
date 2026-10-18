@@ -29,6 +29,34 @@ func TestUsageStatusAddsAssignedSessionCounts(t *testing.T) {
 	}
 }
 
+func TestUsageStatusAddsSessionActivityMetadata(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("claude", "active", "claude:work", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("claude", "idle", "claude:work", ""); err != nil {
+		t.Fatal(err)
+	}
+	active := NewActiveSessions()
+	end := active.Begin("claude", "active")
+	defer end()
+
+	server := Server{Sessions: store, ActiveSessions: active}
+	statuses := server.withSessionActivity(server.withSessionCounts([]AccountUsageStatus{{AccountStatus: AccountStatus{
+		ID: "claude:work", Provider: accounts.ProviderClaude,
+	}}}))
+	status := statuses[0]
+	if status.ActiveSessions != 1 || status.RecentSessions != 2 {
+		t.Fatalf("session activity = %+v, want one active and two recent", status)
+	}
+	if status.FirstSessionAt == nil || status.LastSessionAt == nil {
+		t.Fatalf("session timestamps = %+v, want both timestamps", status)
+	}
+}
+
 func TestKimiUsageStatusIsActiveOnlyWithAssignedSession(t *testing.T) {
 	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
 	if err != nil {

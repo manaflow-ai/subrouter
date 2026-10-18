@@ -48,6 +48,41 @@ type upstreamAttempt struct {
 	addressed            accounts.Account
 	capacityRetryStarted time.Time
 	capacityPolicy       *codexCapacityRetryPolicy
+	// reserved is an admission slot a spill already holds on the account it
+	// moved the request to. The next physical attempt on that account uses
+	// it instead of acquiring (and possibly queueing for) another.
+	reserved *admissionLease
+	// region is where the request's physical attempts went (codex_regions.go).
+	region codexRegionAttemptState
+	// capacityFailures counts this request's capacity-failed attempts.
+	capacityFailures int
+}
+
+// reserve hands lease to the next physical attempt on its account,
+// releasing any earlier reservation that was never used.
+func (a *upstreamAttempt) reserve(lease *admissionLease) {
+	a.mu.Lock()
+	previous := a.reserved
+	a.reserved = lease
+	a.mu.Unlock()
+	previous.release()
+}
+
+// takeReserved returns the reserved slot for accountID, if any.
+func (a *upstreamAttempt) takeReserved(accountID string) *admissionLease {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	lease := a.reserved
+	if lease == nil || lease.key.account != accountID {
+		return nil
+	}
+	a.reserved = nil
+	return lease
+}
+
+// releaseReserved returns a reservation no attempt used.
+func (a *upstreamAttempt) releaseReserved() {
+	a.reserve(nil)
 }
 
 // standaloneUpstreamAttempt is the private state a layer uses when it was
@@ -121,17 +156,28 @@ func (t inflightAttemptTransport) RoundTrip(req *http.Request) (*http.Response, 
 	}
 	// Broker mode is skipped on every path (WebSocket, non-replayable and
 	// replayable alike) so load accounting agrees across them.
-	if t.attempt == nil || t.attempt.server == nil || t.attempt.server.CredentialBroker != nil ||
-		(t.attempt.server.SchedulerRef == nil && t.attempt.server.admission == nil) {
+	if t.attempt == nil || t.attempt.server == nil {
 		return base.RoundTrip(req)
 	}
 	account := t.attempt.current()
-	var admission *admissionLease
-	if t.attempt.server.admission != nil {
+	if t.attempt.server.ErrorEvents != nil {
+		// Every physical attempt passes here once, so each failed attempt of
+		// a retried request is recorded against the account that answered.
+		base = errorRecordingTransport{base: base, attempt: t.attempt, account: account}
+	}
+	if t.attempt.server.CredentialBroker != nil ||
+		(t.attempt.server.SchedulerRef == nil && t.attempt.server.admission == nil) {
+		return base.RoundTrip(req)
+	}
+	admission := t.attempt.takeReserved(account.ID)
+	if admission == nil && t.attempt.server.admission != nil {
 		key := admissionKeyFor(schedulerAccountProvider(account.Provider), account.ID, t.attempt.poolModel)
 		var err error
-		admission, err = t.attempt.server.admission.acquire(req.Context(), key)
+		admission, err = t.attempt.server.admission.acquireFor(req.Context(), key, admissionSessionKey{agent: t.attempt.agent, session: t.attempt.session})
 		if err != nil {
+			// A limiter rejection never reaches the upstream, so the error
+			// recorder below never sees it; record it here.
+			t.attempt.server.recordUpstreamFailure(req, t.attempt, account, nil, err)
 			return nil, err
 		}
 	}
@@ -165,6 +211,20 @@ func (t inflightAttemptTransport) RoundTrip(req *http.Request) (*http.Response, 
 			admission.release()
 		}
 	}}
+	return response, err
+}
+
+// errorRecordingTransport records a failed physical attempt in the server's
+// error event log before the retry layers above react to it.
+type errorRecordingTransport struct {
+	base    http.RoundTripper
+	attempt *upstreamAttempt
+	account accounts.Account
+}
+
+func (t errorRecordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	response, err := t.base.RoundTrip(req)
+	t.attempt.server.recordUpstreamFailure(req, t.attempt, t.account, response, err)
 	return response, err
 }
 
@@ -261,6 +321,12 @@ type upstreamLayers struct {
 	codexOverload  *codexOverloadFailoverTransport
 	codexEgress    *codexEgressFallbackTransport
 	azureCodex     *azureCodexFallbackTransport
+	// codexRegional sends each physical attempt out of the region the
+	// request's region state picks. codexOutcome asks the handler to record
+	// what the client got, outside every retry layer including autonomous
+	// agent retry.
+	codexRegional bool
+	codexOutcome  bool
 }
 
 // build composes the layers around base, innermost first. The order is the
@@ -270,6 +336,11 @@ func (l upstreamLayers) build(base http.RoundTripper, a *upstreamAttempt) http.R
 	// upstream attempt exactly once after the nearest send() has named the
 	// account whose credentials the request carries.
 	transport := http.RoundTripper(inflightAttemptTransport{base: base, attempt: a})
+	if l.codexRegional {
+		// Below every retry layer: each physical attempt picks its region.
+		// It wraps the in-flight accounting itself (see the type).
+		transport = codexRegionalTransport{base: base, attempt: a}
+	}
 	// Usage-limit and auth failover sits closest to the pool: quota, auth and
 	// model-capability answers belong to the account that produced them, so
 	// they are handled (marked, and failed over) before any layer above can

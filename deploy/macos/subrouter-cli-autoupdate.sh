@@ -103,6 +103,54 @@ semver_newer() {
   [ "${#lp[@]}" -gt "${#rp[@]}" ]
 }
 
+# supports_update_auto succeeds when the installed CLI has `update --auto`
+# (#623). The probe only reads help text, and SUBROUTER_NO_AUTO_UPDATE keeps the
+# probe itself from starting a background update.
+supports_update_auto() {
+  [ -x "$INSTALL_DIR/subrouter" ] || return 1
+  SUBROUTER_NO_AUTO_UPDATE=1 "$INSTALL_DIR/subrouter" update --help </dev/null 2>/dev/null \
+    | grep -q -- 'update --auto'
+}
+
+# update_auto_targets_cli succeeds when `update --auto` would replace
+# $INSTALL_DIR/subrouter itself. It replaces the binary the daemon LaunchAgent
+# runs (its --worker-bin under a supervisor), and only without that agent the
+# CLI that was invoked. When the daemon runs a different binary, handing over
+# would leave this CLI on its old release, so it stays on install.sh.
+update_auto_targets_cli() {
+  local plist="$HOME/Library/LaunchAgents/${SUBROUTER_DAEMON_LABEL:-ai.manaflow.subrouter}.plist"
+  [ -f "$plist" ] || return 0
+  python3 -I - "$plist" "$INSTALL_DIR/subrouter" <<'PY' 2>/dev/null
+import os, plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    args = plistlib.load(f).get("ProgramArguments") or []
+target = args[0] if args else ""
+if len(args) > 1 and args[1] == "supervise":
+    target = ""
+    for i, arg in enumerate(args):
+        if arg == "--worker-bin" and i + 1 < len(args):
+            target = args[i + 1]
+            break
+        if arg.startswith("--worker-bin="):
+            target = arg.split("=", 1)[1]
+            break
+real = lambda p: os.path.realpath(os.path.abspath(p))
+sys.exit(0 if target and real(target) == real(sys.argv[2]) else 1)
+PY
+}
+
+# A CLI that can update itself does it better than this script: `update
+# --auto` verifies the staged binary, keeps a backup, waits for the daemon to
+# be idle, health-checks it and restores on failure, and quietly skips a team
+# host, a package-manager install or a newer build. Hand over to it, and keep
+# the install.sh path below only to bring an older CLI onto a release that has
+# it.
+if supports_update_auto && update_auto_targets_cli; then
+  log "running $INSTALL_DIR/subrouter update --auto (details in ~/.subrouter/logs/auto-update.log)"
+  "$INSTALL_DIR/subrouter" update --auto </dev/null
+  exit
+fi
+
 latest_tag="$(resolve_latest_tag)"
 [ -n "$latest_tag" ] || { log "could not resolve latest release tag"; exit 1; }
 
