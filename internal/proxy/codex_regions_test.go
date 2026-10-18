@@ -283,6 +283,7 @@ func TestCodexRegionsRecordsClientVisibleFailure(t *testing.T) {
 func TestCodexRegionsFaultInjection(t *testing.T) {
 	local := newRegionPool(t, "local", always(false))
 	fra := newRegionPool(t, "fra", always(false))
+	var lastRegion string
 	post := func(t *testing.T, proxyURL string) (int, string) {
 		req, _ := http.NewRequest(http.MethodPost, proxyURL+"/responses",
 			strings.NewReader(`{"model":"gpt-6-astra","session_id":"fault-1","input":[]}`))
@@ -294,6 +295,7 @@ func TestCodexRegionsFaultInjection(t *testing.T) {
 		}
 		defer response.Body.Close()
 		body, _ := io.ReadAll(response.Body)
+		lastRegion = response.Header.Get(codexRegionHeader)
 		return response.StatusCode, string(body)
 	}
 
@@ -314,6 +316,9 @@ func TestCodexRegionsFaultInjection(t *testing.T) {
 	}
 	if local.http.Load() != localBefore {
 		t.Fatalf("local was called under a local fault")
+	}
+	if lastRegion != on.server.CodexEgress.Proxies[0].Host {
+		t.Fatalf("%s=%q, want the Frankfurt proxy", codexRegionHeader, lastRegion)
 	}
 	if local.sawTest.Load() || fra.sawTest.Load() {
 		t.Fatalf("the test fault header reached upstream")
@@ -524,5 +529,31 @@ func TestCodexRegionsFaultBlockingEveryRegionSendsNothing(t *testing.T) {
 	}
 	if local.http.Load() != 0 || fra.http.Load() != 0 {
 		t.Fatalf("local=%d fra=%d upstream calls, want none", local.http.Load(), fra.http.Load())
+	}
+}
+
+// /backend-api/codex/responses (what chatgpt_base_url clients send) gets the
+// same retry stack, region rotation included, as /v1/responses.
+func TestCodexRegionsBackendAPIPathUsesRegions(t *testing.T) {
+	local := newRegionPool(t, "local", always(false))
+	fra := newRegionPool(t, "fra", always(false))
+	rig := newRegionRig(t, local, fra)
+	rig.server.CodexFaultInjection = true
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+	req, _ := http.NewRequest(http.MethodPost, proxy.URL+"/backend-api/codex/responses",
+		strings.NewReader(`{"model":"gpt-6-astra","input":[],"stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Session", "backend-api-1")
+	req.Header.Set(codexFaultHeader, "capacity=local")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	t.Logf("status=%d region=%q local=%d fra=%d body=%.120s", response.StatusCode, response.Header.Get(codexRegionHeader), local.http.Load(), fra.http.Load(), body)
+	if local.http.Load() != 0 || fra.http.Load() != 1 || response.Header.Get(codexRegionHeader) == "" {
+		t.Fatalf("want Frankfurt to serve the backend-api path under a local fault")
 	}
 }
