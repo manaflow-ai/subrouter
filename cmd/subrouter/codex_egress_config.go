@@ -15,6 +15,8 @@ import (
 // comma-separated list of HTTP CONNECT proxy URLs in other regions
 // (for example http://cmux-egress-fra:3128,http://cmux-egress-tyo:3128).
 // Unset or empty means the feature is off and the Codex path is unchanged.
+// SUBROUTER_CODEX_EGRESS_MAX_ATTEMPTS caps the egresses one request tries
+// (default proxy.DefaultCodexEgressMaxAttempts).
 func codexEgressConfigFromEnvironment(sessionPath string) (*proxy.CodexEgressConfig, error) {
 	raw := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_EGRESS_PROXIES"))
 	if raw == "" {
@@ -27,10 +29,18 @@ func codexEgressConfigFromEnvironment(sessionPath string) (*proxy.CodexEgressCon
 	if len(proxies) == 0 {
 		return nil, nil
 	}
-	return &proxy.CodexEgressConfig{
+	config := &proxy.CodexEgressConfig{
 		Proxies:      proxies,
 		PinStorePath: filepath.Join(filepath.Dir(sessionPath), "codex-egress-pins.json"),
-	}, nil
+	}
+	if raw := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_EGRESS_MAX_ATTEMPTS")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("SUBROUTER_CODEX_EGRESS_MAX_ATTEMPTS=%q: want a positive integer", raw)
+		}
+		config.MaxAttempts = n
+	}
+	return config, nil
 }
 
 // codexOverloadFailoverConfigFromEnvironment reads the Codex capacity retry
