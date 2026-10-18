@@ -490,12 +490,19 @@ func parseCodexFault(raw string) *codexFault {
 func (s *Server) withCodexFault(r *http.Request) *http.Request {
 	raw := r.Header.Get(codexFaultHeader)
 	r.Header.Del(codexFaultHeader)
-	if raw == "" || s == nil || !s.CodexFaultInjection || !isLoopbackRemote(r.RemoteAddr) {
+	if raw == "" || s == nil {
 		return r
 	}
 	fault := parseCodexFault(raw)
-	if fault == nil {
+	if !s.CodexFaultInjection || !isLoopbackRemote(r.RemoteAddr) || fault == nil {
+		if s.Logger != nil {
+			s.Logger.Warn("codex test fault ignored", "enabled", s.CodexFaultInjection,
+				"remote_addr", r.RemoteAddr, "parsed", fault != nil, "path", r.URL.Path)
+		}
 		return r
+	}
+	if s.Logger != nil {
+		s.Logger.Info("codex test fault applied", "regions", raw, "path", r.URL.Path)
 	}
 	return r.WithContext(context.WithValue(r.Context(), codexFaultKey{}, fault))
 }
