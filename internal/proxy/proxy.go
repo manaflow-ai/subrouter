@@ -10275,9 +10275,9 @@ func retryableResponsesPostRequest(r *http.Request) bool {
 	path := r.URL.Path
 	return path == "/responses" ||
 		path == "/v1/responses" ||
-		// The ChatGPT backend path an OAuth Codex request is rewritten to,
-		// and the one chatgpt_base_url clients send directly.
-		path == "/backend-api/codex/responses" ||
+		// A chatgpt_base_url client's /backend-api/codex/responses, after
+		// pathForUpstream strips /backend-api for an OAuth account.
+		path == "/codex/responses" ||
 		path == "/responses/compact" ||
 		path == "/v1/responses/compact" ||
 		// Codex's web-search backend. The body carries a query, so replaying it
