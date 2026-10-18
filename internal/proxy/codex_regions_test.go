@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -555,5 +556,130 @@ func TestCodexRegionsBackendAPIPathUsesRegions(t *testing.T) {
 	t.Logf("status=%d region=%q local=%d fra=%d body=%.120s", response.StatusCode, response.Header.Get(codexRegionHeader), local.http.Load(), fra.http.Load(), body)
 	if local.http.Load() != 0 || fra.http.Load() != 1 || response.Header.Get(codexRegionHeader) == "" {
 		t.Fatalf("want Frankfurt to serve the backend-api path under a local fault")
+	}
+}
+
+func readWebSocketUntilCloseOrTurn(t *testing.T, conn *websocket.Conn) (string, int) {
+	t.Helper()
+	var got []string
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for {
+		_, body, err := conn.ReadMessage()
+		if err != nil {
+			var closeErr *websocket.CloseError
+			if errors.As(err, &closeErr) {
+				return strings.Join(got, "\n"), closeErr.Code
+			}
+			t.Fatalf("read after %q: %v", got, err)
+		}
+		got = append(got, string(body))
+		if strings.Contains(string(body), "response.completed") || strings.Contains(string(body), "response.failed") {
+			return strings.Join(got, "\n"), 0
+		}
+	}
+}
+
+// A non-autonomous client (Codex Desktop) used to get a 1012 reconnect on
+// its first capacity failure; a self-contained turn is now served from the
+// next region behind the open socket.
+func TestCodexRegionsNonAutonomousTurnServedFromNextRegion(t *testing.T) {
+	local := newRegionPool(t, "local", always(true))
+	fra := newRegionPool(t, "fra", always(false))
+	rig := newRegionRig(t, local, fra)
+	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	conn := dialRegionWebSocket(t, proxy.URL, "desktop-1", false)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+	if code != 0 || !strings.Contains(turn, "served-from-fra") || strings.Contains(turn, "response.failed") {
+		t.Fatalf("turn=%q close=%d, want Frankfurt on the open socket", turn, code)
+	}
+	events := readCapacityEvents(t, rig.server.CodexCapacityEventsPath)
+	if countEvents(events, codexCapacityOutcomeAbsorbed, "") != 1 || countEvents(events, codexCapacityOutcomeClientVisible, "") != 0 {
+		t.Fatalf("events=%+v, want the turn absorbed", events)
+	}
+}
+
+// A turn chained on previous_response_id cannot leave its connection, so a
+// non-autonomous client keeps the old behavior.
+func TestCodexRegionsNonAutonomousChainedTurnKeepsOldPath(t *testing.T) {
+	local := newRegionPool(t, "local", always(true))
+	fra := newRegionPool(t, "fra", always(false))
+	rig := newRegionRig(t, local, fra)
+	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	conn := dialRegionWebSocket(t, proxy.URL, "desktop-chained", false)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_prev","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+	if strings.Contains(turn, "served-from-fra") || fra.creates.Load() != 0 {
+		t.Fatalf("turn=%q close=%d fra=%d, want no move to Frankfurt", turn, code, fra.creates.Load())
+	}
+}
+
+// When every region refuses, a non-autonomous turn stops after the bounded
+// region retries instead of waiting without end.
+func TestCodexRegionsNonAutonomousRetriesAreBounded(t *testing.T) {
+	local := newRegionPool(t, "local", always(true))
+	fra := newRegionPool(t, "fra", always(true))
+	tyo := newRegionPool(t, "tyo", always(true))
+	rig := newRegionRig(t, local, fra, tyo)
+	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	conn := dialRegionWebSocket(t, proxy.URL, "desktop-bounded", false)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+	creates := local.creates.Load() + fra.creates.Load() + tyo.creates.Load()
+	if creates != 1+codexWebSocketRegionRetries {
+		t.Fatalf("creates=%d (turn=%q close=%d), want the first attempt plus %d region retries", creates, turn, code, codexWebSocketRegionRetries)
+	}
+	if code == 0 && !strings.Contains(turn, "response.failed") {
+		t.Fatalf("turn=%q, want the failure or a close after the budget", turn)
+	}
+}
+
+// An upstream that refuses a turn with a close of its own is not a capacity
+// failure: a non-autonomous client still sees that close, unretried.
+func TestCodexRegionsNonAutonomousUpstreamCloseIsNotRetried(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var creates atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		creates.Add(1)
+		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "policy"))
+	}))
+	defer upstream.Close()
+	upstreamURL, _ := url.Parse(upstream.URL)
+	fra := newRegionPool(t, "fra", always(false))
+	rig := newRegionRig(t, &regionPool{name: "local", url: upstreamURL}, fra)
+	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	conn := dialRegionWebSocket(t, proxy.URL, "desktop-policy", false)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, code := readWebSocketUntilCloseOrTurn(t, conn)
+	if code != websocket.ClosePolicyViolation || creates.Load() != 1 || fra.creates.Load() != 0 {
+		t.Fatalf("close=%d upstream creates=%d fra=%d, want the 1008 passed through with no retry", code, creates.Load(), fra.creates.Load())
 	}
 }
