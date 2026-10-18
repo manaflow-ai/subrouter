@@ -436,7 +436,9 @@ func TestCodexEgressPinnedSessionSharesAttemptBudget(t *testing.T) {
 	if status, _ := codexEgressPost(t, proxy.URL, "session-budget"); status != http.StatusServiceUnavailable {
 		t.Fatalf("second turn status=%d, want the capacity failure", status)
 	}
-	if calls.Load() != 3 {
-		t.Fatalf("egress calls=%d, want 3 across both passes", calls.Load())
+	// 3 from the shared egress budget, plus the pool attempt between the
+	// passes, which leaves through a region too while local is cooling.
+	if calls.Load() != 4 {
+		t.Fatalf("egress calls=%d, want 4: the 3-attempt budget plus the pool attempt", calls.Load())
 	}
 }

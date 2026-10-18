@@ -59,6 +59,13 @@ type webSocketUpstreamLink struct {
 	// redial opens a new upstream connection on the same account, nil when
 	// the connection is not autonomous.
 	redial func(context.Context) (*websocket.Conn, error)
+	// region is the slot the current connection went out of; regional says
+	// the dial could have gone elsewhere (codex_websocket_regions.go).
+	region               int
+	regional             bool
+	rotate               bool
+	regionTried          map[int]struct{}
+	turnCapacityFailures int
 }
 
 func newWebSocketUpstreamLink(conn *websocket.Conn) *webSocketUpstreamLink {
@@ -190,6 +197,13 @@ func (s Server) retryCodexWebSocketTurn(ctx context.Context, link *webSocketUpst
 		return false
 	}
 	chained := codexWebSocketCreateChained(body)
+	if connAlive && !chained && link.regional {
+		// A self-contained turn that hit capacity redials out of the next
+		// healthy region; a resend on the same socket stays in the region
+		// that just refused it.
+		link.requestRotate()
+		connAlive = false
+	}
 	for attempt := 0; ; attempt++ {
 		if !link.wait(ctx, s.webSocketTurnRetryDelay(attempt)) {
 			return false
