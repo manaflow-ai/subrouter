@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"context"
+	"net"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -26,8 +28,12 @@ type codexWebSocketRegionPlanKey struct{}
 // codexWebSocketRegionPlan is the ordered list of slots a websocket dial
 // tries, carried from the routing handler to proxyWebSocket.
 type codexWebSocketRegionPlan struct {
-	slots []int
-	model string
+	slots      []int
+	model      string
+	sessionKey string
+	pinned     int // slot the session was pinned to, -1 when none
+	// allFaulted is a test fault that blocks every region: refuse the dial.
+	allFaulted bool
 }
 
 func withCodexWebSocketRegionPlan(ctx context.Context, plan *codexWebSocketRegionPlan) context.Context {
@@ -48,19 +54,31 @@ func (s Server) planCodexWebSocketRegions(ctx context.Context, agentType, sessio
 		return nil
 	}
 	key := azureCodexSessionKeyFor(agentType, sessionID)
-	keep := -1
+	pinnedSlot := -1
 	if pinned, ok := s.codexEgressSessions.lookup(key); ok && pinned >= 0 && pinned < health.slots()-1 {
-		keep = pinned + 1
+		pinnedSlot = pinned + 1
+	}
+	// The pin leads only while its region is healthy; a cooling pinned
+	// region falls back into the ordinary order with local first.
+	keep := pinnedSlot
+	if keep >= 0 && health.cooling(model, keep) {
+		keep = -1
 	}
 	fault := codexFaultFrom(ctx)
 	start := azureCodexEndpointIndex(key, health.slots()-1)
 	slots := health.order(model, health.slots()-1, start, health.slots(), keep, func(slot int) bool {
-		return fault.blocks(health.name(slot))
+		// A proxy the websocket dialer cannot use (https) is left out.
+		return fault.blocks(health.name(slot)) ||
+			(slot != codexRegionLocalSlot && (slot-1 >= len(s.codexEgressWebSocketDialers) || s.codexEgressWebSocketDialers[slot-1] == nil))
 	})
+	plan := &codexWebSocketRegionPlan{slots: slots, model: model, sessionKey: key, pinned: pinnedSlot}
 	if len(slots) == 0 {
-		return nil
+		if fault == nil {
+			return nil
+		}
+		plan.allFaulted = true
 	}
-	return &codexWebSocketRegionPlan{slots: slots, model: model}
+	return plan
 }
 
 // codexEgressWebSocketDialers mirrors outboundWebSocketDialer (http/1.1,
@@ -70,10 +88,21 @@ func codexEgressWebSocketDialers(config *CodexEgressConfig) []*websocket.Dialer 
 		return nil
 	}
 	base := outboundWebSocketDialer()
+	// The proxy is a tailnet peer: a reachable one answers in well under a
+	// second, so a dead one must not hold a reconnect for the 30s default.
+	proxyDialer := &net.Dialer{Timeout: codexEgressProxyDialTimeout, KeepAlive: 30 * time.Second}
 	dialers := make([]*websocket.Dialer, 0, len(config.Proxies))
 	for _, proxy := range config.Proxies {
+		if proxy.Scheme != "http" {
+			// gorilla/websocket dials only http:// proxies.
+			dialers = append(dialers, nil)
+			continue
+		}
 		dialer := *base
 		dialer.Proxy = http.ProxyURL(proxy)
+		dialer.NetDialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return proxyDialer.DialContext(ctx, outboundDialNetwork(addr), addr)
+		}
 		if base.TLSClientConfig != nil {
 			dialer.TLSClientConfig = base.TLSClientConfig.Clone()
 		}
@@ -82,8 +111,11 @@ func codexEgressWebSocketDialers(config *CodexEgressConfig) []*websocket.Dialer 
 	return dialers
 }
 
+// codexEgressProxyDialTimeout bounds the TCP connect to an egress proxy.
+const codexEgressProxyDialTimeout = 5 * time.Second
+
 func (s Server) codexWebSocketDialer(slot int) *websocket.Dialer {
-	if slot > codexRegionLocalSlot && slot-1 < len(s.codexEgressWebSocketDialers) {
+	if slot > codexRegionLocalSlot && slot-1 < len(s.codexEgressWebSocketDialers) && s.codexEgressWebSocketDialers[slot-1] != nil {
 		return s.codexEgressWebSocketDialers[slot-1]
 	}
 	return outboundWebSocketDialer()
@@ -110,6 +142,11 @@ func (s Server) dialCodexWebSocket(ctx context.Context, plan *codexWebSocketRegi
 		}
 		if slot != codexRegionLocalSlot {
 			s.codexRegions.note(model, slot, true)
+			if plan != nil && plan.pinned == slot {
+				// The pin points at a proxy that is down: let the session
+				// settle wherever the next dial lands.
+				s.codexEgressSessions.unpin(plan.sessionKey)
+			}
 		}
 		if s.Logger != nil {
 			s.Logger.Warn("codex websocket region unreachable; dialing the next one",
@@ -165,14 +202,24 @@ func (l *webSocketUpstreamLink) nextRedialSlot(health *codexRegionHealth, model 
 	}
 	order := pick()
 	if len(order) == 0 {
+		// Every region was tried for this turn: start the next round from
+		// the local uplink, so a dead egress is never redialed in a loop.
 		clear(l.regionTried)
-		l.regionTried[l.region] = struct{}{}
-		order = pick()
-	}
-	if len(order) == 0 {
-		return l.region
+		return codexRegionLocalSlot
 	}
 	return order[0]
+}
+
+// markRegionTried records a redial that failed, so the next rotation does
+// not pick the same dead region again.
+func (l *webSocketUpstreamLink) markRegionTried(slot int) {
+	l.mu.Lock()
+	if l.regionTried == nil {
+		l.regionTried = map[int]struct{}{}
+	}
+	l.regionTried[slot] = struct{}{}
+	l.rotate = true
+	l.mu.Unlock()
 }
 
 func (l *webSocketUpstreamLink) noteTurnCapacityFailure() int {

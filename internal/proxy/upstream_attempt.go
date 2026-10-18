@@ -335,11 +335,12 @@ func (l upstreamLayers) build(base http.RoundTripper, a *upstreamAttempt) http.R
 	// This wrapper sits below every retry layer, so it observes each physical
 	// upstream attempt exactly once after the nearest send() has named the
 	// account whose credentials the request carries.
+	transport := http.RoundTripper(inflightAttemptTransport{base: base, attempt: a})
 	if l.codexRegional {
 		// Below every retry layer: each physical attempt picks its region.
-		base = codexRegionalTransport{base: base, attempt: a}
+		// It wraps the in-flight accounting itself (see the type).
+		transport = codexRegionalTransport{base: base, attempt: a}
 	}
-	transport := http.RoundTripper(inflightAttemptTransport{base: base, attempt: a})
 	// Usage-limit and auth failover sits closest to the pool: quota, auth and
 	// model-capability answers belong to the account that produced them, so
 	// they are handled (marked, and failed over) before any layer above can

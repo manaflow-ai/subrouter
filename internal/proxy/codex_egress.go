@@ -215,7 +215,7 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, addressed acc
 	model := t.attempt.poolModel
 	failedAt := func(index int, status int, why error) {
 		health.note(model, index+1, true)
-		t.attempt.noteCodexRegionResult(index+1, true)
+		t.attempt.noteCodexRegionResult(index+1, true, why == nil)
 		event := CodexCapacityEvent{
 			Transport: "http", Region: health.name(index + 1), Account: addressed.ID, Model: model,
 			Reason: reason, Agent: t.attempt.agent, Session: t.attempt.session, Outcome: codexCapacityOutcomeAttempt,
@@ -230,7 +230,11 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, addressed acc
 	used := 0
 	var lastResponse *http.Response
 	var lastErr error
+	fault := codexFaultFrom(req.Context())
 	for _, index := range health.egressOrder(model, count, start, budget, keepStart) {
+		if fault.blocks(health.name(index + 1)) {
+			continue
+		}
 		if req.Context().Err() != nil {
 			break
 		}
@@ -289,7 +293,7 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, addressed acc
 			return response, nil, true, used
 		}
 		health.note(model, index+1, false)
-		t.attempt.noteCodexRegionResult(index+1, false)
+		t.attempt.noteCodexRegionResult(index+1, false, false)
 		t.server.codexEgressSessions.pin(t.sessionKey, index)
 		t.server.logCodexEgress("serving codex via regional egress", reason, egress, lastResponse.StatusCode, nil)
 		return lastResponse, nil, true, used

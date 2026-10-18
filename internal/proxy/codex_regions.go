@@ -2,7 +2,7 @@ package proxy
 
 import (
 	"context"
-	"io"
+	"errors"
 	"net/http"
 	"sort"
 	"strings"
@@ -143,6 +143,16 @@ func (h *codexRegionHealth) coolingLocked(model string, slot int, now time.Time)
 	return states[slot].cooling(now)
 }
 
+// cooling reports whether slot just failed model.
+func (h *codexRegionHealth) cooling(model string, slot int) bool {
+	if h == nil {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.coolingLocked(model, slot, h.now())
+}
+
 // localCooling reports whether the router's own uplink just failed model.
 func (h *codexRegionHealth) localCooling(model string) bool {
 	if h == nil {
@@ -268,10 +278,18 @@ func (h *codexRegionHealth) snapshot() []CodexRegionReport {
 
 // Per-request region state, kept on the shared upstreamAttempt.
 type codexRegionAttemptState struct {
-	last       int // slot of the last physical attempt, -1 before the first
-	lastFailed bool
-	tried      map[int]struct{}
+	last int // slot of the last physical attempt, -1 before the first
+	// rotate says the last attempt failed in a way its region owns (capacity
+	// or an unreachable proxy), so the next one leaves from elsewhere.
+	rotate bool
+	// lastCapacity says the last attempt was a capacity failure.
+	lastCapacity bool
+	tried        map[int]struct{}
 }
+
+// errCodexRegionsFaulted answers a request whose test fault blocks every
+// region. Nothing is sent upstream.
+var errCodexRegionsFaulted = errors.New("subrouter test fault blocks every codex region")
 
 // nextCodexRegion picks the slot for the request's next physical attempt.
 // The first attempt goes local unless local is cooling for the model (or
@@ -290,7 +308,7 @@ func (a *upstreamAttempt) nextCodexRegion(ctx context.Context) int {
 		st.tried = map[int]struct{}{}
 		st.last = -1
 	}
-	if st.last >= 0 && !st.lastFailed {
+	if st.last >= 0 && !st.rotate {
 		return st.last
 	}
 	fault := codexFaultFrom(ctx)
@@ -307,22 +325,29 @@ func (a *upstreamAttempt) nextCodexRegion(ctx context.Context) int {
 		clear(st.tried)
 		order = pick()
 	}
-	slot := codexRegionLocalSlot
-	if len(order) == 1 {
-		slot = order[0]
+	if len(order) == 0 {
+		// Only a test fault can block every region.
+		return -1
 	}
+	slot := order[0]
 	st.tried[slot] = struct{}{}
-	st.last, st.lastFailed = slot, false
+	st.last, st.rotate, st.lastCapacity = slot, false, false
 	return slot
 }
 
-func (a *upstreamAttempt) noteCodexRegionResult(slot int, capacityFailed bool) {
+func (a *upstreamAttempt) noteCodexRegionResult(slot int, rotate, capacity bool) {
 	a.mu.Lock()
-	a.region.last, a.region.lastFailed = slot, capacityFailed
-	if capacityFailed {
+	a.region.last, a.region.rotate, a.region.lastCapacity = slot, rotate, capacity
+	if capacity {
 		a.capacityFailures++
 	}
 	a.mu.Unlock()
+}
+
+func (a *upstreamAttempt) lastCodexAttemptCapacity() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.region.lastCapacity
 }
 
 func (a *upstreamAttempt) codexCapacityFailures() int {
@@ -341,7 +366,11 @@ func (a *upstreamAttempt) lastCodexRegion() string {
 // codexRegionalTransport sends each physical Codex attempt out of the region
 // nextCodexRegion picks. It sits at the bottom of the retry stack, so every
 // retry above it (same-account ladder, account failover, transport replay)
-// rotates regions on its own after a capacity failure.
+// rotates regions on its own after a capacity failure. It wraps the in-flight
+// accounting itself, so its stream peek is the outermost body wrapper and the
+// layers above reuse its verdict instead of peeking again. It never pins a
+// session: a region only steers while the local uplink is cooling, and the
+// egress fallback layer keeps its own pin rule.
 type codexRegionalTransport struct {
 	base    http.RoundTripper // the local uplink
 	attempt *upstreamAttempt
@@ -351,45 +380,55 @@ func (t codexRegionalTransport) RoundTrip(req *http.Request) (*http.Response, er
 	a := t.attempt
 	s := a.server
 	slot := a.nextCodexRegion(req.Context())
+	if slot < 0 {
+		return nil, errCodexRegionsFaulted
+	}
 	transport := t.base
 	if slot != codexRegionLocalSlot && slot-1 < len(s.codexEgressTransports) {
 		transport = s.codexEgressTransports[slot-1]
 	}
 	region := s.codexRegions.name(slot)
-	var response *http.Response
-	var err error
-	if codexFaultFrom(req.Context()).capacityAt(region) {
-		response = codexFaultCapacityResponse(req)
-	} else {
-		response, err = transport.RoundTrip(req)
-	}
+	response, err := inflightAttemptTransport{base: transport, attempt: a}.RoundTrip(req)
 	if err != nil {
-		// A dead proxy is the region's fault; a client that went away is not.
-		failed := req.Context().Err() == nil
-		if failed && slot != codexRegionLocalSlot {
+		// A dead proxy is the region's fault; a client that went away, or an
+		// account paused by admission, is not.
+		rotate := slot != codexRegionLocalSlot && req.Context().Err() == nil && !errors.Is(err, errAdmissionPaused)
+		if rotate {
 			s.codexRegions.note(a.poolModel, slot, true)
+			s.recordCodexCapacityEvent(CodexCapacityEvent{
+				Transport: "http", Region: region, Account: a.current().ID, Model: a.poolModel,
+				Reason: "egress_unreachable", Agent: a.agent, Session: a.session, Outcome: codexCapacityOutcomeAttempt,
+			})
 		}
-		a.noteCodexRegionResult(slot, failed && slot != codexRegionLocalSlot)
+		a.noteCodexRegionResult(slot, rotate, false)
 		return response, err
 	}
 	failed, reason, replaced := codexOverloadFailure(response)
 	s.codexRegions.note(a.poolModel, slot, failed)
-	a.noteCodexRegionResult(slot, failed)
+	a.noteCodexRegionResult(slot, failed, failed)
 	if failed {
 		s.recordCodexCapacityEvent(CodexCapacityEvent{
 			Transport: "http", Region: region, Account: a.current().ID, Model: a.poolModel,
 			Reason: reason, Agent: a.agent, Session: a.session, Outcome: codexCapacityOutcomeAttempt,
 		})
-	} else if slot != codexRegionLocalSlot && codexSuccessStatus(replaced.StatusCode) {
-		// Keep the conversation where it was served, like an egress replay.
-		s.codexEgressSessions.pin(azureCodexSessionKeyFor(a.agent, a.session), slot-1)
 	}
+	if replaced.Header == nil {
+		replaced.Header = make(http.Header)
+	}
+	replaced.Header.Set(codexRegionHeader, region)
 	return replaced, nil
 }
 
+// codexRegionHeader names the region that answered, on HTTP responses and
+// websocket upgrades.
+const codexRegionHeader = "X-Subrouter-Region"
+
 // codexCapacityOutcomeTransport is the outermost Codex layer: it sees what the
-// client gets. A request that hit capacity anywhere below and still served is
-// absorbed; one that ends in a capacity failure reached the client.
+// client gets. It does not peek: the region transport below recorded whether
+// the last physical attempt was a capacity failure. A request that hit
+// capacity and still served is absorbed; one whose last attempt was a
+// capacity failure reached the client; any other error after a capacity
+// failure is failed_other.
 type codexCapacityOutcomeTransport struct {
 	base    http.RoundTripper
 	attempt *upstreamAttempt
@@ -398,31 +437,31 @@ type codexCapacityOutcomeTransport struct {
 func (t codexCapacityOutcomeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	response, err := t.base.RoundTrip(req)
 	a := t.attempt
-	if err != nil || response == nil || req.Context().Err() != nil {
+	failures := a.codexCapacityFailures()
+	if failures == 0 || req.Context().Err() != nil {
 		return response, err
 	}
-	failed, reason, replaced := codexOverloadFailure(response)
-	if !failed && a.codexCapacityFailures() == 0 {
-		return replaced, nil
-	}
-	outcome := codexCapacityOutcomeAbsorbed
-	if failed {
+	outcome := codexCapacityOutcomeFailedOther
+	switch {
+	case err == nil && response != nil && a.lastCodexAttemptCapacity():
 		outcome = codexCapacityOutcomeClientVisible
+	case err == nil && response != nil && codexSuccessStatus(response.StatusCode):
+		outcome = codexCapacityOutcomeAbsorbed
 	}
 	a.server.recordCodexCapacityEvent(CodexCapacityEvent{
 		Transport: "http", Region: a.lastCodexRegion(), Account: a.current().ID, Model: a.poolModel,
-		Reason: reason, Agent: a.agent, Session: a.session, Outcome: outcome,
-		Attempts: a.codexCapacityFailures(),
+		Agent: a.agent, Session: a.session, Outcome: outcome, Attempts: failures,
 	})
-	return replaced, nil
+	return response, err
 }
 
 // Fault injection for live tests. Off unless the operator sets
 // SUBROUTER_CODEX_FAULT_INJECTION=1, and then honored only from loopback.
-// "X-Subrouter-Test-Fault: capacity=local,fly-egress-ams:3128" answers every
-// attempt in those regions with a synthetic server_is_overloaded failure and
-// keeps new websocket dials out of them. Nothing is sent upstream from a
-// faulted region.
+// "X-Subrouter-Test-Fault: capacity=local,fly-egress-ams:3128" keeps the
+// request (HTTP attempts and websocket dials) out of those regions, as if
+// they were at capacity. Nothing is synthesized: health, account marks and
+// other users' routing are untouched, and a request whose fault blocks every
+// region fails without reaching upstream.
 
 const codexFaultHeader = "X-Subrouter-Test-Fault"
 
@@ -469,28 +508,11 @@ func codexFaultFrom(ctx context.Context) *codexFault {
 	return fault
 }
 
-func (f *codexFault) capacityAt(region string) bool {
+// blocks keeps the region out of this request's routing.
+func (f *codexFault) blocks(region string) bool {
 	if f == nil {
 		return false
 	}
 	_, ok := f.regions[region]
 	return ok
-}
-
-// blocks keeps the region out of routing choices. Same set as capacityAt.
-func (f *codexFault) blocks(region string) bool { return f.capacityAt(region) }
-
-func codexFaultCapacityResponse(req *http.Request) *http.Response {
-	body := `{"error":{"type":"server_error","code":"server_is_overloaded","message":"Selected model is at capacity. Please try a different model. (subrouter test fault)"}}`
-	return &http.Response{
-		StatusCode:    http.StatusServiceUnavailable,
-		Status:        "503 Service Unavailable",
-		Proto:         "HTTP/1.1",
-		ProtoMajor:    1,
-		ProtoMinor:    1,
-		Header:        http.Header{"Content-Type": []string{"application/json"}},
-		Body:          io.NopCloser(strings.NewReader(body)),
-		ContentLength: int64(len(body)),
-		Request:       req,
-	}
 }
