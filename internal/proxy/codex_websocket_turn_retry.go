@@ -197,6 +197,11 @@ func (s Server) retryCodexWebSocketTurn(ctx context.Context, link *webSocketUpst
 		return false
 	}
 	chained := codexWebSocketCreateChained(body)
+	if modelState.regionRetry && chained {
+		// Only the old connection holds the previous response, and a
+		// non-autonomous client did not opt into waiting on it.
+		return false
+	}
 	if connAlive && !chained && link.regional {
 		// A self-contained turn that hit capacity redials out of the next
 		// healthy region; a resend on the same socket stays in the region
@@ -205,6 +210,9 @@ func (s Server) retryCodexWebSocketTurn(ctx context.Context, link *webSocketUpst
 		connAlive = false
 	}
 	for attempt := 0; ; attempt++ {
+		if !modelState.spendRegionRetry() {
+			return false
+		}
 		if !link.wait(ctx, s.webSocketTurnRetryDelay(attempt)) {
 			return false
 		}
