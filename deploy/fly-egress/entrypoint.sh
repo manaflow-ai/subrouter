@@ -45,7 +45,7 @@ User tinyproxy
 Group tinyproxy
 Listen $TS_IP
 Port 3128
-Timeout 3600
+Timeout 21600
 MaxClients 512
 LogLevel Warning
 Allow 100.64.0.0/10

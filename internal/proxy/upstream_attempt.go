@@ -52,6 +52,10 @@ type upstreamAttempt struct {
 	// moved the request to. The next physical attempt on that account uses
 	// it instead of acquiring (and possibly queueing for) another.
 	reserved *admissionLease
+	// region is where the request's physical attempts went (codex_regions.go).
+	region codexRegionAttemptState
+	// capacityFailures counts this request's capacity-failed attempts.
+	capacityFailures int
 }
 
 // reserve hands lease to the next physical attempt on its account,
@@ -317,6 +321,12 @@ type upstreamLayers struct {
 	codexOverload  *codexOverloadFailoverTransport
 	codexEgress    *codexEgressFallbackTransport
 	azureCodex     *azureCodexFallbackTransport
+	// codexRegional sends each physical attempt out of the region the
+	// request's region state picks. codexOutcome asks the handler to record
+	// what the client got, outside every retry layer including autonomous
+	// agent retry.
+	codexRegional bool
+	codexOutcome  bool
 }
 
 // build composes the layers around base, innermost first. The order is the
@@ -325,6 +335,10 @@ func (l upstreamLayers) build(base http.RoundTripper, a *upstreamAttempt) http.R
 	// This wrapper sits below every retry layer, so it observes each physical
 	// upstream attempt exactly once after the nearest send() has named the
 	// account whose credentials the request carries.
+	if l.codexRegional {
+		// Below every retry layer: each physical attempt picks its region.
+		base = codexRegionalTransport{base: base, attempt: a}
+	}
 	transport := http.RoundTripper(inflightAttemptTransport{base: base, attempt: a})
 	// Usage-limit and auth failover sits closest to the pool: quota, auth and
 	// model-capability answers belong to the account that produced them, so

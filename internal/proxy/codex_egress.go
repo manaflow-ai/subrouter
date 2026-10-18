@@ -1,11 +1,11 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -35,11 +35,6 @@ type CodexEgressConfig struct {
 // DefaultCodexEgressMaxAttempts is the per-request egress budget when
 // CodexEgressConfig.MaxAttempts is unset.
 const DefaultCodexEgressMaxAttempts = 4
-
-// codexEgressCooldown is how long an egress that just failed a request for
-// capacity is tried after the healthy ones. Regional headroom moves minute
-// to minute, so the mark is short and only reorders; it never excludes.
-const codexEgressCooldown = time.Minute
 
 func (c *CodexEgressConfig) maxAttempts() int {
 	if c == nil || c.MaxAttempts <= 0 {
@@ -109,77 +104,6 @@ func codexEgressTransports(config *CodexEgressConfig) []http.RoundTripper {
 		transports = append(transports, sniffContentTypeTransport{base: transport})
 	}
 	return transports
-}
-
-// codexEgressHealth remembers which egresses failed recently, so the next
-// request starts with a region that is serving.
-type codexEgressHealth struct {
-	mu       sync.Mutex
-	failedAt []time.Time
-	now      func() time.Time
-}
-
-func newCodexEgressHealth(count int) *codexEgressHealth {
-	return &codexEgressHealth{failedAt: make([]time.Time, count), now: time.Now}
-}
-
-func (h *codexEgressHealth) failed(index int) {
-	if h == nil || index < 0 || index >= len(h.failedAt) {
-		return
-	}
-	h.mu.Lock()
-	h.failedAt[index] = h.now()
-	h.mu.Unlock()
-}
-
-func (h *codexEgressHealth) served(index int) {
-	if h == nil || index < 0 || index >= len(h.failedAt) {
-		return
-	}
-	h.mu.Lock()
-	h.failedAt[index] = time.Time{}
-	h.mu.Unlock()
-}
-
-// order lists up to limit egress indexes to try, walking the ring from
-// start: egresses outside their cooldown first, then the cooling ones.
-// keepStart puts start first regardless, for a session already pinned there.
-func (h *codexEgressHealth) order(count, start, limit int, keepStart bool) []int {
-	if count <= 0 || limit <= 0 {
-		return nil
-	}
-	start = ((start % count) + count) % count
-	var now time.Time
-	if h != nil {
-		now = h.now()
-		h.mu.Lock()
-		defer h.mu.Unlock()
-	}
-	cooling := func(index int) bool {
-		if h == nil || index >= len(h.failedAt) || h.failedAt[index].IsZero() {
-			return false
-		}
-		return now.Sub(h.failedAt[index]) < codexEgressCooldown
-	}
-	order := make([]int, 0, min(limit, count))
-	if keepStart {
-		order = append(order, start)
-	}
-	for _, wantCooling := range []bool{false, true} {
-		for step := range count {
-			index := (start + step) % count
-			if keepStart && index == start {
-				continue
-			}
-			if cooling(index) == wantCooling {
-				order = append(order, index)
-			}
-		}
-	}
-	if len(order) > limit {
-		order = order[:limit]
-	}
-	return order
 }
 
 // codexEgressPoolFailed reports whether a pool status is the provider's own
@@ -287,11 +211,26 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, addressed acc
 	if count == 0 || budget <= 0 {
 		return nil, nil, false, 0
 	}
-	health := t.server.codexEgressHealth
+	health := t.server.codexRegions
+	model := t.attempt.poolModel
+	failedAt := func(index int, status int, why error) {
+		health.note(model, index+1, true)
+		t.attempt.noteCodexRegionResult(index+1, true)
+		event := CodexCapacityEvent{
+			Transport: "http", Region: health.name(index + 1), Account: addressed.ID, Model: model,
+			Reason: reason, Agent: t.attempt.agent, Session: t.attempt.session, Outcome: codexCapacityOutcomeAttempt,
+		}
+		if why != nil {
+			event.Reason = "egress_transport_error"
+		} else if status != 0 {
+			event.Reason = fmt.Sprintf("status_%d", status)
+		}
+		t.server.recordCodexCapacityEvent(event)
+	}
 	used := 0
 	var lastResponse *http.Response
 	var lastErr error
-	for _, index := range health.order(count, start, budget, keepStart) {
+	for _, index := range health.egressOrder(model, count, start, budget, keepStart) {
 		if req.Context().Err() != nil {
 			break
 		}
@@ -309,15 +248,16 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, addressed acc
 		}
 		lastResponse, lastErr = response, err
 		if err != nil {
-			// A client that went away is not the region's fault.
-			if req.Context().Err() == nil {
-				health.failed(index)
+			// A client that went away is not the region's fault, and an
+			// account paused by admission is the account's.
+			if req.Context().Err() == nil && !errors.Is(err, errAdmissionPaused) {
+				failedAt(index, 0, err)
 			}
 			t.server.logCodexEgress("codex egress attempt failed", reason, egress, 0, err)
 			continue
 		}
 		if codexEgressPoolFailed(response.StatusCode) {
-			health.failed(index)
+			failedAt(index, response.StatusCode, nil)
 			t.server.logCodexEgress("codex egress attempt failed", reason, egress, response.StatusCode, nil)
 			continue
 		}
@@ -325,7 +265,7 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, addressed acc
 			class, replaced := azureCodexStreamFailure(response)
 			lastResponse = replaced
 			if class == codexFailureServer {
-				health.failed(index)
+				failedAt(index, 0, nil)
 				t.server.logCodexEgress("codex egress attempt failed", reason, egress, response.StatusCode, nil)
 				continue
 			}
@@ -339,7 +279,7 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, addressed acc
 		}
 		if capacity, replaced := codexCapacityBody(lastResponse); capacity {
 			lastResponse = replaced
-			health.failed(index)
+			failedAt(index, 0, nil)
 			t.server.logCodexEgress("codex egress attempt failed", reason, egress, response.StatusCode, nil)
 			continue
 		}
@@ -348,7 +288,8 @@ func (t codexEgressFallbackTransport) tryEgress(req *http.Request, addressed acc
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
 			return response, nil, true, used
 		}
-		health.served(index)
+		health.note(model, index+1, false)
+		t.attempt.noteCodexRegionResult(index+1, false)
 		t.server.codexEgressSessions.pin(t.sessionKey, index)
 		t.server.logCodexEgress("serving codex via regional egress", reason, egress, lastResponse.StatusCode, nil)
 		return lastResponse, nil, true, used
@@ -380,7 +321,7 @@ func (s *Server) logCodexEgress(message, reason, egress string, status int, err 
 // 1012 close hands the session back to the client, whose reconnect is refused
 // with 426 and lands on the HTTP transport, where the pin serves it through
 // the egress.
-func (s Server) codexEgressWebSocketDivert(agentType, sessionID string) bool {
+func (s Server) codexEgressWebSocketDivert(agentType, sessionID, model string) bool {
 	if !s.CodexEgress.configured() {
 		return false
 	}
@@ -390,7 +331,7 @@ func (s Server) codexEgressWebSocketDivert(agentType, sessionID string) bool {
 	}
 	count := len(s.CodexEgress.Proxies)
 	index := azureCodexEndpointIndex(key, count)
-	if order := s.codexEgressHealth.order(count, index, 1, false); len(order) == 1 {
+	if order := s.codexRegions.egressOrder(model, count, index, 1, false); len(order) == 1 {
 		index = order[0]
 	}
 	s.codexEgressSessions.pin(key, index)

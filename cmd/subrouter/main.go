@@ -942,6 +942,8 @@ func serve(args []string) error {
 		ClaudeFableCacheTTLUpgradeOff: envTrue("SUBROUTER_FABLE_CACHE_1H_OFF"),
 		AzureCodex:                    azureCodexConfig,
 		CodexEgress:                   codexEgressConfig,
+		CodexCapacityEventsPath:       filepath.Join(filepath.Dir(*sessionPath), "codex-capacity-events.jsonl"),
+		CodexFaultInjection:           envTrue("SUBROUTER_CODEX_FAULT_INJECTION"),
 		CodexOverloadFailover:         codexOverloadConfig,
 		ClaudeOverloadReroute:         claudeOverloadReroute,
 		ClaudeOverloadRetry:           claudeOverloadRetry,
