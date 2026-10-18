@@ -23,6 +23,9 @@ const (
 	codexCapacityOutcomeAttempt       = "attempt_failed"
 	codexCapacityOutcomeAbsorbed      = "absorbed"
 	codexCapacityOutcomeClientVisible = "client_visible"
+	// codexCapacityOutcomeFailedOther is a request that hit capacity and then
+	// ended in some other error (quota, auth, transport).
+	codexCapacityOutcomeFailedOther = "failed_other"
 
 	codexCapacityEventsMaxBytes = 32 << 20
 	codexCapacityEventsKeep     = 4

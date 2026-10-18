@@ -444,3 +444,85 @@ func TestCodexRegionsAutonomousTurnRedialsInNextRegion(t *testing.T) {
 		t.Fatalf("events=%+v, want one local failure and one absorbed turn", events)
 	}
 }
+
+// A session that left local only because local was cooling is not pinned:
+// once local recovers, its next turn is served at home again.
+func TestCodexRegionsSessionReturnsHomeAfterCooldown(t *testing.T) {
+	var localDown atomic.Bool
+	localDown.Store(true)
+	local := newRegionPool(t, "local", localDown.Load)
+	fra := newRegionPool(t, "fra", always(false))
+	rig := newRegionRig(t, local, fra)
+	var mu sync.Mutex
+	now := time.Now()
+	rig.server.codexRegions = newCodexRegionHealth(rig.server.CodexEgress)
+	rig.server.codexRegions.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	// Another session's failure puts local in cooldown.
+	_, _ = codexEgressPost(t, proxy.URL, "other-session")
+	if status, body := codexEgressPost(t, proxy.URL, "home-1"); status != http.StatusOK || !strings.Contains(body, "served-from-fra") {
+		t.Fatalf("while cooling: status=%d body=%s, want Frankfurt", status, body)
+	}
+	localDown.Store(false)
+	mu.Lock()
+	now = now.Add(codexRegionCooldown + time.Second)
+	mu.Unlock()
+	if status, body := codexEgressPost(t, proxy.URL, "home-1"); status != http.StatusOK || !strings.Contains(body, "served-from-local") {
+		t.Fatalf("after cooldown: status=%d body=%s, want the local uplink", status, body)
+	}
+}
+
+// An autonomous turn's redial skips an egress whose proxy is down instead
+// of retrying it in a loop, and lands on the next region.
+func TestCodexRegionsAutonomousRedialSkipsDeadEgress(t *testing.T) {
+	local := newRegionPool(t, "local", always(true))
+	tyo := newRegionPool(t, "tyo", always(false))
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL, _ := url.Parse(dead.URL)
+	dead.Close()
+	var tyoCalls atomic.Int32
+	server := codexEgressServer(t, local.url, []*url.URL{deadURL, regionProxy(t, "tyo", tyo.url, &tyoCalls)}, 1)
+	server.CodexCapacityEventsPath = filepath.Join(t.TempDir(), "events.jsonl")
+	server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	for index := range 4 {
+		conn := dialRegionWebSocket(t, proxy.URL, fmt.Sprintf("dead-egress-%d", index), true)
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); err != nil {
+			t.Fatal(err)
+		}
+		if turn := readRegionTurn(t, conn); !strings.Contains(turn, "served-from-tyo") {
+			t.Fatalf("session %d turn=%s, want Tokyo", index, turn)
+		}
+	}
+}
+
+// A test fault that blocks every region fails the request without sending
+// anything upstream.
+func TestCodexRegionsFaultBlockingEveryRegionSendsNothing(t *testing.T) {
+	local := newRegionPool(t, "local", always(false))
+	fra := newRegionPool(t, "fra", always(false))
+	rig := newRegionRig(t, local, fra)
+	rig.server.CodexFaultInjection = true
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, proxy.URL+"/responses",
+		strings.NewReader(`{"model":"gpt-6-astra","session_id":"fault-all","input":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(codexFaultHeader, "capacity=local,"+rig.server.CodexEgress.Proxies[0].Host)
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode == http.StatusOK {
+		t.Fatalf("status=%d, want a failure", response.StatusCode)
+	}
+	if local.http.Load() != 0 || fra.http.Load() != 0 {
+		t.Fatalf("local=%d fra=%d upstream calls, want none", local.http.Load(), fra.http.Load())
+	}
+}
