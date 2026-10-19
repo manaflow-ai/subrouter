@@ -23,7 +23,7 @@ var codexWebSocketHistoryHeld atomic.Int64
 // connection and global budgets; nil drops it.
 func (s *webSocketModelState) setHistoryLocked(history []json.RawMessage, response string) {
 	codexWebSocketHistoryHeld.Add(-s.historyBytes)
-	s.history, s.historyResponse, s.historyBytes = nil, "", 0
+	s.history, s.historyResponse, s.historyBytes, s.historyMiss = nil, "", 0, ""
 	if history == nil {
 		return
 	}
@@ -32,10 +32,12 @@ func (s *webSocketModelState) setHistoryLocked(history []json.RawMessage, respon
 		size += int64(len(item))
 	}
 	if size > codexWebSocketHistoryLimit {
+		s.historyMiss = "over_limit"
 		return
 	}
 	if codexWebSocketHistoryHeld.Add(size) > codexWebSocketHistoryBudget {
 		codexWebSocketHistoryHeld.Add(-size)
+		s.historyMiss = "over_budget"
 		return
 	}
 	s.history, s.historyResponse, s.historyBytes = history, response, size
@@ -74,8 +76,10 @@ func codexWebSocketCreateInput(body []byte) (input []json.RawMessage, previous s
 // history belongs to. nil when that history is not known.
 func (s *webSocketModelState) fullInputLocked(body []byte) []json.RawMessage {
 	if !s.keepHistory {
+		s.rebuildMiss = "history_off"
 		return nil
 	}
+	s.rebuildMiss = ""
 	input, previous, ok := codexWebSocketCreateInput(body)
 	if !ok {
 		return nil
@@ -83,7 +87,15 @@ func (s *webSocketModelState) fullInputLocked(body []byte) []json.RawMessage {
 	if previous == "" {
 		return input
 	}
-	if s.history == nil || previous != s.historyResponse {
+	switch {
+	case s.history == nil && s.historyMiss != "":
+		s.rebuildMiss = s.historyMiss
+		return nil
+	case s.history == nil:
+		s.rebuildMiss = "no_history"
+		return nil
+	case previous != s.historyResponse:
+		s.rebuildMiss = "other_response"
 		return nil
 	}
 	full := make([]json.RawMessage, 0, len(s.history)+len(input))
@@ -120,6 +132,10 @@ func (s *webSocketModelState) noteHistory(body []byte) {
 	case "response.completed":
 		if len(s.pendingInputs) == 0 || s.pendingInputs[0] == nil || event.Response.ID == "" {
 			s.setHistoryLocked(nil, "")
+			s.historyMiss = "turn_without_history"
+			if len(s.pendingInputs) == 0 {
+				s.historyMiss = "no_pending_turn"
+			}
 			return
 		}
 		history := make([]json.RawMessage, 0, len(s.pendingInputs[0])+len(s.turnOutput))
@@ -136,8 +152,12 @@ func (s *webSocketModelState) rebuildPendingCreate() []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.pendingBodies) == 0 || len(s.pendingInputs) == 0 || s.pendingInputs[0] == nil {
+		if s.rebuildMiss == "" {
+			s.rebuildMiss = "no_full_input"
+		}
 		return nil
 	}
+	s.rebuildMiss = "bad_json"
 	var event map[string]json.RawMessage
 	if err := json.Unmarshal(s.pendingBodies[0], &event); err != nil {
 		return nil
@@ -164,7 +184,16 @@ func (s *webSocketModelState) rebuildPendingCreate() []byte {
 	if err != nil {
 		return nil
 	}
+	s.rebuildMiss = ""
 	s.pendingBodies[0] = rebuilt
 	s.requestBytes = max(s.requestBytes, int64(len(rebuilt)))
 	return rebuilt
+}
+
+// rebuildMissReason says why the last chained turn could not be rebuilt, for
+// the log.
+func (s *webSocketModelState) rebuildMissReason() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rebuildMiss
 }

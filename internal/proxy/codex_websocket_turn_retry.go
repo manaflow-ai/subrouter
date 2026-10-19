@@ -207,6 +207,9 @@ func (s Server) retryCodexWebSocketTurn(ctx context.Context, link *webSocketUpst
 		// leave the region that refused it.
 		if full := modelState.rebuildPendingCreate(); full != nil {
 			body, chained, rebuilt = full, false, true
+		} else if s.Logger != nil {
+			s.Logger.Info("codex websocket chained turn not rebuilt; resending on its connection",
+				"agent", agentType, "session", sessionID, "account", accountID, "reason", modelState.rebuildMissReason())
 		}
 	}
 	if connAlive && !chained && link.regional {
