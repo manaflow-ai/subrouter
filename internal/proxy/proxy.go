@@ -6752,6 +6752,9 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	// to the 1012 reconnect a non-autonomous client sees.
 	modelState.regionRetry = !modelState.autonomousRetrying && link.regional && !modelState.realtime &&
 		account.Provider == accounts.ProviderCodex
+	// Only a connection that can dial another region uses the history.
+	modelState.keepHistory = link.regional && !modelState.realtime && (modelState.autonomousRetrying || modelState.regionRetry)
+	defer modelState.releaseHistory()
 	if modelState.autonomousRetrying || modelState.regionRetry {
 		regionKey := azureCodexSessionKeyFor(agentType, sessionID)
 		link.redial = func(ctx context.Context) (*websocket.Conn, error) {
@@ -6942,7 +6945,8 @@ type webSocketModelState struct {
 	// same-account retries are spent.
 	turnCapacityAccount  string
 	turnCapacityFailures int
-	// history is what the upstream connection holds as historyResponse:
+	// keepHistory turns on the history below. history is what the upstream
+	// connection holds as historyResponse:
 	// the full input of the last completed turn and its output items. A
 	// turn chained on that response can then be rebuilt self-contained and
 	// sent from another region. nil when unknown or too large to keep.
@@ -6950,7 +6954,11 @@ type webSocketModelState struct {
 	historyResponse string
 	// pendingInputs parallels pendingBodies with each turn's full input
 	// (history plus the turn's own input), nil when it cannot be rebuilt;
-	// turnOutput collects the output items of the turn in flight.
+	// turnOutput collects the output items of the turn in flight. Codex
+	// sends one turn at a time on a connection; a turn sent before the one
+	// in flight completed is never chained on it, so it gets no history.
+	keepHistory   bool
+	historyBytes  int64
 	pendingInputs [][]json.RawMessage
 	turnOutput    []json.RawMessage
 }

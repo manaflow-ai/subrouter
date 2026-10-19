@@ -4,12 +4,50 @@ import (
 	"bytes"
 	"encoding/json"
 	"strings"
+	"sync/atomic"
 )
 
 // codexWebSocketHistoryLimit bounds the conversation one connection keeps
-// for rebuilding chained turns; a larger one is not kept and its chained
+// for rebuilding chained turns, and codexWebSocketHistoryBudget all of them
+// together; a conversation that does not fit is not kept and its chained
 // turns stay on their connection.
-const codexWebSocketHistoryLimit = 8 << 20
+const (
+	codexWebSocketHistoryLimit  = 8 << 20
+	codexWebSocketHistoryBudget = 512 << 20
+)
+
+// codexWebSocketHistoryHeld is the history bytes all connections hold.
+var codexWebSocketHistoryHeld atomic.Int64
+
+// setHistoryLocked replaces the connection's history, within the per
+// connection and global budgets; nil drops it.
+func (s *webSocketModelState) setHistoryLocked(history []json.RawMessage, response string) {
+	codexWebSocketHistoryHeld.Add(-s.historyBytes)
+	s.history, s.historyResponse, s.historyBytes = nil, "", 0
+	if history == nil {
+		return
+	}
+	var size int64
+	for _, item := range history {
+		size += int64(len(item))
+	}
+	if size > codexWebSocketHistoryLimit {
+		return
+	}
+	if codexWebSocketHistoryHeld.Add(size) > codexWebSocketHistoryBudget {
+		codexWebSocketHistoryHeld.Add(-size)
+		return
+	}
+	s.history, s.historyResponse, s.historyBytes = history, response, size
+}
+
+// releaseHistory gives the connection's history back to the global budget
+// when the connection ends.
+func (s *webSocketModelState) releaseHistory() {
+	s.mu.Lock()
+	s.setHistoryLocked(nil, "")
+	s.mu.Unlock()
+}
 
 // codexWebSocketCreateInput is a response.create's input items and its
 // previous_response_id, top level or under response.
@@ -35,6 +73,9 @@ func codexWebSocketCreateInput(body []byte) (input []json.RawMessage, previous s
 // own input, after the history when it is chained on the response the
 // history belongs to. nil when that history is not known.
 func (s *webSocketModelState) fullInputLocked(body []byte) []json.RawMessage {
+	if !s.keepHistory {
+		return nil
+	}
 	input, previous, ok := codexWebSocketCreateInput(body)
 	if !ok {
 		return nil
@@ -68,7 +109,7 @@ func (s *webSocketModelState) noteHistory(body []byte) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.autonomousRetrying && !s.regionRetry {
+	if !s.keepHistory {
 		return
 	}
 	switch strings.ToLower(event.Type) {
@@ -77,20 +118,13 @@ func (s *webSocketModelState) noteHistory(body []byte) {
 			s.turnOutput = append(s.turnOutput, event.Item)
 		}
 	case "response.completed":
-		s.history, s.historyResponse = nil, ""
 		if len(s.pendingInputs) == 0 || s.pendingInputs[0] == nil || event.Response.ID == "" {
+			s.setHistoryLocked(nil, "")
 			return
 		}
 		history := make([]json.RawMessage, 0, len(s.pendingInputs[0])+len(s.turnOutput))
 		history = append(append(history, s.pendingInputs[0]...), s.turnOutput...)
-		size := 0
-		for _, item := range history {
-			size += len(item)
-		}
-		if size > codexWebSocketHistoryLimit {
-			return
-		}
-		s.history, s.historyResponse = history, event.Response.ID
+		s.setHistoryLocked(history, event.Response.ID)
 	}
 }
 
@@ -131,5 +165,6 @@ func (s *webSocketModelState) rebuildPendingCreate() []byte {
 		return nil
 	}
 	s.pendingBodies[0] = rebuilt
+	s.requestBytes = max(s.requestBytes, int64(len(rebuilt)))
 	return rebuilt
 }
