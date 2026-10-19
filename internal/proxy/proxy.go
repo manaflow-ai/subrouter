@@ -6949,8 +6949,12 @@ type webSocketModelState struct {
 	// turnOutput collects the output items of the turn in flight. Codex
 	// sends one turn at a time on a connection; a turn sent before the one
 	// in flight completed is never chained on it, so it gets no history.
-	keepHistory   bool
-	historyBytes  int64
+	keepHistory  bool
+	historyBytes int64
+	// historyMiss says why no history is kept, rebuildMiss why the last
+	// chained turn could not be rebuilt; both only for the log.
+	historyMiss   string
+	rebuildMiss   string
 	pendingInputs [][]json.RawMessage
 	turnOutput    []json.RawMessage
 }
