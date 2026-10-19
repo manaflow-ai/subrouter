@@ -604,6 +604,42 @@ func TestCodexRegionsNonAutonomousTurnServedFromNextRegion(t *testing.T) {
 	}
 }
 
+// A session pinned to one account (X-Subrouter-Account-ID, the Ultrafast
+// pin) keeps that account but still rotates regions: the capacity failure is
+// served from the next region on the open socket, not closed 1012.
+func TestCodexRegionsForcedAccountTurnServedFromNextRegion(t *testing.T) {
+	local := newRegionPool(t, "local", always(true))
+	fra := newRegionPool(t, "fra", always(false))
+	rig := newRegionRig(t, local, fra)
+	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	header := http.Header{"X-Subrouter-Session": []string{"desktop-forced"}, "X-Subrouter-Account-Id": []string{"codex-account-0"}}
+	conn, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(proxy.URL, "http")+"/responses", header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = response.Body.Close()
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+	if code != 0 || !strings.Contains(turn, "served-from-fra") || strings.Contains(turn, "response.failed") {
+		t.Fatalf("turn=%q close=%d, want Frankfurt on the open socket", turn, code)
+	}
+	events := readCapacityEvents(t, rig.server.CodexCapacityEventsPath)
+	if countEvents(events, codexCapacityOutcomeAbsorbed, "") != 1 || countEvents(events, codexCapacityOutcomeClientVisible, "") != 0 {
+		t.Fatalf("events=%+v, want the turn absorbed", events)
+	}
+	for _, event := range events {
+		if event.Account != "" && event.Account != "codex-account-0" {
+			t.Fatalf("event %+v left the forced account", event)
+		}
+	}
+}
+
 // A turn chained on previous_response_id cannot leave its connection, so a
 // non-autonomous client keeps the old behavior.
 func TestCodexRegionsNonAutonomousChainedTurnKeepsOldPath(t *testing.T) {
