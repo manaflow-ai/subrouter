@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"strings"
 	"sync/atomic"
@@ -131,11 +132,16 @@ func (s *webSocketModelState) noteHistory(body []byte) {
 		}
 	case "response.completed":
 		if len(s.pendingInputs) == 0 || s.pendingInputs[0] == nil || event.Response.ID == "" {
-			s.setHistoryLocked(nil, "")
-			s.historyMiss = "turn_without_history"
+			// Keep the first cause: every later turn on the connection
+			// misses because this one did.
+			cause := cmp.Or(s.rebuildMiss, "turn_without_history")
 			if len(s.pendingInputs) == 0 {
-				s.historyMiss = "no_pending_turn"
+				cause = "no_pending_turn"
+			} else if event.Response.ID == "" {
+				cause = "no_response_id"
 			}
+			s.setHistoryLocked(nil, "")
+			s.historyMiss = cause
 			return
 		}
 		history := make([]json.RawMessage, 0, len(s.pendingInputs[0])+len(s.turnOutput))
