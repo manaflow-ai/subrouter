@@ -816,3 +816,113 @@ func TestCodexRegionsChainedResendBudgetEndsInReconnect(t *testing.T) {
 		t.Fatalf("turn=%q close=%d, want a 1012 with no failure event", turn, code)
 	}
 }
+
+// historyPool is one region's backend that answers each response.create
+// with one output item and a completed response named after the region, and
+// keeps every body it received.
+type historyPool struct {
+	*regionPool
+	mu     sync.Mutex
+	bodies []string
+}
+
+func newHistoryPool(t *testing.T, name string, fail func() bool) *historyPool {
+	t.Helper()
+	pool := &historyPool{regionPool: &regionPool{name: name, fail: fail}}
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	pool.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			_, body, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			n := pool.creates.Add(1)
+			pool.mu.Lock()
+			pool.bodies = append(pool.bodies, string(body))
+			pool.mu.Unlock()
+			if pool.fail() {
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(turnRetryCapacityFailure))
+				continue
+			}
+			id := fmt.Sprintf("%s_%d", name, n)
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_item.done","item":{"type":"message","id":"msg_`+id+`","role":"assistant","content":[{"type":"output_text","text":"served-from-`+name+`"}]}}`))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_`+id+`"}}`))
+		}
+	}))
+	t.Cleanup(pool.server.Close)
+	pool.url, _ = url.Parse(pool.server.URL)
+	return pool
+}
+
+func (p *historyPool) lastBody() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.bodies) == 0 {
+		return ""
+	}
+	return p.bodies[len(p.bodies)-1]
+}
+
+// A turn chained on the connection's last response used to be resent only
+// on that connection, in the region that just refused it, and a second
+// refusal became a 1012 reconnect. The relay saw the whole conversation, so
+// it now sends the turn self-contained from the next region.
+func TestCodexRegionsChainedTurnRebuiltForNextRegion(t *testing.T) {
+	for _, autonomous := range []bool{false, true} {
+		t.Run(fmt.Sprintf("autonomous=%v", autonomous), func(t *testing.T) {
+			var localCreates atomic.Int32
+			local := newHistoryPool(t, "local", func() bool { return localCreates.Add(1) > 1 })
+			fra := newHistoryPool(t, "fra", always(false))
+			rig := newRegionRig(t, local.regionPool, fra.regionPool)
+			rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+			proxy := httptest.NewServer(rig.server.Handler())
+			defer proxy.Close()
+
+			conn := dialRegionWebSocket(t, proxy.URL, fmt.Sprintf("desktop-rebuild-%v", autonomous), autonomous)
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","instructions":"be brief","input":[{"type":"message","role":"user","content":"one"}]}`)); err != nil {
+				t.Fatal(err)
+			}
+			if turn, code := readWebSocketUntilCloseOrTurn(t, conn); code != 0 || !strings.Contains(turn, "resp_local_1") {
+				t.Fatalf("first turn=%q close=%d, want it served from local", turn, code)
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","instructions":"be brief","previous_response_id":"resp_local_1","input":[{"type":"message","role":"user","content":"two"}]}`)); err != nil {
+				t.Fatal(err)
+			}
+			turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+			if code != 0 || !strings.Contains(turn, "served-from-fra") || strings.Contains(turn, "response.failed") {
+				t.Fatalf("chained turn=%q close=%d, want it served from Frankfurt on the open socket", turn, code)
+			}
+			var sent struct {
+				Instructions       string            `json:"instructions"`
+				PreviousResponseID *string           `json:"previous_response_id"`
+				Input              []json.RawMessage `json:"input"`
+			}
+			if err := json.Unmarshal([]byte(fra.lastBody()), &sent); err != nil {
+				t.Fatal(err)
+			}
+			if sent.PreviousResponseID != nil || sent.Instructions != "be brief" || len(sent.Input) != 3 ||
+				!strings.Contains(string(sent.Input[0]), `"one"`) || !strings.Contains(string(sent.Input[1]), "msg_local_1") || !strings.Contains(string(sent.Input[2]), `"two"`) {
+				t.Fatalf("Frankfurt got %s, want the full conversation without previous_response_id", fra.lastBody())
+			}
+			if local.creates.Load() != 2 {
+				t.Fatalf("local creates=%d, want the first turn and the refused chained turn only", local.creates.Load())
+			}
+			// The next turn chains on the Frankfurt response and goes out
+			// as is: the new connection holds it.
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","instructions":"be brief","previous_response_id":"resp_fra_1","input":[{"type":"message","role":"user","content":"three"}]}`)); err != nil {
+				t.Fatal(err)
+			}
+			if turn, code := readWebSocketUntilCloseOrTurn(t, conn); code != 0 || !strings.Contains(turn, "resp_fra_2") {
+				t.Fatalf("third turn=%q close=%d, want it served from Frankfurt", turn, code)
+			}
+			if !strings.Contains(fra.lastBody(), `"previous_response_id":"resp_fra_1"`) {
+				t.Fatalf("Frankfurt got %s, want the chained turn unchanged", fra.lastBody())
+			}
+		})
+	}
+}

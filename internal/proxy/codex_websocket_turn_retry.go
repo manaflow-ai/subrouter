@@ -200,6 +200,14 @@ func (s Server) retryCodexWebSocketTurn(ctx context.Context, link *webSocketUpst
 	// connection that holds its previous response; the retry budget bounds
 	// that for a non-autonomous client like any other retry.
 	chained := codexWebSocketCreateChained(body)
+	if chained && link.regional {
+		// The relay saw the whole conversation on this connection, so the
+		// turn can go out self-contained, like Codex's own reconnect, and
+		// leave the region that refused it.
+		if rebuilt := modelState.rebuildPendingCreate(); rebuilt != nil {
+			body, chained = rebuilt, false
+		}
+	}
 	if connAlive && !chained && link.regional {
 		// A self-contained turn that hit capacity redials out of the next
 		// healthy region; a resend on the same socket stays in the region

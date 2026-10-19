@@ -6934,6 +6934,17 @@ type webSocketModelState struct {
 	// same-account retries are spent.
 	turnCapacityAccount  string
 	turnCapacityFailures int
+	// history is what the upstream connection holds as historyResponse:
+	// the full input of the last completed turn and its output items. A
+	// turn chained on that response can then be rebuilt self-contained and
+	// sent from another region. nil when unknown or too large to keep.
+	history         []json.RawMessage
+	historyResponse string
+	// pendingInputs parallels pendingBodies with each turn's full input
+	// (history plus the turn's own input), nil when it cannot be rebuilt;
+	// turnOutput collects the output items of the turn in flight.
+	pendingInputs [][]json.RawMessage
+	turnOutput    []json.RawMessage
 }
 
 // noteTurnCapacityFailure records one capacity failure of the turn in flight
@@ -7023,6 +7034,7 @@ func (s *webSocketModelState) observe(body []byte) {
 	if s.autonomousRetrying || s.regionRetry {
 		// The observed body is a pooled buffer released after forwarding.
 		s.pendingBodies = append(s.pendingBodies, bytes.Clone(body))
+		s.pendingInputs = append(s.pendingInputs, s.fullInputLocked(body))
 	}
 	s.pendingStarts = append(s.pendingStarts, time.Now())
 	s.requestBytes = max(s.requestBytes, int64(len(body)))
@@ -7063,6 +7075,10 @@ func (s *webSocketModelState) complete() {
 	if len(s.pendingBodies) > 0 {
 		s.pendingBodies = s.pendingBodies[1:]
 	}
+	if len(s.pendingInputs) > 0 {
+		s.pendingInputs = s.pendingInputs[1:]
+	}
+	s.turnOutput = nil
 	s.headFirstByte = time.Time{}
 	s.outputForwarded = false
 	s.turnCapacityAccount = ""
@@ -7405,6 +7421,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				}
 			}
 			if provider == accounts.ProviderCodex {
+				modelState.noteHistory(body)
 				modelState.noteOutput(body)
 				modelState.noteUpstreamMessage(time.Now())
 				s.recordWebSocketTokenUsage(provider, accountID, modelState.usageSessionKey, modelState, poolModel, body)
