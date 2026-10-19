@@ -5827,7 +5827,6 @@ func (s Server) proxyHandler() http.Handler {
 				selectionOptions,
 			)
 			if err == nil {
-				selectedAccountID := account.ID
 				pendingSessionExpectedAccount = account.ID
 				if s.Sessions != nil {
 					if assignment, ok := s.Sessions.Get(sessionAgentType, sessionID); ok {
@@ -5835,7 +5834,7 @@ func (s Server) proxyHandler() http.Handler {
 					}
 				}
 				var refreshPendingSessionCommit bool
-				account, refreshPendingSessionCommit, err = s.refreshSelectedAccount(
+				account, refreshPendingSessionCommit, err = s.refreshSelectedAccountWithReservation(
 					r.Context(),
 					requestProvider,
 					sessionAgentType,
@@ -5843,6 +5842,7 @@ func (s Server) proxyHandler() http.Handler {
 					userEmail,
 					routingRequest,
 					account,
+					selectionOptions.placementReservation,
 				)
 				pendingSessionCommit = pendingSessionCommit || refreshPendingSessionCommit
 				if refreshPendingSessionCommit {
@@ -5850,10 +5850,6 @@ func (s Server) proxyHandler() http.Handler {
 				}
 				if err != nil {
 					err = fmt.Errorf("refresh selected account: %w", err)
-				} else if account.ID != selectedAccountID && placementReservation != nil {
-					placementReservation.Release()
-					placementReservation = nil
-					_, placementReservation, err = pickAndReserveRoutingAccount(r.Context(), s.scheduler(), s.SchedulerRef, []accounts.Account{account})
 				}
 			}
 		}
@@ -10207,6 +10203,13 @@ func (s Server) refreshAccount(ctx context.Context, account accounts.Account) (a
 }
 
 func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, r *http.Request, account accounts.Account) (accounts.Account, bool, error) {
+	return s.refreshSelectedAccountWithReservation(ctx, provider, agentType, sessionID, userEmail, r, account, nil)
+}
+
+// refreshSelectedAccountWithReservation keeps replacement selection atomic when
+// a credential dies before dispatch. The caller retains ownership of the output
+// reservation and commits it only at its own lease or request boundary.
+func (s Server) refreshSelectedAccountWithReservation(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, r *http.Request, account accounts.Account, reservation **selectacct.PlacementReservation) (accounts.Account, bool, error) {
 	refreshed, err := s.refreshAccount(ctx, account)
 	if err == nil {
 		return refreshed, false, nil
@@ -10227,20 +10230,31 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 	if s.Logger != nil {
 		s.Logger.Warn("selected OAuth account refresh failed, trying another account", "provider", provider, "account", account.ID, "error", err)
 	}
+	if reservation != nil {
+		(*reservation).Release()
+		*reservation = nil
+	}
 	tried := map[string]struct{}{account.ID: {}}
 	s.markAccountExhaustedRefreshFailure(account, err)
 	lastErr := err
 	oauthOnly := provider == accounts.ProviderCodex &&
 		(codexOAuthRequiredPath(r.URL.Path) || codexModelCatalogRequest(r))
 	for {
-		next, pickErr := s.retryAccount(ctx, provider, agentType, sessionID, userEmail, tried, oauthOnly)
+		next, nextReservation, pickErr := s.retryAccountWithReservation(ctx, provider, agentType, sessionID, userEmail, tried, oauthOnly, reservation != nil)
 		if pickErr != nil {
 			return account, false, lastErr
+		}
+		if reservation != nil {
+			*reservation = nextReservation
 		}
 		tried[next.ID] = struct{}{}
 		refreshed, err = s.refreshAccount(ctx, next)
 		if err == nil {
 			return refreshed, true, nil
+		}
+		nextReservation.Release()
+		if reservation != nil {
+			*reservation = nil
 		}
 		if !isTerminalCredentialError(err) {
 			return next, false, err
@@ -10254,12 +10268,17 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 }
 
 func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}, oauthOnly bool) (accounts.Account, error) {
+	account, _, err := s.retryAccountWithReservation(ctx, provider, agentType, sessionID, userEmail, tried, oauthOnly, false)
+	return account, err
+}
+
+func (s Server) retryAccountWithReservation(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}, oauthOnly, reserve bool) (accounts.Account, *selectacct.PlacementReservation, error) {
 	candidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
 	if oauthOnly {
 		candidates = oauthAccounts(candidates)
 	}
 	if len(candidates) == 0 {
-		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
+		return accounts.Account{}, nil, fmt.Errorf("no %s accounts available", provider)
 	}
 	untried := make([]accounts.Account, 0, len(candidates))
 	for _, account := range candidates {
@@ -10283,7 +10302,7 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 		untried = eligible
 	}
 	if len(untried) == 0 {
-		return accounts.Account{}, fmt.Errorf("no untried %s accounts available", provider)
+		return accounts.Account{}, nil, fmt.Errorf("no untried %s accounts available", provider)
 	}
 	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude {
 		s.refreshUsageScoresForRequest(ctx)
@@ -10292,9 +10311,16 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
 	}
-	account, err := pickRoutingAccount(scheduler, untried)
+	var account accounts.Account
+	var reservation *selectacct.PlacementReservation
+	var err error
+	if reserve && s.SchedulerRef != nil {
+		account, reservation, err = pickAndReserveRoutingAccount(ctx, scheduler, s.SchedulerRef, untried)
+	} else {
+		account, err = pickRoutingAccount(scheduler, untried)
+	}
 	if err != nil {
-		return accounts.Account{}, err
+		return accounts.Account{}, nil, err
 	}
 	// Codex usage snapshots can be stale or unavailable after a credential
 	// refresh failure. Try every untried OAuth account and let its refresh (or
@@ -10304,9 +10330,10 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	// migrated separately.
 	if (provider != accounts.ProviderCodex || account.AuthMode != accounts.AuthModeOAuth) &&
 		scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
-		return accounts.Account{}, s.poolExhaustedError(provider, untried, "")
+		reservation.Release()
+		return accounts.Account{}, nil, s.poolExhaustedError(provider, untried, "")
 	}
-	return account, nil
+	return account, reservation, nil
 }
 
 const replayablePostMaxBodyBytes = 128 << 20
@@ -11532,7 +11559,8 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				// fan-out, so a genuinely API-wide overload is not amplified.
 				// Overload is not quota, so the first account is never marked.
 				// With no candidate the request keeps to the same-account ladder.
-				if next, ok := t.claudeOverloadRerouteCandidate(req.Context(), tried); ok && a.consume() {
+				next, reservation, ok := t.claudeOverloadRerouteCandidateWithReservation(req.Context(), tried)
+				if ok && a.consume() {
 					nextReq, retargetErr := a.replay(req, &next)
 					if retargetErr == nil {
 						if t.logger != nil {
@@ -11548,13 +11576,17 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 						accountID = next.ID
 						accountCredential = next.CredentialIdentity()
 						tried[accountID] = struct{}{}
-						if t.server.SchedulerRef != nil {
+						if reservation != nil {
+							reservation.Commit()
+						} else if t.server.SchedulerRef != nil {
 							t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
 						}
 						attemptReq = nextReq
 						continue
 					}
 				}
+				// No replay was dispatched, including an exhausted shared budget.
+				reservation.Release()
 			}
 			var wait time.Duration
 			if claudeOverload {
@@ -11830,9 +11862,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// its Bedrock fallback), never Anthropic's billing 400.
 		quota429 := t.headerConfirmedClaudeQuota429(response) || claudeCreditExhausted
 		var compatibilityNext accounts.Account
+		var compatibilityReservation *selectacct.PlacementReservation
 		var compatibilityPickErr error
 		if modelUnsupported && t.server != nil {
-			compatibilityNext, compatibilityPickErr = t.server.rerouteModelIncompatibility(
+			compatibilityNext, compatibilityReservation, compatibilityPickErr = t.server.rerouteModelIncompatibilityWithReservation(
 				req.Context(), t.provider, t.agent, t.session, t.userEmail, accountID, exhaustionPool, tried,
 			)
 		}
@@ -11859,6 +11892,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}, exhaustionPool, response.StatusCode, response.Header, peekResponseBodyPrefix(response))
 		}
 		if claudeTransient429 && claudeTransient429Rerouted {
+			compatibilityReservation.Release()
 			// One alternate is enough for a request-scoped throttle. Returning
 			// here lets the client/upstream retry policy provide the next backoff
 			// instead of fanning this burst through every account.
@@ -11876,6 +11910,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 		}
 		if attempt == maxAttempts || t.server == nil || budgetExhausted {
+			compatibilityReservation.Release()
 			reason := "max_attempts"
 			switch {
 			case t.server == nil:
@@ -11896,13 +11931,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			return response, nil
 		}
 		nextAccount, pickErr := compatibilityNext, compatibilityPickErr
-		var nextReservation *selectacct.PlacementReservation
+		nextReservation := compatibilityReservation
 		if !modelUnsupported {
-			if t.provider == accounts.ProviderClaude {
-				nextAccount, nextReservation, pickErr = t.server.oauthRetryCandidateWithReservation(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, !claudeExtraUsageRetried)
-			} else {
-				nextAccount, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, !claudeExtraUsageRetried)
-			}
+			nextAccount, nextReservation, pickErr = t.server.oauthRetryCandidateWithReservation(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, !claudeExtraUsageRetried)
 		}
 		if pickErr != nil {
 			if nextReservation != nil {
@@ -11941,6 +11972,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			rawBody, readBodyErr = io.ReadAll(nextReq.Body)
 			_ = nextReq.Body.Close()
 			if readBodyErr != nil {
+				nextReservation.Release()
 				return response, nil
 			}
 			nextReq.Body = io.NopCloser(bytes.NewReader(rawBody))
@@ -11979,17 +12011,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		markTrafficAccount(attemptReq.Context(), accountID)
 		claudeTransient429Retries = 0
 		tried[accountID] = struct{}{}
-		if nextReservation != nil {
-			nextReservation.Commit()
-		} else if t.server != nil && t.server.SchedulerRef != nil {
-			t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
-		}
 		// replay rebuilt the upstream URL and auth for the replacement account.
 		attemptReq = nextReq
 		if nextUpstream := t.server.upstreamForRequest(t.path, nextAccount); nextUpstream != nil &&
 			t.provider == accounts.ProviderAntigravity && antigravityProjectFromBody(rawBody) != "" {
 			project, projectErr := t.server.antigravityProject(req.Context(), nextAccount, nextUpstream)
 			if projectErr != nil {
+				nextReservation.Release()
 				if t.logger != nil {
 					t.logger.Warn("AGY failover refused without replacement project", "agent", t.agent, "session", t.session, "account", nextAccount.ID, "error", projectErr)
 				}
@@ -11997,6 +12025,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			rewritten, changed, rewriteErr := rewriteAntigravityProject(rawBody, project)
 			if rewriteErr != nil {
+				nextReservation.Release()
 				return response, nil
 			}
 			if changed {
@@ -12004,6 +12033,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				attemptReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(rewritten)), nil }
 				attemptReq.ContentLength = int64(len(rewritten))
 			}
+		}
+		if nextReservation != nil {
+			nextReservation.Commit()
+		} else if t.server != nil && t.server.SchedulerRef != nil {
+			t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
 		}
 		if t.logger != nil {
 			t.logger.Warn("retrying replayable upstream request after usage limit", "agent", t.agent, "session", t.session, "previous_account", previousAccount, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts)
@@ -12663,6 +12697,15 @@ func isTerminalCredentialError(err error) bool {
 // model compatibility is OAuth-only; Kimi plan/model capability applies to the
 // selected account regardless of how that account's credential is represented.
 func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, model string, tried map[string]struct{}) (accounts.Account, error) {
+	account, _, err := s.rerouteModelIncompatibilityInternal(ctx, provider, agentType, sessionID, userEmail, accountID, model, tried, false)
+	return account, err
+}
+
+func (s Server) rerouteModelIncompatibilityWithReservation(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, model string, tried map[string]struct{}) (accounts.Account, *selectacct.PlacementReservation, error) {
+	return s.rerouteModelIncompatibilityInternal(ctx, provider, agentType, sessionID, userEmail, accountID, model, tried, true)
+}
+
+func (s Server) rerouteModelIncompatibilityInternal(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, model string, tried map[string]struct{}, reserve bool) (accounts.Account, *selectacct.PlacementReservation, error) {
 	if model != "" && s.SchedulerRef != nil {
 		s.SchedulerRef.MarkModelIncompatible(provider, accountID, model)
 	}
@@ -12675,7 +12718,14 @@ func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accoun
 	// This runs inside the replay transport, so selection is provisional until
 	// the replacement request returns 2xx. Persisting here would pin the session
 	// to an account that may immediately reject or fail the replay.
-	account, err := s.oauthRetryCandidate(ctx, provider, agentType, sessionID, userEmail, model, tried, provider == accounts.ProviderCodex, false)
+	var account accounts.Account
+	var reservation *selectacct.PlacementReservation
+	var err error
+	if reserve {
+		account, reservation, err = s.oauthRetryCandidateWithReservation(ctx, provider, agentType, sessionID, userEmail, model, tried, provider == accounts.ProviderCodex, false)
+	} else {
+		account, err = s.oauthRetryCandidate(ctx, provider, agentType, sessionID, userEmail, model, tried, provider == accounts.ProviderCodex, false)
+	}
 	if err != nil && s.Logger != nil {
 		s.Logger.Warn("model incompatibility has no alternate account",
 			"provider", provider,
@@ -12685,7 +12735,7 @@ func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accoun
 			"model", model,
 			"error", err)
 	}
-	return account, err
+	return account, reservation, err
 }
 
 func (s Server) rerouteModelIncompatibilityForReconnect(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, model string) error {
@@ -12706,7 +12756,7 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 	return account, err
 }
 
-// oauthRetryCandidateWithReservation is the Claude failover variant used by
+// oauthRetryCandidateWithReservation is the OAuth failover variant used by
 // the replay transport. It atomically reserves the replacement account before
 // refreshing its credential, so concurrent quota failures cannot all select
 // the same stale best account. The caller must commit the reservation once the
@@ -12715,7 +12765,7 @@ func (s Server) oauthRetryCandidateWithReservation(ctx context.Context, provider
 	return s.oauthRetryCandidateInternal(ctx, provider, agentType, sessionID, userEmail, poolModel, tried, oauthOnly, allowTriedClaudeExtraUsage, true)
 }
 
-func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly, allowTriedClaudeExtraUsage, reserveClaude bool) (accounts.Account, *selectacct.PlacementReservation, error) {
+func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly, allowTriedClaudeExtraUsage, reserveOAuth bool) (accounts.Account, *selectacct.PlacementReservation, error) {
 	allCandidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
 	if len(allCandidates) == 0 {
 		return accounts.Account{}, nil, fmt.Errorf("no %s accounts available", provider)
@@ -12809,7 +12859,7 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 				return accounts.Account{}, nil, fmt.Errorf("no untried %s accounts available", provider)
 			}
 			var err error
-			if reserveClaude && provider == accounts.ProviderClaude && s.SchedulerRef != nil && allOAuthCandidates(candidates) {
+			if reserveOAuth && s.SchedulerRef != nil && allOAuthCandidates(candidates) {
 				var normalized accounts.Account
 				normalizedCandidates := SchedulerAccounts(candidates)
 				normalized, reservation, pickErr := s.SchedulerRef.PickAndReserveContext(ctx, scheduler, normalizedCandidates)
