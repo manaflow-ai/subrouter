@@ -316,19 +316,28 @@ func TestLiveDebitsReorderPickWithoutExhausting(t *testing.T) {
 }
 
 func TestLiveDebitsSurviveForModelAndSessionCounts(t *testing.T) {
+	// Live debits reweight within the plan tier but never change the tier
+	// (it reads the measured score), so a keeps the spread floor weight and
+	// an unseeded Pick still lands on it about 2% of the time. Pin the draw.
+	previous := spreadRandFloat
+	spreadRandFloat = func() float64 { return 0.5 }
+	defer func() { spreadRandFloat = previous }()
 	scheduler := NewScheduler([]Score{
 		{AccountID: "a", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
 			ModelScores: map[string]Score{"claudefable": {AccountID: "a", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1}}},
 		{AccountID: "b", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
 			ModelScores: map[string]Score{"claudefable": {AccountID: "b", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1}}},
 		// 35 debited requests push a's headroom to 0.30, below the
-		// new-session threshold, so the pick is deterministic even though
-		// placement spreads within equal-pressure bands.
+		// new-session threshold, which drops a to the spread floor weight.
 	}).WithLiveDebits(map[string]int{ScoreKey(account.ProviderClaude, "a"): 35}).
 		WithSessionCounts(map[string]int{})
+	model := scheduler.ForModel("claude-fable")
+	if model.UsableForNewSession(account.ProviderClaude, "a") || !model.UsableForNewSession(account.ProviderClaude, "b") {
+		t.Fatal("live debits were dropped by ForModel or WithSessionCounts")
+	}
 	accountA := account.Account{ID: "a", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"}
 	accountB := account.Account{ID: "b", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"}
-	picked, err := scheduler.ForModel("claude-fable").Pick([]account.Account{accountA, accountB})
+	picked, err := model.Pick([]account.Account{accountA, accountB})
 	if err != nil || picked.ID != "b" {
 		t.Fatalf("pool pick = %v %v, want b (debits must survive ForModel and WithSessionCounts)", picked.ID, err)
 	}
