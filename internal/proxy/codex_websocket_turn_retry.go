@@ -196,12 +196,10 @@ func (s Server) retryCodexWebSocketTurn(ctx context.Context, link *webSocketUpst
 	if body == nil || link.redial == nil {
 		return false
 	}
+	// A chained turn (previous_response_id) can only be resent on the
+	// connection that holds its previous response; the retry budget bounds
+	// that for a non-autonomous client like any other retry.
 	chained := codexWebSocketCreateChained(body)
-	if modelState.regionRetry && chained {
-		// Only the old connection holds the previous response, and a
-		// non-autonomous client did not opt into waiting on it.
-		return false
-	}
 	if connAlive && !chained && link.regional {
 		// A self-contained turn that hit capacity redials out of the next
 		// healthy region; a resend on the same socket stays in the region
@@ -240,8 +238,15 @@ func (s Server) retryCodexWebSocketTurn(ctx context.Context, link *webSocketUpst
 			}
 		}
 		if err := link.send(body); err != nil {
+			if chained {
+				// The socket that held the previous response is gone.
+				return false
+			}
 			connAlive = false
 			continue
+		}
+		if chained {
+			modelState.noteChainedResend()
 		}
 		if s.Logger != nil {
 			s.Logger.Info("codex websocket turn resent behind the open client socket",
