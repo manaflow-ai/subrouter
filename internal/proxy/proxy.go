@@ -5967,13 +5967,18 @@ func (s Server) proxyHandler() http.Handler {
 				autonomousRetry = false
 			}
 			var azureDivert func(model string) bool
-			if !realtimeSocket && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
+			if !realtimeSocket && s.CredentialBroker == nil &&
 				requestProvider == accounts.ProviderCodex && s.CodexEgress.configured() {
 				// The dial itself goes out of the session's region: its pinned
 				// egress, else a region that is not cooling for the model.
+				// Regions keep the account and its credential, so a fixed
+				// account or bound lease rotates regions too, as over HTTP.
 				if plan := s.planCodexWebSocketRegions(r.Context(), sessionAgentType, sessionID, retryPoolModel); plan != nil {
 					r = r.WithContext(withCodexWebSocketRegionPlan(r.Context(), plan))
 				}
+			}
+			if !realtimeSocket && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
+				requestProvider == accounts.ProviderCodex && s.CodexEgress.configured() {
 				// The divert parameter is named for Azure but any capacity
 				// divert fits: egress first, since it is the same model on
 				// the same account, then Azure.
