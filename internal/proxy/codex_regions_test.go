@@ -1041,3 +1041,38 @@ func TestCodexRegionsRebuiltTurnRejectionBecomesReconnect(t *testing.T) {
 		t.Fatalf("fra creates=%d, want the one rebuilt send", fra.creates.Load())
 	}
 }
+
+// An autonomous turn whose account sheds in two regions used to switch
+// account at once: a 1012 its client sees as a reconnect. It now tries the
+// rest of the region budget on the same account first.
+func TestCodexRegionsAutonomousTurnTriesRegionsBeforeAccountSwitch(t *testing.T) {
+	local := newRegionPool(t, "local", always(true))
+	fra := newRegionPool(t, "fra", always(true))
+	ams := newRegionPool(t, "ams", always(false))
+	rig := newRegionRig(t, local, fra, ams)
+	proxies := make([]*url.URL, 0, 2)
+	for _, region := range []*regionPool{fra, ams} {
+		proxies = append(proxies, regionProxy(t, region.name, region.url, &atomic.Int32{}))
+	}
+	rig.server = codexEgressServer(t, local.url, proxies, 2)
+	rig.server.CodexEgress.PinStorePath = ""
+	rig.server.CodexCapacityEventsPath = filepath.Join(t.TempDir(), "codex-capacity-events.jsonl")
+	rig.server.CodexOverloadFailover = &CodexOverloadFailoverConfig{Enabled: true}
+	fastCapacityGaps(rig.server.CodexOverloadFailover, time.Millisecond)
+	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	conn := dialRegionWebSocket(t, proxy.URL, "auto-regions-first", true)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+	if code != 0 || !strings.Contains(turn, "served-from-ams") {
+		t.Fatalf("turn=%q close=%d, want Amsterdam on the open socket", turn, code)
+	}
+	events := readCapacityEvents(t, rig.server.CodexCapacityEventsPath)
+	if countEvents(events, codexCapacityOutcomeClientVisible, "") != 0 {
+		t.Fatalf("events=%+v, want no client-visible failure", events)
+	}
+}

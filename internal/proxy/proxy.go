@@ -7174,6 +7174,18 @@ func (s *webSocketModelState) retrySkipReason() string {
 	return "unknown"
 }
 
+// sameAccountTurnRetries is how many capacity retries a turn gets on its
+// account before an autonomous connection switches account (a 1012 its
+// client sees as a reconnect). A connection that dials other regions spends
+// them in other regions first: the same account often serves the model from
+// another region while its home region sheds.
+func (s *webSocketModelState) sameAccountTurnRetries(regional bool) int {
+	if regional && s.autonomousRetrying {
+		return codexWebSocketRegionRetries
+	}
+	return codexCapacitySameAccountRetries
+}
+
 // codexWebSocketRegionRetries bounds the region retries of one turn on a
 // non-autonomous connection: its client did not opt into an open-ended wait.
 const codexWebSocketRegionRetries = 3
@@ -7361,7 +7373,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 						// account (and its prompt cache) and moves only the region.
 						if s.CodexOverloadFailover.enabled() && codexCapacityFailureJSON(body) &&
 							!modelState.regionRetryLeft() &&
-							modelState.noteTurnCapacityFailure(accountID) > codexCapacitySameAccountRetries &&
+							modelState.noteTurnCapacityFailure(accountID) > modelState.sameAccountTurnRetries(link.regional) &&
 							s.codexCapacitySwitchAvailable(ctx, agentType, sessionID, accountID, model, tier) {
 							if s.Logger != nil {
 								s.Logger.Warn("codex websocket turn still at capacity after a same-account retry; switching account",
