@@ -113,6 +113,31 @@ func clientSessionHeader(header http.Header) string {
 	return ""
 }
 
+// transcriptReaderPaths are the routes that serve raw transcripts (every
+// person's prompts and replies). They take the prompt-reader rule, not the
+// admin rule, when tailnet auth is on.
+func transcriptReaderPaths() []string {
+	return []string{"/_subrouter/transcripts", "/_subrouter/transcripts/"}
+}
+
+// requireTranscriptReader guards transcript routes. Without tailnet auth the
+// admin rule is unchanged (token or local configs); with it, every tailnet
+// peer is an admin, so only prompt readers and the admin token pass.
+func (s Server) requireTranscriptReader(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	admin := s.requireAdmin(next)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.TailnetAuth == nil {
+			admin(w, r)
+			return
+		}
+		if !s.authorizePromptReader(r) {
+			http.Error(w, "transcripts are limited to prompt readers", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
 // authorizePromptReader admits the admin token, tailnet logins listed in
 // PromptLedgerReaders, and loopback only when PromptLedgerLoopbackReader is
 // set. Tailnet admin status alone is not enough: on a tailnet-auth gateway
