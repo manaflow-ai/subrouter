@@ -196,11 +196,21 @@ func (s Server) retryCodexWebSocketTurn(ctx context.Context, link *webSocketUpst
 	if body == nil || link.redial == nil {
 		return false
 	}
+	// A chained turn (previous_response_id) can only be resent on the
+	// connection that holds its previous response; the retry budget bounds
+	// that for a non-autonomous client like any other retry.
 	chained := codexWebSocketCreateChained(body)
-	if modelState.regionRetry && chained {
-		// Only the old connection holds the previous response, and a
-		// non-autonomous client did not opt into waiting on it.
-		return false
+	rebuilt := false
+	if chained && link.regional {
+		// The relay saw the whole conversation on this connection, so the
+		// turn can go out self-contained, like Codex's own reconnect, and
+		// leave the region that refused it.
+		if full := modelState.rebuildPendingCreate(); full != nil {
+			body, chained, rebuilt = full, false, true
+		} else if s.Logger != nil {
+			s.Logger.Info("codex websocket chained turn not rebuilt; resending on its connection",
+				"agent", agentType, "session", sessionID, "account", accountID, "reason", modelState.rebuildMissReason())
+		}
 	}
 	if connAlive && !chained && link.regional {
 		// A self-contained turn that hit capacity redials out of the next
@@ -240,8 +250,18 @@ func (s Server) retryCodexWebSocketTurn(ctx context.Context, link *webSocketUpst
 			}
 		}
 		if err := link.send(body); err != nil {
+			if chained {
+				// The socket that held the previous response is gone.
+				return false
+			}
 			connAlive = false
 			continue
+		}
+		if chained || rebuilt {
+			// Any failure of the resend before output becomes the 1012
+			// reconnect the client would have had anyway: Codex then sends
+			// its own full request.
+			modelState.noteChainedResend()
 		}
 		if s.Logger != nil {
 			s.Logger.Info("codex websocket turn resent behind the open client socket",
