@@ -29,6 +29,7 @@ import (
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
+	"github.com/manaflow-ai/subrouter/internal/attribution"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
@@ -407,6 +408,9 @@ func serve(args []string) error {
 	tailscaleAuthUsers := flags.String("tailscale-auth-users", "", "comma-separated tailnet logins allowed by --tailscale-auth; empty allows every tailnet peer")
 	tailscaleAuthTags := flags.String("tailscale-auth-tags", "", "comma-separated tailnet tags allowed by --tailscale-auth; empty allows every tailnet peer")
 	tailscaleCLI := flags.String("tailscale-cli", "", "path to the tailscale CLI used for peer identity")
+	promptLedgerDir := flags.String("prompt-ledger", strings.TrimSpace(os.Getenv("SUBROUTER_PROMPT_LEDGER")), "directory for the tailnet-attributed prompt ledger (who sent which prompt); empty disables it")
+	promptLedgerRetention := flags.Duration("prompt-ledger-retention", attribution.DefaultRetention, "delete prompt ledger days older than this")
+	promptLedgerReaders := flags.String("prompt-ledger-readers", strings.TrimSpace(os.Getenv("SUBROUTER_PROMPT_LEDGER_READERS")), "comma-separated tailnet logins allowed to read /_subrouter/prompts (loopback and the admin token always may)")
 	requireSessionLeases := flags.Bool("require-session-leases", false, "reject proxy requests without a valid session lease; defaults to SUBROUTER_REQUIRE_SESSION_LEASES")
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
@@ -998,6 +1002,19 @@ func serve(args []string) error {
 		FableBedrockPrimary:           fableBedrockEnabled,
 		ClaudeBedrockPrimary:          claudeBedrockPrimaryEnabled,
 		Transcripts:                   transcriptRecorder,
+	}
+	if dir := strings.TrimSpace(*promptLedgerDir); dir != "" {
+		ledger, err := attribution.Open(dir, attribution.Options{
+			Identify:  proxy.TailnetIdentify(tailnetAuthorizer),
+			Retention: *promptLedgerRetention,
+		})
+		if err != nil {
+			return fmt.Errorf("prompt ledger: %w", err)
+		}
+		defer ledger.Close()
+		server.PromptLedger = ledger
+		server.PromptLedgerReaders = splitAndTrim(*promptLedgerReaders)
+		slog.Info("prompt ledger enabled", "dir", dir, "retention", promptLedgerRetention.String(), "readers", strings.Join(server.PromptLedgerReaders, ","), "tailnet_identity", tailnetAuthorizer != nil)
 	}
 	if err := server.ValidateCredentialUpstreams(); err != nil {
 		return err

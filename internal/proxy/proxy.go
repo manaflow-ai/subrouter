@@ -40,6 +40,7 @@ import (
 	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
+	"github.com/manaflow-ai/subrouter/internal/attribution"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/buildversion"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
@@ -176,6 +177,12 @@ type Server struct {
 	// carried in the request. Nil disables the mode, which is the default and
 	// the only supported configuration for shared cloud deployments.
 	TailnetAuth TailnetAuthorizer
+	// PromptLedger records who (tailnet peer) sent which human prompt.
+	// PromptLedgerReaders are the tailnet logins allowed to read it through
+	// /_subrouter/prompts; loopback and the admin token also may. Every other
+	// tailnet member is refused even when tailnet auth makes them admins.
+	PromptLedger        *attribution.Ledger
+	PromptLedgerReaders []string
 	// LocalProxyToken protects provider proxy routes in cloud mode. Health and
 	// readiness stay unauthenticated so supervisors can probe the daemon.
 	LocalProxyToken string
@@ -2990,6 +2997,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
 	mux.HandleFunc("/internal/v1/session-leases/", s.requireSessionLeaseAdmin(s.handleSessionLease))
 	mux.HandleFunc("/_subrouter/health", s.handleHealth)
+	mux.HandleFunc(PromptsPath, s.handlePrompts)
 	mux.HandleFunc(StoreHandshakePath, s.handleStoreHandshake)
 	mux.HandleFunc("/_subrouter/ready", s.handleReady)
 	mux.HandleFunc("/_subrouter/stream-stats", s.handleStreamStats)
@@ -3064,6 +3072,9 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 		payload[ShadowHealthProofField] = proof
 	}
 	payload["codex_provider_selection"] = true
+	if s.PromptLedger != nil {
+		payload["prompt_ledger"] = s.PromptLedger.Stats()
+	}
 	// Whether the Codex Azure fallback is armed is otherwise invisible until a
 	// pool outage, which is exactly when nobody wants to discover it was
 	// misconfigured. Endpoint names only; keys never leave the process.
@@ -5737,6 +5748,7 @@ func (s Server) proxyHandler() http.Handler {
 		// or cannot start (no usable OAuth account). Other Claude models use the
 		// normal pool unchanged.
 		requestModel := session.ExtractModel(routingRequest, s.MaxBodyBytes)
+		s.submitPromptAttribution(r, agentType, sessionID, requestModel)
 		requestPoolModel := ""
 		retryPoolModel := requestModel
 		fableFallbackConfigured := false
@@ -6741,6 +6753,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	upstreamConn.SetReadLimit(maxWebSocketMessageBytes)
 
 	modelState := &webSocketModelState{
+		peerAddr:           r.RemoteAddr,
 		model:              compatibilityModel,
 		realtime:           codexLivePath(r.URL.Path),
 		capacityPersist:    s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger).persist,
@@ -6883,9 +6896,11 @@ func cloneWebSocketResponseHeaders(headers http.Header) http.Header {
 }
 
 type webSocketModelState struct {
-	mu      sync.RWMutex
-	model   string
-	pending []string
+	mu sync.RWMutex
+	// peerAddr is the client socket's remote address, for prompt attribution.
+	peerAddr string
+	model    string
+	pending  []string
 	// Voice events are not Responses turns. Pass their errors through without
 	// replay, quota reroutes, or Responses token accounting.
 	realtime bool
@@ -7320,6 +7335,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 		}
 		if messageType == websocket.TextMessage && direction == "client_to_upstream" && provider == accounts.ProviderCodex {
 			modelState.observe(body)
+			s.submitWebSocketPromptAttribution(modelState, agentType, sessionID, poolModel, userEmail, body)
 		}
 		if direction == "upstream_to_client" && messageType == websocket.TextMessage {
 			failureClass := codexFailureNone
