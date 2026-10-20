@@ -679,8 +679,8 @@ func TestCodexRegionsNonAutonomousChainedTurnIsBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	turn, code := readWebSocketUntilCloseOrTurn(t, conn)
-	if local.creates.Load() != 1+codexWebSocketRegionRetries || fra.creates.Load() != 0 {
-		t.Fatalf("local=%d fra=%d (turn=%q close=%d), want 1+%d on local only", local.creates.Load(), fra.creates.Load(), turn, code, codexWebSocketRegionRetries)
+	if local.creates.Load() != 1+codexWebSocketChainedResends || fra.creates.Load() != 0 {
+		t.Fatalf("local=%d fra=%d (turn=%q close=%d), want 1+%d on local only", local.creates.Load(), fra.creates.Load(), turn, code, codexWebSocketChainedResends)
 	}
 }
 

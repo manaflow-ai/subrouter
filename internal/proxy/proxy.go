@@ -6899,8 +6899,9 @@ type webSocketModelState struct {
 	autonomousRetrying bool
 	// regionRetry lets a non-autonomous connection that can dial other
 	// regions retry a pre-output capacity turn behind the open socket, up to
-	// codexWebSocketRegionRetries times per turn: a self-contained turn in
-	// another region, a chained one on its own connection.
+	// codexWebSocketRegionRetries times per turn for a self-contained turn in
+	// another region, codexWebSocketChainedResends for a chained one on its
+	// own connection.
 	regionRetry       bool
 	regionRetriesUsed int
 	// chainedResent marks a turn the relay resent on its connection with a
@@ -7145,7 +7146,7 @@ func (s *webSocketModelState) turnRetryable() bool {
 	if s.autonomousRetrying {
 		return true
 	}
-	return s.regionRetry && s.regionRetriesUsed < codexWebSocketRegionRetries
+	return s.regionRetry && s.regionRetriesUsed < s.regionRetryBudgetLocked()
 }
 
 // retrySkipReason says why a non-autonomous capacity turn is not retried
@@ -7160,7 +7161,7 @@ func (s *webSocketModelState) retrySkipReason() string {
 		return "no_pending_turn"
 	case s.outputForwarded:
 		return "output_forwarded"
-	case s.regionRetriesUsed >= codexWebSocketRegionRetries:
+	case s.regionRetriesUsed >= s.regionRetryBudgetLocked():
 		return "budget_spent"
 	}
 	return "unknown"
@@ -7178,8 +7179,7 @@ func (s *webSocketModelState) sameAccountTurnRetries(regional bool) int {
 		return codexCapacitySameAccountRetries
 	}
 	s.mu.RLock()
-	leaves := len(s.pendingBodies) > 0 && (!codexWebSocketCreateChained(s.pendingBodies[0]) ||
-		len(s.pendingInputs) > 0 && s.pendingInputs[0] != nil)
+	leaves := s.turnLeavesRegionLocked()
 	s.mu.RUnlock()
 	if !leaves {
 		return codexCapacitySameAccountRetries
@@ -7187,18 +7187,42 @@ func (s *webSocketModelState) sameAccountTurnRetries(regional bool) int {
 	return codexWebSocketRegionRetries
 }
 
+// turnLeavesRegionLocked reports a pending turn that a retry can send out of
+// its region: self-contained, or chained with the input the relay rebuilds.
+func (s *webSocketModelState) turnLeavesRegionLocked() bool {
+	return len(s.pendingBodies) > 0 && (!codexWebSocketCreateChained(s.pendingBodies[0]) ||
+		len(s.pendingInputs) > 0 && s.pendingInputs[0] != nil)
+}
+
+// regionRetryBudgetLocked is the retry budget of the turn in flight on a
+// non-autonomous connection. A chained turn the relay cannot rebuild is
+// resent into the region that refused it, so it keeps the smaller budget.
+func (s *webSocketModelState) regionRetryBudgetLocked() int {
+	if s.turnLeavesRegionLocked() {
+		return codexWebSocketRegionRetries
+	}
+	return codexWebSocketChainedResends
+}
+
 // codexWebSocketRegionRetries bounds the region retries of one turn on a
 // non-autonomous connection: its client did not opt into an open-ended wait.
+// An autonomous connection uses it too, as the same-account retries of a turn
+// that can leave its region before it switches account.
 // Live data in an overload: each further region served about a third of the
 // turns the earlier ones refused, so 5 regions absorb about half of the turns
 // that 3 regions sent back to the client as a reconnect.
 const codexWebSocketRegionRetries = 5
 
+// codexWebSocketChainedResends bounds the same-socket resends of a chained
+// turn the relay cannot rebuild: each one goes back to the region that refused
+// it, so more of them add load there and delay the reconnect.
+const codexWebSocketChainedResends = 3
+
 // regionRetryLeft reports a non-autonomous region retry still in budget.
 func (s *webSocketModelState) regionRetryLeft() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.regionRetry && s.regionRetriesUsed < codexWebSocketRegionRetries
+	return s.regionRetry && s.regionRetriesUsed < s.regionRetryBudgetLocked()
 }
 
 // spendRegionRetry takes one region retry of the turn in flight; false when
@@ -7209,7 +7233,7 @@ func (s *webSocketModelState) spendRegionRetry() bool {
 	if s.autonomousRetrying {
 		return true
 	}
-	if !s.regionRetry || s.regionRetriesUsed >= codexWebSocketRegionRetries {
+	if !s.regionRetry || s.regionRetriesUsed >= s.regionRetryBudgetLocked() {
 		return false
 	}
 	s.regionRetriesUsed++
