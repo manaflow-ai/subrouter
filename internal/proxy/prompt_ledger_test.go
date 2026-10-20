@@ -97,3 +97,22 @@ func TestPromptsEndpointIsReaderOnly(t *testing.T) {
 }
 
 var _ = context.Background
+
+// Loopback is not a reader unless the server opts in: on a shared host any
+// local process (agent jobs) could otherwise read everyone's prompts.
+func TestPromptsEndpointRefusesLoopbackByDefault(t *testing.T) {
+	server, _ := promptLedgerServer(t, &stubTailnetAuth{allow: false}, "lawrence@manaflow.ai")
+	req := httptest.NewRequest(http.MethodGet, "/_subrouter/prompts", nil)
+	req.RemoteAddr = "127.0.0.1:5000"
+	resp := httptest.NewRecorder()
+	server.Handler().ServeHTTP(resp, req)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("loopback status = %d, want 403", resp.Code)
+	}
+	server.PromptLedgerLoopbackReader = true
+	resp = httptest.NewRecorder()
+	server.Handler().ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("opted-in loopback status = %d", resp.Code)
+	}
+}
