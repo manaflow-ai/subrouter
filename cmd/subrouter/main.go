@@ -410,7 +410,8 @@ func serve(args []string) error {
 	tailscaleCLI := flags.String("tailscale-cli", "", "path to the tailscale CLI used for peer identity")
 	promptLedgerDir := flags.String("prompt-ledger", strings.TrimSpace(os.Getenv("SUBROUTER_PROMPT_LEDGER")), "directory for the tailnet-attributed prompt ledger (who sent which prompt); empty disables it")
 	promptLedgerRetention := flags.Duration("prompt-ledger-retention", attribution.DefaultRetention, "delete prompt ledger days older than this")
-	promptLedgerReaders := flags.String("prompt-ledger-readers", strings.TrimSpace(os.Getenv("SUBROUTER_PROMPT_LEDGER_READERS")), "comma-separated tailnet logins allowed to read /_subrouter/prompts (loopback and the admin token always may)")
+	promptLedgerLoopback := flags.Bool("prompt-ledger-loopback-reader", envTrue("SUBROUTER_PROMPT_LEDGER_LOOPBACK_READER"), "let loopback callers read /_subrouter/prompts (off: on a shared host every local process is loopback)")
+	promptLedgerReaders := flags.String("prompt-ledger-readers", strings.TrimSpace(os.Getenv("SUBROUTER_PROMPT_LEDGER_READERS")), "comma-separated tailnet logins allowed to read /_subrouter/prompts (the admin token always may)")
 	requireSessionLeases := flags.Bool("require-session-leases", false, "reject proxy requests without a valid session lease; defaults to SUBROUTER_REQUIRE_SESSION_LEASES")
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
@@ -1014,6 +1015,7 @@ func serve(args []string) error {
 		defer ledger.Close()
 		server.PromptLedger = ledger
 		server.PromptLedgerReaders = splitAndTrim(*promptLedgerReaders)
+		server.PromptLedgerLoopbackReader = *promptLedgerLoopback
 		slog.Info("prompt ledger enabled", "dir", dir, "retention", promptLedgerRetention.String(), "readers", strings.Join(server.PromptLedgerReaders, ","), "tailnet_identity", tailnetAuthorizer != nil)
 	}
 	if err := server.ValidateCredentialUpstreams(); err != nil {

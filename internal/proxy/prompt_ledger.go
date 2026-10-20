@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -18,8 +19,9 @@ import (
 const PromptsPath = "/_subrouter/prompts"
 
 // promptPeekMaxBytes bounds the wire body read for attribution. Bigger bodies
-// are still proxied; they are just not attributed.
-const promptPeekMaxBytes = int64(32 << 20)
+// are still proxied; they are just not attributed. The handler only copies
+// wire bytes; decoding and parsing happen on the ledger's worker.
+const promptPeekMaxBytes = int64(8 << 20)
 
 // TailnetIdentify adapts a TailnetAuthorizer to the ledger. It names every
 // resolvable peer, including one outside an admin allowlist: attribution is
@@ -47,8 +49,11 @@ func (s Server) submitPromptAttribution(r *http.Request, agentType, sessionID, m
 	if r.ContentLength > promptPeekMaxBytes {
 		return
 	}
-	body, truncated := session.PeekDecodedJSONBody(r, promptPeekMaxBytes)
-	if len(body) == 0 || truncated {
+	if !strings.Contains(r.Header.Get("Content-Type"), "json") {
+		return
+	}
+	body, ok := peekWireBody(r, promptPeekMaxBytes)
+	if !ok {
 		return
 	}
 	s.PromptLedger.Submit(attribution.Request{
@@ -60,7 +65,26 @@ func (s Server) submitPromptAttribution(r *http.Request, agentType, sessionID, m
 		Path:            r.URL.Path,
 		ClaimedUser:     session.ExtractUserEmail(r),
 		UserAgent:       r.Header.Get("User-Agent"),
+		ContentEncoding: r.Header.Get("Content-Encoding"),
 	}, body)
+}
+
+// peekWireBody reads up to max bytes of the body and puts them back in front
+// of the rest, so the proxied body is byte-identical. ok is false for an empty
+// body or one longer than max.
+func peekWireBody(r *http.Request, max int64) ([]byte, bool) {
+	if r.Body == nil || r.Body == http.NoBody {
+		return nil, false
+	}
+	wire, err := io.ReadAll(io.LimitReader(r.Body, max+1))
+	r.Body = struct {
+		io.Reader
+		io.Closer
+	}{Reader: io.MultiReader(bytes.NewReader(wire), r.Body), Closer: r.Body}
+	if err != nil || len(wire) == 0 || int64(len(wire)) > max {
+		return nil, false
+	}
+	return bytes.Clone(wire), true
 }
 
 // submitWebSocketPromptAttribution hands a client response.create frame to
@@ -89,11 +113,13 @@ func clientSessionHeader(header http.Header) string {
 	return ""
 }
 
-// authorizePromptReader admits loopback, the admin token, and tailnet logins
-// listed in PromptLedgerReaders. Tailnet admin status alone is not enough:
-// on a tailnet-auth gateway every team member is an admin.
+// authorizePromptReader admits the admin token, tailnet logins listed in
+// PromptLedgerReaders, and loopback only when PromptLedgerLoopbackReader is
+// set. Tailnet admin status alone is not enough: on a tailnet-auth gateway
+// every team member is an admin, and on a shared host every local process is
+// loopback.
 func (s Server) authorizePromptReader(r *http.Request) bool {
-	if isLoopbackRemote(r.RemoteAddr) || s.matchesConfiguredAdminToken(r) {
+	if s.matchesConfiguredAdminToken(r) || (s.PromptLedgerLoopbackReader && isLoopbackRemote(r.RemoteAddr)) {
 		return true
 	}
 	if s.TailnetAuth == nil || len(s.PromptLedgerReaders) == 0 {
@@ -173,6 +199,7 @@ func (s Server) handlePrompts(w http.ResponseWriter, r *http.Request) {
 		sessions[entry.Person][entry.SessionID] = struct{}{}
 	}
 	for person, count := range response.ByPerson {
+		delete(sessions[person], "")
 		response.People = append(response.People, promptPersonCount{Person: person, Prompts: count, Sessions: len(sessions[person])})
 	}
 	sort.Slice(response.People, func(i, j int) bool { return response.People[i].Prompts > response.People[j].Prompts })

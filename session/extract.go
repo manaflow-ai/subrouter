@@ -754,27 +754,3 @@ func canonicalThreadID(value string) string {
 	}
 	return value[:index]
 }
-
-// PeekDecodedJSONBody reads at most maxWireBytes of a JSON request body,
-// restores the body for the proxy (byte-identical), and returns it decoded per
-// Content-Encoding. truncated reports a body cut at the limit.
-func PeekDecodedJSONBody(r *http.Request, maxWireBytes int64) (body []byte, truncated bool) {
-	if r == nil || r.Body == nil || maxWireBytes <= 0 {
-		return nil, false
-	}
-	if !strings.Contains(r.Header.Get("Content-Type"), "json") {
-		return nil, false
-	}
-	wire, err := io.ReadAll(io.LimitReader(r.Body, maxWireBytes+1))
-	if err != nil {
-		return nil, false
-	}
-	r.Body = struct {
-		io.Reader
-		io.Closer
-	}{Reader: io.MultiReader(bytes.NewReader(wire), r.Body), Closer: r.Body}
-	if int64(len(wire)) > maxWireBytes {
-		return nil, true
-	}
-	return decodeRequestBody(wire, r.Header.Get("Content-Encoding"))
-}

@@ -13,12 +13,15 @@ package attribution
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,6 +30,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 const (
@@ -40,7 +45,13 @@ const (
 	DefaultQueryLimit = 500
 	MaxQueryLimit     = 5000
 
-	defaultQueueSize  = 1024
+	defaultQueueSize = 1024
+	// DefaultMaxQueuedBytes bounds the body bytes waiting for the worker.
+	DefaultMaxQueuedBytes = int64(256 << 20)
+	// MaxFieldBytes caps each header-derived field in an entry.
+	MaxFieldBytes = 512
+	// maxDecodedBytes bounds a decompressed body in the worker.
+	maxDecodedBytes   = int64(32 << 20)
 	dedupeSessions    = 10000
 	identifyTimeout   = 3 * time.Second
 	pruneInterval     = time.Hour
@@ -69,6 +80,9 @@ type Request struct {
 	Path            string
 	ClaimedUser     string
 	UserAgent       string
+	// ContentEncoding of the submitted body ("", "identity", "zstd", "gzip").
+	// The worker decodes it, so the request path never decompresses.
+	ContentEncoding string
 }
 
 // Entry is one ledger line.
@@ -95,7 +109,10 @@ type Options struct {
 	Identify  IdentifyFunc
 	Retention time.Duration
 	QueueSize int
-	Now       func() time.Time
+	// MaxQueuedBytes bounds body bytes held by queued jobs; past it Submit
+	// drops and counts. Zero takes DefaultMaxQueuedBytes.
+	MaxQueuedBytes int64
+	Now            func() time.Time
 }
 
 // Stats is reported on /_subrouter/health.
@@ -122,9 +139,11 @@ type Ledger struct {
 	retention time.Duration
 	now       func() time.Time
 
-	queue chan job
-	done  chan struct{}
-	once  sync.Once
+	queue          chan job
+	done           chan struct{}
+	once           sync.Once
+	queuedBytes    atomic.Int64
+	maxQueuedBytes int64
 
 	// worker-owned state
 	lastPrompt map[string]string
@@ -154,14 +173,18 @@ func Open(dir string, options Options) (*Ledger, error) {
 	if options.Now == nil {
 		options.Now = time.Now
 	}
+	if options.MaxQueuedBytes <= 0 {
+		options.MaxQueuedBytes = DefaultMaxQueuedBytes
+	}
 	l := &Ledger{
-		dir:        dir,
-		identify:   options.Identify,
-		retention:  options.Retention,
-		now:        options.Now,
-		queue:      make(chan job, options.QueueSize),
-		done:       make(chan struct{}),
-		lastPrompt: map[string]string{},
+		dir:            dir,
+		identify:       options.Identify,
+		retention:      options.Retention,
+		now:            options.Now,
+		queue:          make(chan job, options.QueueSize),
+		done:           make(chan struct{}),
+		lastPrompt:     map[string]string{},
+		maxQueuedBytes: options.MaxQueuedBytes,
 	}
 	go l.run()
 	return l, nil
@@ -181,9 +204,18 @@ func (l *Ledger) Submit(request Request, body []byte) {
 	if l == nil || len(body) == 0 {
 		return
 	}
+	size := int64(len(body))
+	if l.queuedBytes.Add(size) > l.maxQueuedBytes {
+		l.queuedBytes.Add(-size)
+		l.droppedQueue.Add(1)
+		return
+	}
 	select {
+	case <-l.done:
+		l.queuedBytes.Add(-size)
 	case l.queue <- job{request: request, body: body}:
 	default:
+		l.queuedBytes.Add(-size)
 		l.droppedQueue.Add(1)
 	}
 }
@@ -193,10 +225,19 @@ func (l *Ledger) Flush() {
 	if l == nil {
 		return
 	}
+	select {
+	case <-l.done:
+		return
+	default:
+	}
 	ch := make(chan struct{})
 	select {
 	case l.queue <- job{flush: ch}:
-		<-ch
+	case <-l.done:
+		return
+	}
+	select {
+	case <-ch:
 	case <-l.done:
 	}
 }
@@ -237,6 +278,7 @@ func (l *Ledger) run() {
 				continue
 			}
 			l.handle(j)
+			l.queuedBytes.Add(-int64(len(j.body)))
 		case <-l.done:
 			return
 		}
@@ -244,7 +286,12 @@ func (l *Ledger) run() {
 }
 
 func (l *Ledger) handle(j job) {
-	text, ok := ExtractPrompt(j.body)
+	body, ok := decodeBody(j.body, j.request.ContentEncoding)
+	if !ok {
+		l.skipped.Add(1)
+		return
+	}
+	text, ok := ExtractPrompt(body)
 	if !ok {
 		l.skipped.Add(1)
 		return
@@ -284,13 +331,13 @@ func (l *Ledger) handle(j job) {
 		Person:          person,
 		Node:            identity.NodeName,
 		Tags:            identity.Tags,
-		ClaimedUser:     j.request.ClaimedUser,
-		Agent:           j.request.Agent,
-		SessionID:       j.request.SessionID,
-		ClientSessionID: j.request.ClientSessionID,
-		Model:           j.request.Model,
-		Path:            j.request.Path,
-		UserAgent:       j.request.UserAgent,
+		ClaimedUser:     capField(j.request.ClaimedUser),
+		Agent:           capField(j.request.Agent),
+		SessionID:       capField(j.request.SessionID),
+		ClientSessionID: capField(j.request.ClientSessionID),
+		Model:           capField(j.request.Model),
+		Path:            capField(j.request.Path),
+		UserAgent:       capField(j.request.UserAgent),
 		BodyBytes:       len(j.body),
 		PromptSHA256:    hash,
 		Prompt:          text,
@@ -302,8 +349,48 @@ func (l *Ledger) handle(j job) {
 	}
 	l.recorded.Add(1)
 	if l.now().Sub(l.prunedAt) >= pruneInterval {
-		l.Prune()
+		l.prune()
 	}
+}
+
+func capField(value string) string {
+	if len(value) <= MaxFieldBytes {
+		return value
+	}
+	cut := MaxFieldBytes
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut]
+}
+
+func decodeBody(wire []byte, encoding string) ([]byte, bool) {
+	var reader io.Reader
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "", "identity":
+		return wire, true
+	case "zstd":
+		decoder, err := zstd.NewReader(bytes.NewReader(wire), zstd.WithDecoderMaxMemory(uint64(maxDecodedBytes)))
+		if err != nil {
+			return nil, false
+		}
+		defer decoder.Close()
+		reader = decoder
+	case "gzip":
+		gz, err := gzip.NewReader(bytes.NewReader(wire))
+		if err != nil {
+			return nil, false
+		}
+		defer gz.Close()
+		reader = gz
+	default:
+		return nil, false
+	}
+	decoded, err := io.ReadAll(io.LimitReader(reader, maxDecodedBytes+1))
+	if err != nil || int64(len(decoded)) > maxDecodedBytes {
+		return nil, false
+	}
+	return decoded, true
 }
 
 func (l *Ledger) write(entry Entry) error {
@@ -328,15 +415,26 @@ func (l *Ledger) write(entry Entry) error {
 }
 
 // Prune deletes day files whose whole day is older than the retention.
+// The writer also prunes at most once an hour after a write.
 func (l *Ledger) Prune() {
 	if l == nil {
 		return
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.pruneLocked()
+}
+
+func (l *Ledger) prune() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.pruneLocked()
+}
+
+func (l *Ledger) pruneLocked() {
 	now := l.now().UTC()
 	l.prunedAt = now
 	cutoff := now.Add(-l.retention)
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	names, err := os.ReadDir(l.dir)
 	if err != nil {
 		return
@@ -382,6 +480,14 @@ func (f Filter) Matches(person string) bool {
 	if got == want {
 		return true
 	}
+	if strings.HasPrefix(want, "tag:") {
+		for _, tag := range strings.Split(got, ",") {
+			if strings.TrimSpace(tag) == want {
+				return true
+			}
+		}
+		return false
+	}
 	if local, _, ok := strings.Cut(got, "@"); ok && !strings.Contains(want, "@") && local == want {
 		return true
 	}
@@ -406,20 +512,30 @@ func (l *Ledger) Query(filter Filter) ([]Entry, error) {
 	if limit > MaxQueryLimit {
 		limit = MaxQueryLimit
 	}
+	// Day files are append-only; only pruning removes them, so the list is
+	// read under the lock and the files are scanned without it (writes go on).
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	names, err := os.ReadDir(l.dir)
+	l.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
 	firstDay := filter.Since.UTC().Truncate(24 * time.Hour)
-	var out []Entry
+	var days []string
 	for _, name := range names {
 		day, ok := dayOf(name.Name())
 		if !ok || day.Before(firstDay) || day.After(filter.Until.UTC()) {
 			continue
 		}
-		file, err := os.Open(filepath.Join(l.dir, name.Name()))
+		days = append(days, name.Name())
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(days)))
+	// Newest day first; within a day keep a ring of the newest `limit`
+	// entries, so memory stays bounded by limit, not by the window.
+	var out []Entry
+	for _, name := range days {
+		var dayEntries []Entry
+		file, err := os.Open(filepath.Join(l.dir, name))
 		if err != nil {
 			continue
 		}
@@ -433,11 +549,18 @@ func (l *Ledger) Query(filter Filter) ([]Entry, error) {
 			if entry.Time.Before(filter.Since) || entry.Time.After(filter.Until) || !filter.Matches(entry.Person) {
 				continue
 			}
-			out = append(out, entry)
+			dayEntries = append(dayEntries, entry)
+			if len(dayEntries) > 2*limit {
+				dayEntries = append(dayEntries[:0:0], dayEntries[len(dayEntries)-limit:]...)
+			}
 		}
 		file.Close()
+		sort.SliceStable(dayEntries, func(i, j int) bool { return dayEntries[i].Time.Before(dayEntries[j].Time) })
+		out = append(dayEntries, out...)
+		if len(out) >= limit {
+			break
+		}
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
 	if len(out) > limit {
 		out = out[len(out)-limit:]
 	}
@@ -475,7 +598,7 @@ func ExtractPrompt(body []byte) (string, bool) {
 		return "", false
 	}
 	if len(probe.Messages) > 0 {
-		return ExtractClaudePrompt(body)
+		return extractClaudeMessages(probe.Messages)
 	}
 	if probe.Type != "" && probe.Type != "response.create" {
 		return "", false
@@ -555,13 +678,23 @@ func codexHarnessText(text string) bool {
 // Anthropic Messages request. A turn that only carries tool results (plus
 // harness reminders) is not a human prompt and returns ok=false.
 func ExtractClaudePrompt(body []byte) (string, bool) {
+	var probe struct {
+		Messages json.RawMessage `json:"messages"`
+	}
+	if json.Unmarshal(body, &probe) != nil {
+		return "", false
+	}
+	return extractClaudeMessages(probe.Messages)
+}
+
+func extractClaudeMessages(raw json.RawMessage) (string, bool) {
 	var request struct {
 		Messages []struct {
 			Role    string          `json:"role"`
 			Content json.RawMessage `json:"content"`
-		} `json:"messages"`
+		}
 	}
-	if json.Unmarshal(body, &request) != nil || len(request.Messages) == 0 {
+	if json.Unmarshal(raw, &request.Messages) != nil || len(request.Messages) == 0 {
 		return "", false
 	}
 	// Claude Code appends a "system" role message (the environment block)
@@ -588,9 +721,6 @@ func ExtractClaudePrompt(body []byte) (string, bool) {
 	}
 	var parts []string
 	for _, block := range blocks {
-		if block.Type == "tool_result" {
-			return "", false
-		}
 		if block.Type != "text" {
 			continue
 		}

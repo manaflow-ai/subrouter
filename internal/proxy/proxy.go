@@ -183,6 +183,8 @@ type Server struct {
 	// tailnet member is refused even when tailnet auth makes them admins.
 	PromptLedger        *attribution.Ledger
 	PromptLedgerReaders []string
+	// PromptLedgerLoopbackReader lets loopback callers read the ledger.
+	PromptLedgerLoopbackReader bool
 	// LocalProxyToken protects provider proxy routes in cloud mode. Health and
 	// readiness stay unauthenticated so supervisors can probe the daemon.
 	LocalProxyToken string
@@ -5739,6 +5741,7 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		defer endProxyRequest()
 		if bridgeRequest {
+			s.submitPromptAttribution(r, agentType, sessionID, session.ExtractModel(routingRequest, s.MaxBodyBytes))
 			s.serveClaudeCodex(w, r, agentType, sessionID)
 			return
 		}
