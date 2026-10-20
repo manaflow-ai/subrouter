@@ -1076,3 +1076,46 @@ func TestCodexRegionsAutonomousTurnTriesRegionsBeforeAccountSwitch(t *testing.T)
 		t.Fatalf("events=%+v, want no client-visible failure", events)
 	}
 }
+
+// The region budget is bounded: when every region sheds, the autonomous
+// turn switches account (1012) after the budget, and an autonomous
+// connection's chained turn with no history switches at the second failure.
+func TestCodexRegionsAutonomousAccountSwitchIsBounded(t *testing.T) {
+	for name, tc := range map[string]struct {
+		create string
+		want   int32
+	}{
+		"self-contained":      {`{"type":"response.create","model":"gpt-6-astra","input":[]}`, 1 + codexWebSocketRegionRetries},
+		"chained, no history": {`{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_unknown","input":[]}`, 1 + codexCapacitySameAccountRetries},
+	} {
+		t.Run(name, func(t *testing.T) {
+			local := newRegionPool(t, "local", always(true))
+			fra := newRegionPool(t, "fra", always(true))
+			ams := newRegionPool(t, "ams", always(true))
+			proxies := make([]*url.URL, 0, 2)
+			for _, region := range []*regionPool{fra, ams} {
+				proxies = append(proxies, regionProxy(t, region.name, region.url, &atomic.Int32{}))
+			}
+			server := codexEgressServer(t, local.url, proxies, 2)
+			server.CodexEgress.PinStorePath = ""
+			server.CodexCapacityEventsPath = filepath.Join(t.TempDir(), "codex-capacity-events.jsonl")
+			server.CodexOverloadFailover = &CodexOverloadFailoverConfig{Enabled: true}
+			fastCapacityGaps(server.CodexOverloadFailover, time.Millisecond)
+			server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+			proxy := httptest.NewServer(server.Handler())
+			defer proxy.Close()
+
+			conn := dialRegionWebSocket(t, proxy.URL, "auto-bounded-"+strings.ReplaceAll(name, " ", ""), true)
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(tc.create)); err != nil {
+				t.Fatal(err)
+			}
+			turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+			if code != websocket.CloseServiceRestart {
+				t.Fatalf("turn=%q close=%d, want the account switch 1012", turn, code)
+			}
+			if got := local.creates.Load() + fra.creates.Load() + ams.creates.Load(); got != tc.want {
+				t.Fatalf("creates=%d (local=%d fra=%d ams=%d), want %d", got, local.creates.Load(), fra.creates.Load(), ams.creates.Load(), tc.want)
+			}
+		})
+	}
+}
