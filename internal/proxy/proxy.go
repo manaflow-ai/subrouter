@@ -7197,7 +7197,10 @@ func (s *webSocketModelState) sameAccountTurnRetries(regional bool) int {
 
 // codexWebSocketRegionRetries bounds the region retries of one turn on a
 // non-autonomous connection: its client did not opt into an open-ended wait.
-const codexWebSocketRegionRetries = 3
+// Live data in an overload: each further region served about a third of the
+// turns the earlier ones refused, so 5 regions absorb about half of the turns
+// that 3 regions sent back to the client as a reconnect.
+const codexWebSocketRegionRetries = 5
 
 // regionRetryLeft reports a non-autonomous region retry still in budget.
 func (s *webSocketModelState) regionRetryLeft() bool {
