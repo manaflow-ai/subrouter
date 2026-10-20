@@ -7179,11 +7179,20 @@ func (s *webSocketModelState) retrySkipReason() string {
 // client sees as a reconnect). A connection that dials other regions spends
 // them in other regions first: the same account often serves the model from
 // another region while its home region sheds.
+// A chained turn the relay cannot rebuild is resent in its own region, so it
+// keeps the short count.
 func (s *webSocketModelState) sameAccountTurnRetries(regional bool) int {
-	if regional && s.autonomousRetrying {
-		return codexWebSocketRegionRetries
+	if !regional || !s.autonomousRetrying {
+		return codexCapacitySameAccountRetries
 	}
-	return codexCapacitySameAccountRetries
+	s.mu.RLock()
+	leaves := len(s.pendingBodies) > 0 && (!codexWebSocketCreateChained(s.pendingBodies[0]) ||
+		len(s.pendingInputs) > 0 && s.pendingInputs[0] != nil)
+	s.mu.RUnlock()
+	if !leaves {
+		return codexCapacitySameAccountRetries
+	}
+	return codexWebSocketRegionRetries
 }
 
 // codexWebSocketRegionRetries bounds the region retries of one turn on a
