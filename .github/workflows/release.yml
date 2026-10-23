@@ -36,7 +36,7 @@ jobs:
   build:
     name: Build and verify artifacts
     if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # runner-policy-exception: build provenance attestation is verified with --deny-self-hosted-runners (gcp-deploy.yml, deploy/gcp)
     outputs:
       version: ${{ steps.version.outputs.version }}
       source_commit: ${{ steps.version.outputs.source_commit }}
@@ -124,7 +124,7 @@ jobs:
   github-release:
     name: Publish GitHub release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     permissions:
       contents: write
@@ -151,7 +151,7 @@ jobs:
   # the Actions "Run workflow" button with the toggle enabled to publish.
   npm-publish:
     name: Publish npm package (manual)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # runner-policy-exception: npm trusted publishing accepts only GitHub-hosted runners
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_npm }}
     environment: npm
     permissions:
@@ -172,7 +172,7 @@ jobs:
 
   pypi-publish:
     name: Publish PyPI package (manual)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # runner-policy-exception: PyPI trusted publishing, kept GitHub-hosted with the release pipeline
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pypi }}
     environment: pypi
     permissions:
