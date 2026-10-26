@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -384,5 +385,49 @@ func TestClaudeThirdPartyExtraUsageKeyOnlySurvivesOuterReplay(t *testing.T) {
 	assertClaudeAccountUnmarked(t, server, "oauth-b")
 	if assignment, ok := sessions.Get("claude", "session-third-party-outer"); !ok || assignment.AccountID != "claude:key" {
 		t.Fatalf("sticky assignment = %+v, ok=%v; want the API key after the outer replay", assignment, ok)
+	}
+}
+
+// A transient throttle on the key is not the third-party refusal: it passes
+// through as a retryable 429, and the request still never reaches OAuth.
+func TestClaudeThirdPartyExtraUsageKeyTransient429PassesThrough(t *testing.T) {
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "oauth-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-a"},
+			{ID: "oauth-b", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-b"},
+			{ID: "claude:key", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-key"},
+		},
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+	}
+	var oauthB, keyHits int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if req.Header.Get("X-Api-Key") == "tok-key" {
+			keyHits++
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`))}
+		}
+		if req.Header.Get("Authorization") == "Bearer tok-b" {
+			oauthB++
+		}
+		return &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{},
+			Body: io.NopCloser(strings.NewReader(anthropicThirdPartyExtraUsageBody))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-third-party-key-429", account: "oauth-a",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 4,
+		budget: newAttemptBudget(6),
+		sleep:  func(context.Context, time.Duration) error { return nil },
+	}
+	response, err := transport.RoundTrip(claudeThirdPartyOAuthRequest(t, "tok-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests || response.Header.Get("X-Subrouter-Error") != "" {
+		t.Fatalf("status %d error %q; want the key's own retryable 429", response.StatusCode, response.Header.Get("X-Subrouter-Error"))
+	}
+	if oauthB != 0 || keyHits == 0 {
+		t.Fatalf("oauth-b calls %d, key calls %d; want 0 and at least 1", oauthB, keyHits)
 	}
 }
