@@ -11677,6 +11677,52 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			return response, nil
 		}
+		if t.provider == accounts.ProviderClaude && !modelUnsupported {
+			// Anthropic refuses a non-Claude-Code client on a subscription
+			// credential (claude_third_party.go). Every OAuth account answers the
+			// same, and the account is fine, so neither retry another OAuth
+			// account nor mark this one: move to an API key or explain.
+			thirdParty, thirdPartyErr := responseClaudeThirdPartyExtraUsage(response)
+			if thirdPartyErr != nil {
+				if t.logger != nil {
+					t.logger.Warn("third-party extra-usage response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", thirdPartyErr)
+				}
+				return response, nil
+			}
+			if thirdParty {
+				if t.server != nil && attempt < maxAttempts {
+					if next, ok := t.server.claudeAPIKeyRetryCandidate(req.Context(), t.poolModel, tried); ok && a.consume() {
+						if nextReq, replayErr := a.replay(replayReq, &next); replayErr == nil {
+							if t.logger != nil {
+								t.logger.Warn("claude refused a third-party client on a subscription account; routing it to an API key",
+									"agent", t.agent, "session", t.session, "from_account", accountID, "to_account", next.ID, "status", response.StatusCode)
+							}
+							if response.Body != nil {
+								_ = response.Body.Close()
+							}
+							markTrafficRetryPath(attemptReq.Context(), "claude_third_party_api_key")
+							accountID = next.ID
+							accountCredential = next.CredentialIdentity()
+							markTrafficAccount(attemptReq.Context(), accountID)
+							tried[accountID] = struct{}{}
+							if t.server.SchedulerRef != nil {
+								t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
+							}
+							quotaFailedOver = true
+							failoverReason = accountMoveCredential
+							attemptReq = nextReq
+							continue
+						}
+					}
+				}
+				if t.logger != nil {
+					t.logger.Warn("claude refused a third-party client on a subscription account and no API key can take it",
+						"agent", t.agent, "session", t.session, "account", accountID, "status", response.StatusCode)
+				}
+				markTrafficErrorClass(attemptReq.Context(), "claude_third_party_extra_usage")
+				return claudeThirdPartyExtraUsageResponse(response, attemptReq), nil
+			}
+		}
 		usageLimited, exhausted, credentialFailure := false, false, false
 		persistentAuthorizationDenial := claudeStreamDenial
 		claudeCreditExhausted := claudeStreamCredit
