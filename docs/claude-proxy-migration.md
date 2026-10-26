@@ -6,6 +6,6 @@ The proxy launch settings start from `~/.claude/settings.json`, merge settings C
 
 Claude Code also has `autoMemoryDirectory`, but it selects one directory for all projects. That would flatten project memory and change Claude's project namespace, so Subrouter keeps the per-project `projects/<project>/memory` layout and grants the resolved projects root instead.
 
-On systems where `/home/leo` is bind-mounted as `/Users/leoli`, path comparisons use filesystem identity, so either spelling remains stable and does not trigger a repeated migration.
+On systems where `/home/alice` is bind-mounted as `/Users/alice`, path comparisons use filesystem identity, so either spelling remains stable and does not trigger a repeated migration.
 
 Backups named `*.subrouter-backup-*` are retained for manual recovery. Subrouter never removes those backups or credentials.

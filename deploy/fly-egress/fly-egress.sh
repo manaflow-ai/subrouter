@@ -21,12 +21,12 @@
 #   fly-egress.sh destroy REGION            remove one region's machine + volume
 set -euo pipefail
 
-APP="${FLY_EGRESS_APP:-subrouter-codex-egress}"
+APP="${FLY_EGRESS_APP:-}"
 ORG="${FLY_EGRESS_ORG:-manaflow}"
 IMAGE_TAG="${FLY_EGRESS_IMAGE_TAG:-v1}"
 IMAGE="registry.fly.io/${APP}:${IMAGE_TAG}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROUTER_HOST="${FLY_EGRESS_ROUTER_HOST:-cmux-lawrence}"
+ROUTER_HOST="${FLY_EGRESS_ROUTER_HOST:-}"
 PF_TABLE_FILE=/etc/pf.anchors/ai.manaflow.subrouter.egress
 ALL_REGIONS="ams arn cdg dfw ewr fra gru iad jnb lax lhr nrt ord sin sjc syd yyz"
 
@@ -102,6 +102,7 @@ all_proxies() {
 }
 
 cmd_sync_router() {
+  [ -n "$ROUTER_HOST" ] || die "set FLY_EGRESS_ROUTER_HOST to the router host"
   local dry=0
   [ "${1:-}" = "--dry-run" ] && dry=1
   local hosts proxies current
@@ -154,6 +155,11 @@ cmd_destroy() {
   fly volumes list -a "$APP" --json | jq -r --arg r "$region" '.[] | select(.region == $r) | .id' \
     | while read -r v; do fly volumes destroy "$v" -a "$APP" -y; done
 }
+
+case "${1:-}" in
+  build|up|update|status|proxies|pf-hosts|sync-router|destroy)
+    [ -n "$APP" ] || die "set FLY_EGRESS_APP to the Fly app name" ;;
+esac
 
 case "${1:-}" in
   build) shift; cmd_build "$@" ;;

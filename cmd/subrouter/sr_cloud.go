@@ -209,7 +209,7 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 
 func hostedExchangeLoginError(err error) error {
 	return fmt.Errorf(
-		"hosted cmux.com tenant exchange failed: %w\nIf you want the team server instead, run:\n  sr storage legacy\n  sr server add lawrence --url http://127.0.0.1:31415 --default",
+		"hosted cmux.com tenant exchange failed: %w\nIf you want the team server instead, run:\n  sr storage legacy\n  sr server add team --url http://127.0.0.1:31415 --default",
 		err,
 	)
 }

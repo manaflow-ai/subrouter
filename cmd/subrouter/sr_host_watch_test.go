@@ -20,14 +20,14 @@ func cmuxCalls(fake *hostFakeHost, verb string) [][]string {
 
 func TestHostWatchLabelsMatchingCmuxWorkspaces(t *testing.T) {
 	runner, fake, out, _ := setupHostTest(t, "http://127.0.0.1:31415")
-	if err := runner.run(context.Background(), []string{"host", "attach", "big-red"}); err != nil {
+	if err := runner.run(context.Background(), []string{"host", "attach", "devbox"}); err != nil {
 		t.Fatalf("attach: %v\n%s", err, out)
 	}
 	old := hostInCmux
 	hostInCmux = func() bool { return true }
 	t.Cleanup(func() { hostInCmux = old })
 	fake.cmuxList = `{"workspaces":[
-		{"id":"ws-red","remote":{"destination":"leo@big-red","connected":true}},
+		{"id":"ws-red","remote":{"destination":"dev@devbox","connected":true}},
 		{"id":"ws-local"},
 		{"id":"ws-other","remote":{"destination":"beryl7"}}]}`
 
@@ -36,11 +36,11 @@ func TestHostWatchLabelsMatchingCmuxWorkspaces(t *testing.T) {
 		t.Fatalf("watch: %v\n%s", err, out)
 	}
 	set := cmuxCalls(fake, "set-status")
-	want := "cmux set-status sr-pool lawrence ✓ tunnel --workspace ws-red --window w1 --color #34C759"
+	want := "cmux set-status sr-pool pool-a ✓ tunnel --workspace ws-red --window w1 --color #34C759"
 	if len(set) != 1 || strings.Join(set[0], " ") != want {
 		t.Fatalf("set-status calls = %v", set)
 	}
-	if !strings.Contains(out.String(), "big-red") || !strings.Contains(out.String(), "tunnel (running)") {
+	if !strings.Contains(out.String(), "devbox") || !strings.Contains(out.String(), "tunnel (running)") {
 		t.Fatalf("watch output:\n%s", out)
 	}
 	if n := len(cmuxCalls(fake, "clear-status")); n != 0 {
@@ -50,9 +50,9 @@ func TestHostWatchLabelsMatchingCmuxWorkspaces(t *testing.T) {
 
 func TestHostCmuxPillsOnlyChangeOnTransitions(t *testing.T) {
 	runner, fake, _, _ := setupHostTest(t, "http://127.0.0.1:31415")
-	fake.cmuxList = `[{"id":"ws-red","remote":{"destination":"big-red"}}]`
+	fake.cmuxList = `[{"id":"ws-red","remote":{"destination":"devbox"}}]`
 	pills := &hostCmuxPills{r: runner, last: map[cmuxWorkspaceKey]string{}}
-	host := attachedHost{SSHHost: "big-red", Route: hostRouteTunnel, Server: "lawrence"}
+	host := attachedHost{SSHHost: "devbox", Route: hostRouteTunnel, Server: "pool-a"}
 	ok := []hostCheck{{host: host, reachable: true, healthy: true, tunnelUp: true}}
 	down := []hostCheck{{host: host, reachable: true, healthy: false, tunnelUp: false}}
 	for _, checks := range [][]hostCheck{ok, ok, down, down} {
@@ -61,7 +61,7 @@ func TestHostCmuxPillsOnlyChangeOnTransitions(t *testing.T) {
 		}
 	}
 	set := cmuxCalls(fake, "set-status")
-	if len(set) != 2 || set[1][3] != "lawrence ✗ tunnel stopped" || set[1][9] != "#FF3B30" {
+	if len(set) != 2 || set[1][3] != "pool-a ✗ tunnel stopped" || set[1][9] != "#FF3B30" {
 		t.Fatalf("set-status calls = %v", set)
 	}
 	// The workspace goes away (closed): its pill state is dropped.
@@ -75,19 +75,19 @@ func TestHostCmuxPillsOnlyChangeOnTransitions(t *testing.T) {
 }
 
 func TestHostCheckPill(t *testing.T) {
-	tunnel := attachedHost{Route: hostRouteTunnel, Server: "lawrence"}
-	direct := attachedHost{Route: hostRouteDirect, Server: "lawrence"}
+	tunnel := attachedHost{Route: hostRouteTunnel, Server: "pool-a"}
+	direct := attachedHost{Route: hostRouteDirect, Server: "pool-a"}
 	team := attachedHost{Route: hostRouteTeam}
 	cases := []struct {
 		check hostCheck
 		want  string
 	}{
-		{hostCheck{host: tunnel, reachable: true, healthy: true, tunnelUp: true}, "lawrence ✓ tunnel"},
-		{hostCheck{host: tunnel, reachable: true, tunnelUp: false}, "lawrence ✗ tunnel stopped"},
-		{hostCheck{host: tunnel, reachable: true, tunnelUp: true}, "lawrence ✗ pool down"},
-		{hostCheck{host: direct, reachable: true, healthy: true}, "lawrence ✓"},
+		{hostCheck{host: tunnel, reachable: true, healthy: true, tunnelUp: true}, "pool-a ✓ tunnel"},
+		{hostCheck{host: tunnel, reachable: true, tunnelUp: false}, "pool-a ✗ tunnel stopped"},
+		{hostCheck{host: tunnel, reachable: true, tunnelUp: true}, "pool-a ✗ pool down"},
+		{hostCheck{host: direct, reachable: true, healthy: true}, "pool-a ✓"},
 		{hostCheck{host: team, reachable: true, healthy: true}, "team ✓"},
-		{hostCheck{host: direct}, "lawrence ? host unreachable"},
+		{hostCheck{host: direct}, "pool-a ? host unreachable"},
 	}
 	for _, tc := range cases {
 		if got, _ := tc.check.pill(); got != tc.want {
@@ -97,10 +97,10 @@ func TestHostCheckPill(t *testing.T) {
 }
 
 func TestSameSSHHost(t *testing.T) {
-	if !sameSSHHost("leo@big-red", "big-red") || !sameSSHHost("Big-Red", "big-red") {
+	if !sameSSHHost("dev@devbox", "devbox") || !sameSSHHost("Devbox", "devbox") {
 		t.Fatal("user@host and case should match")
 	}
-	if sameSSHHost("big-red2", "big-red") || sameSSHHost("", "") {
+	if sameSSHHost("devbox2", "devbox") || sameSSHHost("", "") {
 		t.Fatal("different hosts matched")
 	}
 }
@@ -108,11 +108,11 @@ func TestSameSSHHost(t *testing.T) {
 func TestHostCmuxPillsCoverEveryWindow(t *testing.T) {
 	runner, fake, _, _ := setupHostTest(t, "http://127.0.0.1:31415")
 	fake.cmuxWindows = map[string]string{
-		"win-a": `{"workspaces":[{"id":"ws-1","remote":{"destination":"big-red"}}]}`,
-		"win-b": `{"workspaces":[{"id":"ws-2","remote":{"destination":"leo@big-red"}},{"id":"ws-3","remote":{"enabled":false,"destination":null}}]}`,
+		"win-a": `{"workspaces":[{"id":"ws-1","remote":{"destination":"devbox"}}]}`,
+		"win-b": `{"workspaces":[{"id":"ws-2","remote":{"destination":"dev@devbox"}},{"id":"ws-3","remote":{"enabled":false,"destination":null}}]}`,
 	}
 	pills := &hostCmuxPills{r: runner, last: map[cmuxWorkspaceKey]string{}}
-	host := attachedHost{SSHHost: "big-red", Route: hostRouteTunnel, Server: "lawrence"}
+	host := attachedHost{SSHHost: "devbox", Route: hostRouteTunnel, Server: "pool-a"}
 	if err := pills.update(context.Background(), []hostCheck{{host: host, reachable: true, healthy: true, tunnelUp: true}}); err != nil {
 		t.Fatal(err)
 	}

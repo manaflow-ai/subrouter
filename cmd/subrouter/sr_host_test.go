@@ -140,7 +140,7 @@ func setupHostTest(t *testing.T, serverURL string) (srRunner, *hostFakeHost, *by
 	if err := os.MkdirAll(store.StoreDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	servers := `{"servers":[{"name":"lawrence","url":"` + serverURL + `"}],"default":"lawrence"}`
+	servers := `{"servers":[{"name":"pool-a","url":"` + serverURL + `"}],"default":"pool-a"}`
 	if err := os.WriteFile(filepath.Join(store.StoreDir(), "servers.json"), []byte(servers), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -167,14 +167,14 @@ func TestParseHostVisibility(t *testing.T) {
 
 func TestHostAttachFallsBackToTunnelForLoopbackPool(t *testing.T) {
 	runner, fake, out, agents := setupHostTest(t, "http://127.0.0.1:31415")
-	if err := runner.run(context.Background(), []string{"host", "attach", "big-red"}); err != nil {
+	if err := runner.run(context.Background(), []string{"host", "attach", "devbox"}); err != nil {
 		t.Fatalf("attach: %v\n%s", err, out)
 	}
-	plist, err := os.ReadFile(filepath.Join(agents, "ai.manaflow.subrouter.host.big-red.plist"))
+	plist, err := os.ReadFile(filepath.Join(agents, "ai.manaflow.subrouter.host.devbox.plist"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"<string>127.0.0.1:31415:127.0.0.1:31415</string>", "<string>big-red</string>", "<string>ControlPath=none</string>"} {
+	for _, want := range []string{"<string>127.0.0.1:31415:127.0.0.1:31415</string>", "<string>devbox</string>", "<string>ControlPath=none</string>"} {
 		if !strings.Contains(string(plist), want) {
 			t.Fatalf("plist missing %s:\n%s", want, plist)
 		}
@@ -193,8 +193,8 @@ func TestHostAttachFallsBackToTunnelForLoopbackPool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, ok := state.find("big-red")
-	if !ok || h.Route != hostRouteTunnel || h.Server != "lawrence" || h.URL != "http://127.0.0.1:31415" {
+	h, ok := state.find("devbox")
+	if !ok || h.Route != hostRouteTunnel || h.Server != "pool-a" || h.URL != "http://127.0.0.1:31415" {
 		t.Fatalf("state = %+v", state)
 	}
 	if !strings.Contains(out.String(), "reverse tunnel") {
@@ -202,7 +202,7 @@ func TestHostAttachFallsBackToTunnelForLoopbackPool(t *testing.T) {
 	}
 
 	// A second attach keeps the running tunnel.
-	if err := runner.run(context.Background(), []string{"host", "attach", "big-red"}); err != nil {
+	if err := runner.run(context.Background(), []string{"host", "attach", "devbox"}); err != nil {
 		t.Fatalf("re-attach: %v\n%s", err, out)
 	}
 	if fake.commands("launchctl", "bootstrap") != 1 || fake.commands("launchctl", "bootout") != 0 {
@@ -212,8 +212,8 @@ func TestHostAttachFallsBackToTunnelForLoopbackPool(t *testing.T) {
 
 func TestHostAttachPrefersDirectRoute(t *testing.T) {
 	runner, fake, out, agents := setupHostTest(t, "http://127.0.0.1:31415")
-	fake.reachable["http://100.89.225.106:31415"] = true
-	err := runner.run(context.Background(), []string{"host", "attach", "big-red", "--url", "http://10.0.0.9:31415", "--url", "http://100.89.225.106:31415/v1"})
+	fake.reachable["http://100.64.0.10:31415"] = true
+	err := runner.run(context.Background(), []string{"host", "attach", "devbox", "--url", "http://10.0.0.9:31415", "--url", "http://100.64.0.10:31415/v1"})
 	if err != nil {
 		t.Fatalf("attach: %v\n%s", err, out)
 	}
@@ -223,15 +223,15 @@ func TestHostAttachPrefersDirectRoute(t *testing.T) {
 	if _, err := os.Stat(agents); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("direct route wrote a LaunchAgent")
 	}
-	h, _ := mustLoadHosts(t, runner).find("big-red")
-	if h.Route != hostRouteDirect || h.URL != "http://100.89.225.106:31415" {
+	h, _ := mustLoadHosts(t, runner).find("devbox")
+	if h.Route != hostRouteDirect || h.URL != "http://100.64.0.10:31415" {
 		t.Fatalf("host = %+v", h)
 	}
 }
 
 func TestHostAttachDirectOnlyFailsWithoutRoute(t *testing.T) {
 	runner, fake, _, _ := setupHostTest(t, "http://127.0.0.1:31415")
-	err := runner.run(context.Background(), []string{"host", "attach", "big-red", "--route", "direct"})
+	err := runner.run(context.Background(), []string{"host", "attach", "devbox", "--route", "direct"})
 	if err == nil || !strings.Contains(err.Error(), "--url") {
 		t.Fatalf("err = %v", err)
 	}
@@ -243,7 +243,7 @@ func TestHostAttachDirectOnlyFailsWithoutRoute(t *testing.T) {
 func TestHostAttachRefusesBusyHostPort(t *testing.T) {
 	runner, fake, _, _ := setupHostTest(t, "http://127.0.0.1:31415")
 	fake.portBusy = true
-	err := runner.run(context.Background(), []string{"host", "attach", "big-red"})
+	err := runner.run(context.Background(), []string{"host", "attach", "devbox"})
 	if err == nil || !strings.Contains(err.Error(), "already answers") {
 		t.Fatalf("err = %v", err)
 	}
@@ -254,7 +254,7 @@ func TestHostAttachRefusesBusyHostPort(t *testing.T) {
 
 func TestHostAttachTunnelRefusesHTTPS(t *testing.T) {
 	runner, _, _, _ := setupHostTest(t, "https://pool.example.com")
-	err := runner.run(context.Background(), []string{"host", "attach", "big-red"})
+	err := runner.run(context.Background(), []string{"host", "attach", "devbox"})
 	if err == nil || !strings.Contains(err.Error(), "plain http") {
 		t.Fatalf("err = %v", err)
 	}
@@ -262,41 +262,41 @@ func TestHostAttachTunnelRefusesHTTPS(t *testing.T) {
 
 func TestHostDetachStopsTunnelAndForgetsHost(t *testing.T) {
 	runner, fake, out, agents := setupHostTest(t, "http://127.0.0.1:31415")
-	if err := runner.run(context.Background(), []string{"host", "attach", "big-red"}); err != nil {
+	if err := runner.run(context.Background(), []string{"host", "attach", "devbox"}); err != nil {
 		t.Fatalf("attach: %v\n%s", err, out)
 	}
-	if err := runner.run(context.Background(), []string{"host", "detach", "big-red"}); err != nil {
+	if err := runner.run(context.Background(), []string{"host", "detach", "devbox"}); err != nil {
 		t.Fatalf("detach: %v\n%s", err, out)
 	}
 	if fake.loaded {
 		t.Fatalf("tunnel still loaded")
 	}
-	if _, err := os.Stat(filepath.Join(agents, "ai.manaflow.subrouter.host.big-red.plist")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(agents, "ai.manaflow.subrouter.host.devbox.plist")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("plist left behind")
 	}
 	scripts := fake.sshScripts()
-	if last := scripts[len(scripts)-1]; !strings.Contains(last, "remove") || !strings.Contains(last, "lawrence") {
+	if last := scripts[len(scripts)-1]; !strings.Contains(last, "remove") || !strings.Contains(last, "pool-a") {
 		t.Fatalf("detach did not remove the host entry: %s", last)
 	}
-	if hosts, _ := mustLoadHosts(t, runner).find("big-red"); hosts.SSHHost != "" {
+	if hosts, _ := mustLoadHosts(t, runner).find("devbox"); hosts.SSHHost != "" {
 		t.Fatalf("host still recorded")
 	}
 	// Detaching again is a no-op.
-	if err := runner.run(context.Background(), []string{"host", "detach", "big-red"}); err != nil {
+	if err := runner.run(context.Background(), []string{"host", "detach", "devbox"}); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestHostStatusReportsRouteAndHealth(t *testing.T) {
 	runner, _, out, _ := setupHostTest(t, "http://127.0.0.1:31415")
-	if err := runner.run(context.Background(), []string{"host", "attach", "big-red"}); err != nil {
+	if err := runner.run(context.Background(), []string{"host", "attach", "devbox"}); err != nil {
 		t.Fatalf("attach: %v\n%s", err, out)
 	}
 	out.Reset()
 	if err := runner.run(context.Background(), []string{"host", "status"}); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"big-red: lawrence through this machine's tunnel", "tunnel:  running", "pool:    ok"} {
+	for _, want := range []string{"devbox: pool-a through this machine's tunnel", "tunnel:  running", "pool:    ok"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("status missing %q:\n%s", want, out)
 		}
@@ -308,7 +308,7 @@ func TestHostAttachRejectsLocalStorage(t *testing.T) {
 	if err := os.WriteFile(os.Getenv("SUBROUTER_CLOUD_CONFIG"), []byte(`{"version":1,"credentialSource":"local"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := runner.run(context.Background(), []string{"host", "attach", "big-red"})
+	err := runner.run(context.Background(), []string{"host", "attach", "devbox"})
 	if err == nil || !strings.Contains(err.Error(), "local") {
 		t.Fatalf("err = %v", err)
 	}
@@ -439,7 +439,7 @@ mkdir -p "$GOBIN"; printf x > "$GOBIN/subrouter"; chmod +x "$GOBIN/subrouter"
 
 func TestHostAttachRecordsRouteOnHost(t *testing.T) {
 	runner, fake, out, _ := setupHostTest(t, "http://127.0.0.1:31415")
-	if err := runner.run(context.Background(), []string{"host", "attach", "big-red"}); err != nil {
+	if err := runner.run(context.Background(), []string{"host", "attach", "devbox"}); err != nil {
 		t.Fatalf("attach: %v\n%s", err, out)
 	}
 	var marker string
@@ -448,7 +448,7 @@ func TestHostAttachRecordsRouteOnHost(t *testing.T) {
 			marker = fake.stdins[i]
 		}
 	}
-	for _, want := range []string{`"route":"tunnel"`, `"pool":"lawrence"`, `"url":"http://127.0.0.1:31415"`, `"via":"`} {
+	for _, want := range []string{`"route":"tunnel"`, `"pool":"pool-a"`, `"url":"http://127.0.0.1:31415"`, `"via":"`} {
 		if !strings.Contains(marker, want) {
 			t.Fatalf("marker missing %s: %q", want, marker)
 		}
@@ -456,18 +456,18 @@ func TestHostAttachRecordsRouteOnHost(t *testing.T) {
 }
 
 func TestWithHostRouteNamesTheTunnel(t *testing.T) {
-	marker := hostAttachMarker{Pool: "lawrence", Route: hostRouteTunnel, Via: "Air-Blue"}
+	marker := hostAttachMarker{Pool: "pool-a", Route: hostRouteTunnel, Via: "Laptop"}
 	live := sessionStatusView{AccountID: "a1", Label: "bob@example.com"}
 	line := renderSessionStatus(live, time.Now())
 	if got := withHostRoute(line, live, marker, true); got != line {
 		t.Fatalf("live = %q", got)
 	}
 	down := sessionStatusView{Stale: true, Unreachable: true}
-	if got := withHostRoute(renderSessionStatus(down, time.Now()), down, marker, true); got != "sr: pool unreachable · Air-Blue tunnel down" {
+	if got := withHostRoute(renderSessionStatus(down, time.Now()), down, marker, true); got != "sr: pool unreachable · Laptop tunnel down" {
 		t.Fatalf("down = %q", got)
 	}
 	stale := sessionStatusView{AccountID: "a1", Label: "bob@example.com", Stale: true, Unreachable: true}
-	if got := withHostRoute("sr: bob@example.com · (stale)", stale, marker, true); got != "sr: bob@example.com · (stale) · Air-Blue tunnel down" {
+	if got := withHostRoute("sr: bob@example.com · (stale)", stale, marker, true); got != "sr: bob@example.com · (stale) · Laptop tunnel down" {
 		t.Fatalf("stale = %q", got)
 	}
 	// Data that is only old because the session sat idle, or a lookup the
@@ -480,7 +480,7 @@ func TestWithHostRouteNamesTheTunnel(t *testing.T) {
 	if got := withHostRoute("sr: account unknown (server refused the session lookup)", refused, marker, true); got != "sr: account unknown (server refused the session lookup)" {
 		t.Fatalf("refused = %q", got)
 	}
-	direct := hostAttachMarker{Route: hostRouteDirect, Via: "Air-Blue"}
+	direct := hostAttachMarker{Route: hostRouteDirect, Via: "Laptop"}
 	if got := withHostRoute(line, live, direct, true); got != line {
 		t.Fatalf("direct route changed the line: %q", got)
 	}
@@ -491,15 +491,15 @@ func TestWithHostRouteNamesTheTunnel(t *testing.T) {
 
 func TestServerHeadingShowsAttachedRoute(t *testing.T) {
 	runner, _, _, _ := setupHostTest(t, "http://127.0.0.1:31415")
-	server := srServerConfig{Name: "lawrence", URL: "http://127.0.0.1:31415"}
-	if got := runner.serverHeading(server); got != "Server: lawrence (http://127.0.0.1:31415)" {
+	server := srServerConfig{Name: "pool-a", URL: "http://127.0.0.1:31415"}
+	if got := runner.serverHeading(server); got != "Server: pool-a (http://127.0.0.1:31415)" {
 		t.Fatalf("unattached heading = %q", got)
 	}
-	marker := `{"pool":"lawrence","route":"tunnel","via":"Air-Blue","url":"http://127.0.0.1:31415"}`
+	marker := `{"pool":"pool-a","route":"tunnel","via":"Laptop","url":"http://127.0.0.1:31415"}`
 	if err := os.WriteFile(filepath.Join(runner.store.StoreDir(), hostAttachMarkerFile), []byte(marker), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	want := "Server: lawrence (http://127.0.0.1:31415) · via a reverse tunnel from Air-Blue (down while Air-Blue sleeps)"
+	want := "Server: pool-a (http://127.0.0.1:31415) · via a reverse tunnel from Laptop (down while Laptop sleeps)"
 	if got := runner.serverHeading(server); got != want {
 		t.Fatalf("heading = %q", got)
 	}
@@ -515,12 +515,12 @@ func TestExplainHostRouteErrorNamesTheTunnel(t *testing.T) {
 	if got := runner.explainHostRouteError(refused); got != refused {
 		t.Fatalf("unattached machine changed the error: %v", got)
 	}
-	marker := `{"pool":"lawrence","route":"tunnel","via":"Air-Blue","url":"http://127.0.0.1:31415"}`
+	marker := `{"pool":"pool-a","route":"tunnel","via":"Laptop","url":"http://127.0.0.1:31415"}`
 	if err := os.WriteFile(filepath.Join(runner.store.StoreDir(), hostAttachMarkerFile), []byte(marker), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	got := runner.explainHostRouteError(refused)
-	if !errors.Is(got, refused) || !strings.Contains(got.Error(), "reverse tunnel from Air-Blue, which is down") {
+	if !errors.Is(got, refused) || !strings.Contains(got.Error(), "reverse tunnel from Laptop, which is down") {
 		t.Fatalf("got %v", got)
 	}
 	other := errors.New("dial tcp 10.0.0.1:443: connect: connection refused")

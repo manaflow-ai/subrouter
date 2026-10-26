@@ -52,7 +52,7 @@ func TestSameEndpointTreatsHTTPAndHTTPSAsDifferentOrigins(t *testing.T) {
 }
 
 func TestHealthURLForRejectsRelative(t *testing.T) {
-	if _, err := healthURLFor("cmux-mac-mini:31415"); err == nil {
+	if _, err := healthURLFor("router-host:31415"); err == nil {
 		t.Fatal("expected error for non-absolute base URL")
 	}
 	if _, err := healthURLFor("   "); err == nil {

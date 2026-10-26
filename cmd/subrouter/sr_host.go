@@ -178,7 +178,7 @@ commit built with go on the host. Re-running attach is safe.
 watch keeps the hosts' pool health on screen. Run it in a cmux Dock pane
 (~/.config/cmux/dock.json: {"id":"sr-pool","title":"Pool","command":"sr host watch"})
 and every workspace whose remote destination is an attached host gets a
-sidebar pill such as "lawrence ✓ tunnel" or "lawrence ✗ tunnel stopped".
+sidebar pill such as "pool-a ✓ tunnel" or "pool-a ✗ tunnel stopped".
 `
 
 func (r srRunner) host(ctx context.Context, args []string) error {

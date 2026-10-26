@@ -29,12 +29,12 @@ func (f *fakeRunner) Output(_ context.Context, _ string, args ...string) ([]byte
 }
 
 const userWhois = `{
-  "Node": {"Name": "lawrences-macbook-pro-2.tail137216.ts.net.", "Tags": null},
+  "Node": {"Name": "laptop-2.example.ts.net.", "Tags": null},
   "UserProfile": {"LoginName": "lawrence@manaflow.ai", "DisplayName": "Lawrence Chen"}
 }`
 
 const taggedWhois = `{
-  "Node": {"Name": "cmux-lawrences-mac-mini.tail137216.ts.net.", "Tags": ["tag:dev-workstation"]},
+  "Node": {"Name": "mac-mini.example.ts.net.", "Tags": ["tag:dev-workstation"]},
   "UserProfile": {"LoginName": "tagged-devices", "DisplayName": "Tagged Devices"}
 }`
 
@@ -59,7 +59,7 @@ func TestLookupReturnsUserIdentity(t *testing.T) {
 		t.Fatalf("login = %q", identity.LoginName)
 	}
 	// The trailing dot in a MagicDNS name is noise in logs.
-	if identity.NodeName != "lawrences-macbook-pro-2.tail137216.ts.net" {
+	if identity.NodeName != "laptop-2.example.ts.net" {
 		t.Fatalf("node = %q", identity.NodeName)
 	}
 	// whois takes the bare address; the port must be stripped before the call.
@@ -69,7 +69,7 @@ func TestLookupReturnsUserIdentity(t *testing.T) {
 }
 
 func TestLookupReturnsTagsForTaggedNode(t *testing.T) {
-	identity, ok := newTestResolver(&fakeRunner{output: taggedWhois}).Lookup(context.Background(), "100.89.225.106:4001")
+	identity, ok := newTestResolver(&fakeRunner{output: taggedWhois}).Lookup(context.Background(), "100.64.0.10:4001")
 	if !ok {
 		t.Fatal("expected the tagged peer to resolve")
 	}

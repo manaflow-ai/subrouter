@@ -200,7 +200,7 @@ func TestSRLoginHostedExchangeFailureSuggestsLegacyServer(t *testing.T) {
 	for _, want := range []string{
 		"hosted cmux.com tenant exchange failed",
 		"sr storage legacy",
-		"sr server add lawrence --url http://127.0.0.1:31415 --default",
+		"sr server add team --url http://127.0.0.1:31415 --default",
 	} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("error = %q, missing %q", message, want)

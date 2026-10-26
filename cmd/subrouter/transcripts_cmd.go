@@ -405,7 +405,7 @@ func (u *countingUploader) Destination() string { return "dry-run" }
 func transcriptsRecompress(args []string) error {
 	flags := flag.NewFlagSet("transcripts recompress", flag.ContinueOnError)
 	localDir := flags.String("local-dir", "", "raw transcript spool (the directory holding by-agent/)")
-	sourceURL := flags.String("source", "", "container URL with a raw transcript prefix in the old account, e.g. https://<old-account>.blob.core.windows.net/transcripts/cmux-lawrence/by-agent (read credential: SUBROUTER_TRANSCRIPT_SOURCE_KEY_FILE)")
+	sourceURL := flags.String("source", "", "container URL with a raw transcript prefix in the old account, e.g. https://<old-account>.blob.core.windows.net/transcripts/<host>/by-agent (read credential: SUBROUTER_TRANSCRIPT_SOURCE_KEY_FILE)")
 	container := flags.String("container", "", "destination container URL; defaults to SUBROUTER_TRANSCRIPT_AZURE_CONTAINER_URL")
 	deleteSources := flags.Bool("delete", false, "with --local-dir: delete each source file after its segments are committed")
 	dryRun := flags.Bool("dry-run", false, "compress and count, upload nothing, delete nothing")

@@ -13141,7 +13141,7 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 		// feedback loop: failures cause retries, retries empty the pool, every
 		// subsequent request has to dial, the extra dials exhaust the machine's
 		// ephemeral ports, and the resulting dial failures cause more retries.
-		// That is how cmux-mac-mini ran out of ports a second time, with
+		// That is how a Mac mini worker ran out of ports a second time, with
 		// 33k sockets in TIME_WAIT against a 32k range.
 		//
 		// The staleness this guarded against is now prevented at the source:

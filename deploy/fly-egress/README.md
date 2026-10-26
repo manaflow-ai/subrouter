@@ -1,13 +1,13 @@
 # Codex regional egress on Fly.io
 
-The team router on cmux-lawrence keeps every Codex credential and does every
+The team router keeps every Codex credential and does every
 token refresh. When the local pool answers a capacity failure
 (`server_is_overloaded`, 408 or 5xx), `codexEgressFallbackTransport` replays
 the same request, on the same account, through an HTTP CONNECT proxy in
 another region. These Fly machines are those proxies. They hold no
 credentials and store nothing but their Tailscale node state.
 
-- App `subrouter-codex-egress` in the `manaflow` org. One `shared-cpu-1x`
+- One Fly app (`FLY_EGRESS_APP`) in `FLY_EGRESS_ORG`. One `shared-cpu-1x`
   256 MB machine per Fly region, each with a 1 GB `ts_state` volume.
 - Each machine joins the tailnet as `fly-egress-<region>` with `tag:egress`
   and runs tinyproxy on `<tailnet-ipv4>:3128`. No Fly services, so no public
@@ -21,7 +21,7 @@ credentials and store nothing but their Tailscale node state.
 ## Operate
 
 ```bash
-./fly-egress.sh build                 # image registry.fly.io/subrouter-codex-egress:v1
+./fly-egress.sh build                 # image registry.fly.io/$FLY_EGRESS_APP:v1
 ./fly-egress.sh up                    # every region; or: ./fly-egress.sh up ams fra
 ./fly-egress.sh status
 ./fly-egress.sh sync-router --dry-run
@@ -36,7 +36,7 @@ the secret after the machines join:
 
 ```bash
 tsadmin api POST /tailnet/-/keys '{"capabilities":{"devices":{"create":{"reusable":true,"ephemeral":false,"preauthorized":true,"tags":["tag:egress"]}}},"expirySeconds":3600,"description":"fly codex egress bootstrap"}' \
-  | jq -r '"TS_AUTHKEY=" + .key' | fly secrets import -a subrouter-codex-egress --stage
+  | jq -r '"TS_AUTHKEY=" + .key' | fly secrets import -a "$FLY_EGRESS_APP" --stage
 ```
 
 A restart reuses the node state on the volume, so the node keeps its name and
@@ -62,11 +62,11 @@ session store (`attempt_failed` per region, then `absorbed`,
 `client_visible` or `failed_other` per request or turn). Summary:
 
 ```bash
-ssh cmux-lawrence 'curl -sS http://127.0.0.1:31415/_subrouter/codex-capacity' | jq '.events, .regions'
+ssh "$FLY_EGRESS_ROUTER_HOST" 'curl -sS http://127.0.0.1:31415/_subrouter/codex-capacity' | jq '.events, .regions'
 ```
 
 Live test: `live-regions.py` sends real turns from loopback with
 `X-Subrouter-Test-Fault: capacity=<regions>`, which keeps those regions out of
 the request (nothing is synthesized and nothing is sent from them). Enable
 `SUBROUTER_CODEX_FAULT_INJECTION=1` with `subrouter-deploy.sh reconfigure`,
-run it on cmux-lawrence, then reconfigure again without it.
+run it on the router host, then reconfigure again without it.

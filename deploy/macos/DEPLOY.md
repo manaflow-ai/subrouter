@@ -5,7 +5,7 @@ The supervisor binds the public port only after the first worker answers
 therefore turns a slow or broken worker into a total outage: `supervise` exits
 before it binds, launchd restarts it every 30 seconds, and clients get
 connection refused until someone puts the old binary back. That happened twice
-on cmux-lawrence on 2026-09-04 and blocked every agent on the tailnet.
+on the team router on 2026-09-04 and blocked every agent on the tailnet.
 
 Replacing the binary and asking the supervisor to upgrade has no such failure
 mode. The listener stays bound, the new generation starts behind it, and the
@@ -59,7 +59,7 @@ the supervisor moves only with `--enable-rollouts` (below). Log: `/var/log/subro
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/deploy/macos/upgrade-host.sh \
-  | bash -s -- --enable-rollouts -J browser-a -i ~/.ssh/id_ed25519_manaflow_cmux cmux-lawrence@172.20.21.158
+  | bash -s -- --enable-rollouts -J JUMP_HOST -i ~/.ssh/KEY USER@ROUTER_HOST
 ```
 
 `--enable-rollouts` goes before the ssh arguments. It builds `--ref` (default
@@ -115,7 +115,7 @@ instead:
 A candidate that never becomes ready is replaced with the backed-up binary and
 plist while the bridge still serves. `--adopt-worker-config` also wires
 `--worker-config` into the plist, writing the file from the plist's worker
-args if it is missing. Rehearsed on cmux-lawrence on 2026-09-22 against a copy
+args if it is missing. Rehearsed on the team router on 2026-09-22 against a copy
 of the stack on a spare port: 0 failed probes out of 476 during a handoff, and
 a crash-looping candidate was rolled back with 284 of 284 probes answered. The
 run logs to `/var/log/subrouter-handoff.log`. If it stops with "the bridge
@@ -236,7 +236,7 @@ Use `--addr :31415`, not `--addr 0.0.0.0:31415`. The IPv4 wildcard binds IPv4
 only, which is exactly what it means, and current supervisors honour it. Older
 builds bound dual stack from the same string, so upgrading a supervisor on a
 host whose clients arrive over IPv6, such as anything on the tailnet, silently
-drops those clients. That happened on cmux-lawrence on 2026-09-04. The
+drops those clients. That happened on the team router on 2026-09-04. The
 supervisor now logs the family it bound and warns when it is IPv4 only.
 
 ```bash
