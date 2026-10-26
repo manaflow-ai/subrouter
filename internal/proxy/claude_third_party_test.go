@@ -323,8 +323,9 @@ func TestClaudeThirdPartyExtraUsageIgnoredOnAPIKeyAccount(t *testing.T) {
 	}
 }
 
-// The key-only state is request-wide: an outer replay that re-enters the
-// transport after the API key failed still never reaches an OAuth account.
+// The key-only state is request-wide: when the API key answers a 408, the
+// outer transport replay re-sends its input addressed to the refusing OAuth
+// account, and the request must still go to the key, never to OAuth.
 func TestClaudeThirdPartyExtraUsageKeyOnlySurvivesOuterReplay(t *testing.T) {
 	server := Server{
 		Accounts: []accounts.Account{
@@ -334,40 +335,39 @@ func TestClaudeThirdPartyExtraUsageKeyOnlySurvivesOuterReplay(t *testing.T) {
 		},
 		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
 	}
-	var oauthB, keyHits int
-	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
-		if req.Header.Get("X-Api-Key") == "tok-key" {
+	var oauthA, oauthB, keyHits int
+	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.Header.Get("X-Api-Key") == "tok-key":
 			keyHits++
-			return &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{},
-				Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`))}
-		}
-		if req.Header.Get("Authorization") == "Bearer tok-b" {
+			if keyHits == 1 {
+				return &http.Response{StatusCode: http.StatusRequestTimeout, Header: http.Header{}, Body: http.NoBody}, nil
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(`{"id":"ok"}`))}, nil
+		case req.Header.Get("Authorization") == "Bearer tok-b":
 			oauthB++
+		default:
+			oauthA++
 		}
 		return &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{},
-			Body: io.NopCloser(strings.NewReader(anthropicThirdPartyExtraUsageBody))}
-	}}
-	budget := newAttemptBudget(6)
-	first := usageLimitRetryTransport{
-		base: stub, server: &server, provider: accounts.ProviderClaude,
-		agent: "claude", session: "session-third-party-outer", account: "oauth-a",
-		method: http.MethodPost, path: "/v1/messages", maxAttempts: 4, budget: budget,
-	}
-	response, err := first.RoundTrip(claudeThirdPartyOAuthRequest(t, "tok-a"))
+			Body: io.NopCloser(strings.NewReader(anthropicThirdPartyExtraUsageBody))}, nil
+	})
+	req := claudeThirdPartyOAuthRequest(t, "tok-a")
+	a := &upstreamAttempt{server: &server, provider: accounts.ProviderClaude, account: server.Accounts[0],
+		path: "/v1/messages", getBody: req.GetBody, budget: newAttemptBudget(20)}
+	transport := upstreamLayers{
+		usageLimit:     &usageLimitRetryTransport{method: http.MethodPost, maxAttempts: 6},
+		replayablePost: &replayablePostRetryTransport{method: http.MethodPost, maxAttempts: 6},
+	}.build(base, a)
+	response, err := transport.RoundTrip(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	response.Body.Close()
-	// The outer layer replays on the account the request last used.
-	replay := first
-	replay.account = "claude:key"
-	response, err = replay.RoundTrip(claudeCostTierRequest(t, "tok-key"))
-	if err != nil {
-		t.Fatal(err)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || oauthA != 1 || oauthB != 0 || keyHits != 2 {
+		t.Fatalf("status %d oauth-a=%d oauth-b=%d key=%d; want 200 with 1, 0, 2", response.StatusCode, oauthA, oauthB, keyHits)
 	}
-	response.Body.Close()
-	if oauthB != 0 || keyHits != 2 {
-		t.Fatalf("oauth-b calls %d, key calls %d; want 0 and 2", oauthB, keyHits)
-	}
+	assertClaudeAccountUnmarked(t, server, "oauth-a")
 	assertClaudeAccountUnmarked(t, server, "oauth-b")
 }

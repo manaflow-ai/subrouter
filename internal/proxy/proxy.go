@@ -11411,6 +11411,27 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				continue
 			}
 		}
+		// An outer layer (transport replay) re-sends its own input, addressed
+		// to the subscription account that refused this client. Keep a
+		// key-only request on API keys before anything is sent.
+		if claudeThirdPartyKeyOnly && t.server != nil &&
+			t.server.claudeAuthMode(accounts.Account{ID: accountID}) != accounts.AuthModeAPIKey {
+			tried[accountID] = struct{}{}
+			next, ok := t.server.claudeAPIKeyRetryCandidate(req.Context(), t.poolModel, tried)
+			if !ok {
+				return claudeThirdPartyExtraUsageResponse(nil, attemptReq), nil
+			}
+			nextReq, replayErr := a.replay(replayReq, &next)
+			if replayErr != nil {
+				return nil, replayErr
+			}
+			accountID = next.ID
+			accountCredential = next.CredentialIdentity()
+			tried[accountID] = struct{}{}
+			attemptReq = nextReq
+			quotaFailedOver = true
+			failoverReason = accountMoveCredential
+		}
 		// A session fanning out (subagents, workflows) shares one sticky
 		// account, so its requests queue behind that account's admission
 		// limit while the rest of the pool idles. Place this one request on
