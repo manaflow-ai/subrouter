@@ -30,7 +30,7 @@ import (
 // telling the user to add one, is the only remedy.
 
 // claudeThirdPartyExtraUsageReply is the message of subrouter's own answer.
-const claudeThirdPartyExtraUsageReply = "subrouter: this client isn't Claude Code, so Anthropic bills its subscription (OAuth) requests from extra usage instead of plan limits, and refused this one. Retrying on another subscription account fails the same way. Add a Claude API-key account to subrouter so it can route this client there, or use Claude Code."
+const claudeThirdPartyExtraUsageReply = "subrouter: this client isn't Claude Code, so Anthropic bills its subscription (OAuth) requests from extra usage instead of plan limits, and refused this one. Retrying on another subscription account fails the same way. No Claude API-key account in subrouter could take it: add a working one so subrouter can route this client there, or use Claude Code."
 
 // claudeThirdPartyExtraUsageMessage matches Anthropic's refusal of a
 // non-Claude-Code client on a subscription credential. It keys on the stable

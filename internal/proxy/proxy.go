@@ -11982,6 +11982,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				budgetExhausted = !a.consume()
 			}
 		}
+		if claudeThirdPartyKeyOnly && (attempt == maxAttempts || t.server == nil || budgetExhausted) {
+			// Every API key this request may use is spent: the client needs the
+			// third-party explanation, not the last key's own error.
+			return claudeThirdPartyExtraUsageResponse(response, attemptReq), nil
+		}
 		if attempt == maxAttempts || t.server == nil || budgetExhausted {
 			reason := "max_attempts"
 			switch {
@@ -12023,6 +12028,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			if t.logger != nil {
 				t.logger.Warn("usage-limit retry has no alternate account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", pickErr)
+			}
+			if claudeThirdPartyKeyOnly {
+				return claudeThirdPartyExtraUsageResponse(response, attemptReq), nil
 			}
 			var poolErr *poolExhaustedError
 			if (quota429 && errors.As(pickErr, &poolErr)) || claudeCreditExhausted {

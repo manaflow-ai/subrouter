@@ -266,6 +266,9 @@ func TestClaudeThirdPartyExtraUsageKeyFailureNeverReturnsToOAuth(t *testing.T) {
 	if oauthA != 1 || keyHits != 1 || oauthB != 0 {
 		t.Fatalf("calls oauth-a=%d key=%d oauth-b=%d; want 1, 1, 0", oauthA, keyHits, oauthB)
 	}
+	if response.StatusCode != http.StatusBadRequest || response.Header.Get("X-Subrouter-Error") != "claude_third_party_extra_usage" {
+		t.Fatalf("status %d error %q; want subrouter's third-party 400, not the key's 401", response.StatusCode, response.Header.Get("X-Subrouter-Error"))
+	}
 	assertClaudeAccountUnmarked(t, server, "oauth-a")
 	assertClaudeAccountUnmarked(t, server, "oauth-b")
 }
