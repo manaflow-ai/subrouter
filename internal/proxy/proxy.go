@@ -11360,6 +11360,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	// subscription account (claude_third_party.go), so every later move of
 	// this request goes to another API key, never back to an OAuth account.
 	claudeThirdPartyKeyOnly := a.budget != nil && a.budget.claudeThirdPartyKeyOnly.Load()
+	// claudeThirdPartyRedirected: this pass moved a key-only request off the
+	// OAuth account it was addressed to before its first send, so a success
+	// on its first attempt must still move the session to the key.
+	claudeThirdPartyRedirected := false
 	claudeTransient429Retries := 0
 	claudeTransient429Rerouted := a.budget != nil && a.budget.claudeTransient429Rerouted.Load()
 	sealedStripped := false
@@ -11431,6 +11435,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			attemptReq = nextReq
 			quotaFailedOver = true
 			failoverReason = accountMoveCredential
+			claudeThirdPartyRedirected = true
 		}
 		// A session fanning out (subagents, workflows) shares one sticky
 		// account, so its requests queue behind that account's admission
@@ -11880,7 +11885,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if spilledFrom != "" {
 				return response, nil
 			}
-			if err := t.commitSuccessfulFailover(response, attempt, accountID, commitReason); err != nil {
+			commitAttempt := attempt
+			if claudeThirdPartyRedirected && commitAttempt < 2 {
+				commitAttempt = 2
+			}
+			if err := t.commitSuccessfulFailover(response, commitAttempt, accountID, commitReason); err != nil {
 				if response.Body != nil {
 					_ = response.Body.Close()
 				}

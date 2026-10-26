@@ -327,7 +327,12 @@ func TestClaudeThirdPartyExtraUsageIgnoredOnAPIKeyAccount(t *testing.T) {
 // outer transport replay re-sends its input addressed to the refusing OAuth
 // account, and the request must still go to the key, never to OAuth.
 func TestClaudeThirdPartyExtraUsageKeyOnlySurvivesOuterReplay(t *testing.T) {
+	sessions := newSessionStore(t)
+	if _, err := sessions.Put("claude", "session-third-party-outer", "oauth-a", ""); err != nil {
+		t.Fatal(err)
+	}
 	server := Server{
+		Sessions: sessions,
 		Accounts: []accounts.Account{
 			{ID: "oauth-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-a"},
 			{ID: "oauth-b", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-b"},
@@ -355,6 +360,7 @@ func TestClaudeThirdPartyExtraUsageKeyOnlySurvivesOuterReplay(t *testing.T) {
 	})
 	req := claudeThirdPartyOAuthRequest(t, "tok-a")
 	a := &upstreamAttempt{server: &server, provider: accounts.ProviderClaude, account: server.Accounts[0],
+		agent: "claude", session: "session-third-party-outer",
 		path: "/v1/messages", getBody: req.GetBody, budget: newAttemptBudget(20)}
 	transport := upstreamLayers{
 		usageLimit:     &usageLimitRetryTransport{method: http.MethodPost, maxAttempts: 6},
@@ -368,6 +374,12 @@ func TestClaudeThirdPartyExtraUsageKeyOnlySurvivesOuterReplay(t *testing.T) {
 	if response.StatusCode != http.StatusOK || oauthA != 1 || oauthB != 0 || keyHits != 2 {
 		t.Fatalf("status %d oauth-a=%d oauth-b=%d key=%d; want 200 with 1, 0, 2", response.StatusCode, oauthA, oauthB, keyHits)
 	}
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatal(err)
+	}
 	assertClaudeAccountUnmarked(t, server, "oauth-a")
 	assertClaudeAccountUnmarked(t, server, "oauth-b")
+	if assignment, ok := sessions.Get("claude", "session-third-party-outer"); !ok || assignment.AccountID != "claude:key" {
+		t.Fatalf("sticky assignment = %+v, ok=%v; want the API key after the outer replay", assignment, ok)
+	}
 }
