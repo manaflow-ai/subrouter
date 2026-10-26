@@ -163,3 +163,21 @@ func TestRefreshSyncDoesNotOverwriteConcurrentSwitch(t *testing.T) {
 		t.Fatalf("active refresh token = %q; want b-refresh (the account the user switched to)", got)
 	}
 }
+
+func TestWriteCodexActiveAuthRefusesTheSubrouterPlaceholder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.json")
+	login := []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"current"}}`)
+	if err := os.WriteFile(path, login, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCodexActiveAuth(path, json.RawMessage(`{"auth_mode":"apikey","OPENAI_API_KEY":"subrouter"}`)); err == nil {
+		t.Fatal("writing the placeholder as the active login succeeded")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(login) {
+		t.Fatalf("active login changed to %q", got)
+	}
+}

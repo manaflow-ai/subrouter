@@ -338,7 +338,7 @@ func TestPrepareCodexSharedHomeLinksAndRefreshes(t *testing.T) {
 	if err := prepareCodexSharedHome(source, target, "http://h/v1", nil); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"sessions", "skills", "auth.json", "hooks.json"} {
+	for _, name := range []string{"sessions", "skills", "hooks.json"} {
 		if dest, err := os.Readlink(filepath.Join(target, name)); err != nil || dest != filepath.Join(source, name) {
 			t.Errorf("%s: link %q, %v", name, dest, err)
 		}
@@ -347,6 +347,12 @@ func TestPrepareCodexSharedHomeLinksAndRefreshes(t *testing.T) {
 		if _, err := os.Lstat(filepath.Join(target, name)); !os.IsNotExist(err) {
 			t.Errorf("%s must not be linked from the source home", name)
 		}
+	}
+	if info, err := os.Lstat(filepath.Join(target, "auth.json")); err != nil || !info.Mode().IsRegular() {
+		t.Errorf("auth.json must be the shared home's own file: %v %v", info, err)
+	}
+	if body, _ := os.ReadFile(filepath.Join(source, "auth.json")); string(body) != "{}" {
+		t.Errorf("the user's auth.json was modified: %q", body)
 	}
 	if info, err := os.Lstat(filepath.Join(target, "packages")); err != nil || !info.IsDir() {
 		t.Fatalf("packages must be a real directory of the shared home: %v %v", info, err)
@@ -555,5 +561,70 @@ func TestSessionNotifySharedFlagParses(t *testing.T) {
 	}
 	if json.Unmarshal([]byte(`{"cwd":"/w"}`), &payload) != nil || payload.Cwd != "/w" {
 		t.Fatal("notify payload cwd")
+	}
+}
+
+// A direct ChatGPT login in the user's Codex home must survive sr codex
+// launches: after a reboot cmux restores direct sessions as plain
+// `codex resume`, which reads that file and talks to api.openai.com.
+func TestCodexSharedHomeNeverTouchesTheUserLogin(t *testing.T) {
+	f := newSharedHomeFixture(t)
+	f.writeUser("model = \"gpt-5\"\n")
+	userLogin := []byte(`{"auth_mode":"chatgpt","tokens":{"refresh_token":"rt-user"}}`)
+	userAuth := filepath.Join(f.source, "auth.json")
+	if err := os.WriteFile(userAuth, userLogin, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// An older build linked auth.json into the user's home; writing the
+	// placeholder through that link would replace the user's login.
+	if err := os.MkdirAll(f.target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(userAuth, filepath.Join(f.target, "auth.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 2 {
+		f.prepare("http://a/v1")
+	}
+
+	info, err := os.Lstat(filepath.Join(f.target, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		t.Fatalf("shared auth.json mode = %v, want a private 0600 file", info.Mode())
+	}
+	if !codexHomeHasPlaceholderAuth(f.target) {
+		t.Fatal("shared home is not logged in with the placeholder")
+	}
+	got, err := os.ReadFile(userAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(userLogin) {
+		t.Fatalf("user login changed to %q", got)
+	}
+	if codexHomeHasPlaceholderAuth(f.source) {
+		t.Fatal("a direct ChatGPT login was reported as the placeholder")
+	}
+}
+
+func TestCodexHomeHasPlaceholderAuthDetectsThePoisonedLogin(t *testing.T) {
+	home := t.TempDir()
+	if codexHomeHasPlaceholderAuth(home) {
+		t.Fatal("a missing auth.json is not the placeholder")
+	}
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"auth_mode":"apikey","OPENAI_API_KEY":"subrouter"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !codexHomeHasPlaceholderAuth(home) {
+		t.Fatal("the placeholder login was not detected")
+	}
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"auth_mode":"apikey","OPENAI_API_KEY":"sk-real"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if codexHomeHasPlaceholderAuth(home) {
+		t.Fatal("a real API key was reported as the placeholder")
 	}
 }

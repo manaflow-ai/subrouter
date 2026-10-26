@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -45,11 +46,16 @@ const (
 // codexSharedHomeOwnedEntries are never linked from the source home: the
 // config is generated, the daemon control and state directories must be
 // per-home, and the models cache belongs to the provider that filled it.
+// auth.json is per-home so sr codex never reads, refreshes or overwrites the
+// user's own Codex login: concurrent launches sharing one single-use ChatGPT
+// refresh token race, and the Subrouter placeholder key must never land in
+// the home that plain codex sends to api.openai.com.
 // packages is per-home because Codex's installer writes absolute paths
 // under $CODEX_HOME into it: through a link, a daemon start here re-points
 // the user's own installation at this home.
 var codexSharedHomeOwnedEntries = map[string]bool{
 	"config.toml":        true,
+	"auth.json":          true,
 	"app-server-control": true,
 	"app-server-daemon":  true,
 	"models_cache.json":  true,
@@ -220,7 +226,39 @@ func prepareCodexSharedHome(source, target, baseURL string, notify []string) err
 	if err := ensureCodexSharedDaemonPackage(source, target); err != nil {
 		return err
 	}
+	if err := writeCodexSharedHomeAuth(target); err != nil {
+		return err
+	}
 	return mergeCodexSharedHomeConfig(source, target, baseURL, notify)
+}
+
+// codexPlaceholderAuth is the shared home's own login. The generated provider
+// authenticates model traffic with the same placeholder; the proxy, not this
+// file, holds the real account credentials.
+var codexPlaceholderAuth = []byte("{\n  \"auth_mode\": \"apikey\",\n  \"OPENAI_API_KEY\": \"subrouter\"\n}\n")
+
+func writeCodexSharedHomeAuth(target string) error {
+	path := filepath.Join(target, "auth.json")
+	if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
+		if current, err := os.ReadFile(path); err == nil && bytes.Equal(current, codexPlaceholderAuth) {
+			return nil
+		}
+	}
+	return writeFileAtomic(path, codexPlaceholderAuth, 0o600)
+}
+
+// codexHomeHasPlaceholderAuth reports whether a user's own Codex home is
+// logged in with the Subrouter placeholder key. Plain codex would send it to
+// api.openai.com and fail with 401.
+func codexHomeHasPlaceholderAuth(home string) bool {
+	body, err := os.ReadFile(filepath.Join(home, "auth.json"))
+	if err != nil {
+		return false
+	}
+	var auth struct {
+		APIKey string `json:"OPENAI_API_KEY"`
+	}
+	return json.Unmarshal(body, &auth) == nil && strings.TrimSpace(auth.APIKey) == "subrouter"
 }
 
 func lockCodexSharedHome(target string) (func(), error) {

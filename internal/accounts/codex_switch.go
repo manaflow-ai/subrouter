@@ -187,6 +187,9 @@ func writeCodexActiveAuth(path string, rawAuth json.RawMessage) error {
 	if err := json.Unmarshal(rawAuth, &auth); err != nil {
 		return err
 	}
+	if strings.TrimSpace(auth.OpenAIAPIKey) == "subrouter" {
+		return errors.New("refusing to write the Subrouter placeholder key as the active Codex login: plain codex would send it to api.openai.com")
+	}
 	payload := rawAuth
 	if auth.AuthMode == "apikey" || auth.OpenAIAPIKey != "" {
 		apiKeyPayload := map[string]string{

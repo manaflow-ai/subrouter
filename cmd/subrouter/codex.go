@@ -140,6 +140,9 @@ func codex(args []string) error {
 		childAccountID = ""
 	}
 
+	if source, err := codexSourceHome(); err == nil && codexHomeHasPlaceholderAuth(source) {
+		fmt.Fprintf(os.Stderr, "%s: warning: %s is logged in with the Subrouter placeholder key, so plain `codex` (and cmux restoring it) fails with 401 at api.openai.com; run `codex login` to restore your own login\n", programBase(), filepath.Join(source, "auth.json"))
+	}
 	sharedHome := ""
 	if codexSharedDaemonEligible(args, localTarget, userEmail, accountID, persistCapacity, retryHeader) {
 		if sharedHome, err = prepareCodexSharedHomeForLaunch(baseURL); err != nil {
