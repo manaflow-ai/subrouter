@@ -89,6 +89,9 @@ func (s Server) claudeAPIKeyRetryCandidate(ctx context.Context, poolModel string
 		if scheduler.Exhausted(provider, candidate.ID) {
 			continue
 		}
+		if s.admission != nil && s.admission.paused(admissionKeyFor(provider, candidate.ID, poolModel), now) {
+			continue
+		}
 		if s.SchedulerRef != nil {
 			if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(provider, candidate.ID, poolModel, now); blocked {
 				continue

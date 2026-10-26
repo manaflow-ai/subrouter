@@ -225,3 +225,100 @@ func TestClaudeThirdPartyExtraUsageSkipsHeldAPIKey(t *testing.T) {
 		t.Fatalf("calls %d status %d error %q; want one call and subrouter's 400", stub.calls, response.StatusCode, response.Header.Get("X-Subrouter-Error"))
 	}
 }
+
+// Once a request moved to an API key because of a third-party refusal, a
+// later failure on that key must not send it back to a subscription account.
+func TestClaudeThirdPartyExtraUsageKeyFailureNeverReturnsToOAuth(t *testing.T) {
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "oauth-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-a"},
+			{ID: "oauth-b", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-b"},
+			{ID: "claude:key", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-key"},
+		},
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+	}
+	var oauthA, oauthB, keyHits int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		switch {
+		case req.Header.Get("X-Api-Key") == "tok-key":
+			keyHits++
+			return &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`))}
+		case req.Header.Get("Authorization") == "Bearer tok-b":
+			oauthB++
+		default:
+			oauthA++
+		}
+		return &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(anthropicThirdPartyExtraUsageBody))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-third-party-key-fails", account: "oauth-a",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 4,
+		budget: newAttemptBudget(3),
+	}
+	response, err := transport.RoundTrip(claudeThirdPartyOAuthRequest(t, "tok-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if oauthA != 1 || keyHits != 1 || oauthB != 0 {
+		t.Fatalf("calls oauth-a=%d key=%d oauth-b=%d; want 1, 1, 0", oauthA, keyHits, oauthB)
+	}
+	assertClaudeAccountUnmarked(t, server, "oauth-a")
+	assertClaudeAccountUnmarked(t, server, "oauth-b")
+}
+
+// An admission-paused key cannot take the request, so it is not picked.
+func TestClaudeThirdPartyExtraUsageSkipsPausedAPIKey(t *testing.T) {
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "oauth-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-a"},
+			{ID: "claude:paused", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-paused"},
+			{ID: "claude:open", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-open"},
+		},
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+		admission:    newAdmissionControl(),
+	}
+	server.admission.pause(admissionKeyFor(accounts.ProviderClaude, "claude:paused", ""), time.Now().Add(time.Minute))
+	got, ok := server.claudeAPIKeyRetryCandidate(t.Context(), "", map[string]struct{}{"oauth-a": {}})
+	if !ok || got.ID != "claude:open" {
+		t.Fatalf("candidate = %q, %v; want claude:open", got.ID, ok)
+	}
+	server.admission.pause(admissionKeyFor(accounts.ProviderClaude, "claude:open", ""), time.Now().Add(time.Minute))
+	if got, ok := server.claudeAPIKeyRetryCandidate(t.Context(), "", map[string]struct{}{"oauth-a": {}}); ok {
+		t.Fatalf("candidate = %q with every key paused; want none", got.ID)
+	}
+}
+
+// The refusal is about subscription billing. An API-key account answering
+// with similar text is not given the third-party treatment.
+func TestClaudeThirdPartyExtraUsageIgnoredOnAPIKeyAccount(t *testing.T) {
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "claude:key", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-key"},
+		},
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+	}
+	stub := &stubRoundTripper{responses: func(*http.Request) *http.Response {
+		return &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{},
+			Body: io.NopCloser(strings.NewReader(anthropicThirdPartyExtraUsageBody))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-third-party-on-key", account: "claude:key",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
+		budget: newAttemptBudget(2),
+	}
+	req := claudeCostTierRequest(t, "tok-key")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.Header.Get("X-Subrouter-Error") != "" || string(body) != anthropicThirdPartyExtraUsageBody {
+		t.Fatalf("API-key response rewritten: header %q body %q", response.Header.Get("X-Subrouter-Error"), body)
+	}
+}

@@ -11356,6 +11356,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	overloadRerouted, quotaFailedOver := false, false
 	failoverReason := accountMoveUsageLimit
 	claudeExtraUsageRetried := false
+	// claudeThirdPartyKeyOnly: Anthropic refused this client on a
+	// subscription account (claude_third_party.go), so every later move of
+	// this request goes to another API key, never back to an OAuth account.
+	claudeThirdPartyKeyOnly := false
 	claudeTransient429Retries := 0
 	claudeTransient429Rerouted := a.budget != nil && a.budget.claudeTransient429Rerouted.Load()
 	sealedStripped := false
@@ -11381,7 +11385,16 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				schedulerAccountProvider(t.provider), accountID, t.poolModel, time.Now(),
 			); blocked {
 				tried[accountID] = struct{}{}
-				next, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
+				var next accounts.Account
+				var pickErr error
+				if claudeThirdPartyKeyOnly {
+					var ok bool
+					if next, ok = t.server.claudeAPIKeyRetryCandidate(req.Context(), t.poolModel, tried); !ok {
+						return claudeThirdPartyExtraUsageResponse(nil, attemptReq), nil
+					}
+				} else {
+					next, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
+				}
 				if pickErr != nil {
 					return nil, pickErr
 				}
@@ -11441,7 +11454,16 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if admissionRejected(err) && a.replayable() && req.Context().Err() == nil &&
 			attempt < maxAttempts && t.server != nil {
 			tried[accountID] = struct{}{}
-			next, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
+			var next accounts.Account
+			var pickErr error
+			if claudeThirdPartyKeyOnly {
+				var ok bool
+				if next, ok = t.server.claudeAPIKeyRetryCandidate(req.Context(), t.poolModel, tried); !ok {
+					return claudeThirdPartyExtraUsageResponse(nil, attemptReq), nil
+				}
+			} else {
+				next, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
+			}
 			if pickErr == nil {
 				if nextReq, replayErr := a.replay(replayReq, &next); replayErr == nil {
 					if t.provider == accounts.ProviderClaude && claudeTransient429Retries > 0 {
@@ -11529,7 +11551,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				}
 				return response, nil
 			}
-			if claudeOverload && t.claudeOverloadRerouteEnabled() && !claudeHold.reroutedOnce() &&
+			if claudeOverload && !claudeThirdPartyKeyOnly && t.claudeOverloadRerouteEnabled() && !claudeHold.reroutedOnce() &&
 				claudeHold.spent() >= providerOverloadMaxRetries && attempt < maxAttempts {
 				// Opt-in: after the short same-account retries, try exactly one
 				// other account with headroom: a single extra request, not a
@@ -11677,7 +11699,8 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			return response, nil
 		}
-		if t.provider == accounts.ProviderClaude && !modelUnsupported {
+		if t.provider == accounts.ProviderClaude && !modelUnsupported && t.server != nil &&
+			t.server.claudeAuthMode(accounts.Account{ID: accountID}) != accounts.AuthModeAPIKey {
 			// Anthropic refuses a non-Claude-Code client on a subscription
 			// credential (claude_third_party.go). Every OAuth account answers the
 			// same, and the account is fine, so neither retry another OAuth
@@ -11690,7 +11713,8 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				return response, nil
 			}
 			if thirdParty {
-				if t.server != nil && attempt < maxAttempts {
+				claudeThirdPartyKeyOnly = true
+				if attempt < maxAttempts {
 					if next, ok := t.server.claudeAPIKeyRetryCandidate(req.Context(), t.poolModel, tried); ok && a.consume() {
 						if nextReq, replayErr := a.replay(replayReq, &next); replayErr == nil {
 							if t.logger != nil {
@@ -11947,7 +11971,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		nextAccount, pickErr := compatibilityNext, compatibilityPickErr
 		var nextReservation *selectacct.PlacementReservation
-		if !modelUnsupported {
+		if !modelUnsupported && claudeThirdPartyKeyOnly {
+			if next, ok := t.server.claudeAPIKeyRetryCandidate(req.Context(), t.poolModel, tried); ok {
+				nextAccount = next
+			} else {
+				pickErr = errors.New("no untried Claude API-key account can take a third-party client")
+			}
+		} else if !modelUnsupported {
 			if t.provider == accounts.ProviderClaude {
 				nextAccount, nextReservation, pickErr = t.server.oauthRetryCandidateWithReservation(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, !claudeExtraUsageRetried)
 			} else {
