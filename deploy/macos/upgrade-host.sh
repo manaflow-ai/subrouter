@@ -6,7 +6,7 @@
 #
 # SSH_ARGS are passed to ssh as they are, so a jump host and key work:
 #
-#   upgrade-host.sh -J browser-a -i ~/.ssh/id_ed25519_manaflow_cmux cmux-lawrence@172.20.21.158
+#   upgrade-host.sh -J JUMP_HOST -i ~/.ssh/KEY USER@ROUTER_HOST
 #
 # The script copies itself to the host over ssh stdin and runs there as the
 # login user, taking root through `sudo -n` only for the steps that need it.

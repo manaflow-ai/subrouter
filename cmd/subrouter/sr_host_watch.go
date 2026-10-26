@@ -20,8 +20,8 @@ import (
 // sr host watch keeps attached hosts' pool health on screen. It is meant to
 // run in a cmux Dock pane: there it also labels every workspace whose remote
 // destination is an attached host with a sidebar status pill, so a Claude
-// session on big-red shows "lawrence ✓ tunnel" or "pool down" next to its
-// workspace without anything on big-red having to reach cmux.
+// session on devbox shows "lawrence ✓ tunnel" or "pool down" next to its
+// workspace without anything on devbox having to reach cmux.
 
 const hostCmuxStatusKey = "sr-pool"
 
@@ -244,7 +244,7 @@ func parseCmuxWindows(body []byte) ([]string, error) {
 	return ids, nil
 }
 
-// sameSSHHost treats "big-red" and "leo@big-red" as the same destination.
+// sameSSHHost treats "devbox" and "dev@devbox" as the same destination.
 func sameSSHHost(a, b string) bool {
 	strip := func(s string) string {
 		s = strings.ToLower(strings.TrimSpace(s))

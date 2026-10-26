@@ -460,10 +460,10 @@ func TestDeviceUsageEndpointAggregatesByClientAndAccount(t *testing.T) {
 	recorder := NewTokenUsageRecorder("", nil)
 	now := time.Date(2026, 9, 26, 10, 15, 0, 0, time.UTC)
 	recorder.now = fixedClock(now)
-	recorder.Record("claude", "leo@cmux.com", "claude-opus-5-5", "air-blue", tokenUsage{InputTokens: 10, CachedInputTokens: 4, OutputTokens: 2}, true)
+	recorder.Record("claude", "leo@cmux.com", "claude-opus-5-5", "client-a", tokenUsage{InputTokens: 10, CachedInputTokens: 4, OutputTokens: 2}, true)
 	recorder.now = fixedClock(now.Add(time.Hour))
-	recorder.Record("claude", "leo@cmux.com", "claude-opus-5-5", "air-blue", tokenUsage{InputTokens: 7, OutputTokens: 3}, true)
-	recorder.Record("claude", "leo@cmux.com", "claude-opus-5-5", "big-red", tokenUsage{InputTokens: 99}, true)
+	recorder.Record("claude", "leo@cmux.com", "claude-opus-5-5", "client-a", tokenUsage{InputTokens: 7, OutputTokens: 3}, true)
+	recorder.Record("claude", "leo@cmux.com", "claude-opus-5-5", "client-b", tokenUsage{InputTokens: 99}, true)
 
 	handler := Server{AdminToken: "admin-secret", TokenUsage: recorder}.Handler()
 	req := httptest.NewRequest(http.MethodGet, "http://subrouter.example/_subrouter/device-usage?since=48h", nil)
@@ -483,11 +483,11 @@ func TestDeviceUsageEndpointAggregatesByClientAndAccount(t *testing.T) {
 	if len(decoded.Rows) != 2 {
 		t.Fatalf("rows = %+v, want two client rollups", decoded.Rows)
 	}
-	if decoded.Rows[0].Client != "air-blue" || decoded.Rows[0].InputTokens != 17 || decoded.Rows[0].Requests != 2 {
-		t.Fatalf("air-blue row = %+v", decoded.Rows[0])
+	if decoded.Rows[0].Client != "client-a" || decoded.Rows[0].InputTokens != 17 || decoded.Rows[0].Requests != 2 {
+		t.Fatalf("client-a row = %+v", decoded.Rows[0])
 	}
 	if decoded.Rows[0].FirstHour != "2026-09-26T10:00:00Z" || decoded.Rows[0].LastHour != "2026-09-26T11:00:00Z" {
-		t.Fatalf("air-blue hours = %+v", decoded.Rows[0])
+		t.Fatalf("client-a hours = %+v", decoded.Rows[0])
 	}
 }
 

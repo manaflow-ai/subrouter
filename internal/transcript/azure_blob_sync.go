@@ -61,7 +61,7 @@ type AzureBlobSyncer struct {
 type AzureBlobSyncerConfig struct {
 	SourceDir string
 	// Destination is the container URL, optionally with a prefix path, e.g.
-	// https://account.blob.core.windows.net/transcripts/cmux-lawrence.
+	// https://account.blob.core.windows.net/transcripts/<host>.
 	Destination string
 	// AccountKey is the storage account shared key. Preferred over a SAS
 	// because it does not expire, and an expired credential would stop the

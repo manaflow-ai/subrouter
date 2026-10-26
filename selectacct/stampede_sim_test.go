@@ -9,7 +9,7 @@ import (
 )
 
 // This simulation reproduces the production shape behind the 2026-08-18
-// incident on cmux-lawrence, where one Codex account served 100% of traffic
+// incident on the team router, where one Codex account served 100% of traffic
 // for five consecutive hours while six healthy accounts sat idle, and its
 // eventual weekly-cap exhaustion rerouted every session on it at once
 // (26,165 account moves in one day, peaking at 8,043/hour), re-billing each

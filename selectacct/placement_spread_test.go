@@ -8,7 +8,7 @@ import (
 )
 
 // The live Codex pool shape as reported by the usage endpoint on
-// cmux-lawrence: one account-wide 7-day window per account and nothing at or
+// the team router: one account-wide 7-day window per account and nothing at or
 // under 6 hours, so ShortHeadroom mirrors Headroom, ShortResetAfterSeconds is
 // 0, and ExpiryPressure is 0 for every account. used_percent is integer-only
 // and lags consumption, so consecutive placements see identical scores.
@@ -48,7 +48,7 @@ var livePoolHeadrooms = map[string]float64{
 	"aziz+14@example.com": 0.87,
 }
 
-// Placements are rare (61 new Codex sessions in 19 hours on cmux-lawrence)
+// Placements are rare (61 new Codex sessions in 19 hours on the team router)
 // while usage scores refresh every 30 seconds, so in production nearly every
 // placement decision runs against a freshly refreshed snapshot: live debits
 // from earlier placements have been wiped and the lagging integer
