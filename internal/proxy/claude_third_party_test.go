@@ -322,3 +322,52 @@ func TestClaudeThirdPartyExtraUsageIgnoredOnAPIKeyAccount(t *testing.T) {
 		t.Fatalf("API-key response rewritten: header %q body %q", response.Header.Get("X-Subrouter-Error"), body)
 	}
 }
+
+// The key-only state is request-wide: an outer replay that re-enters the
+// transport after the API key failed still never reaches an OAuth account.
+func TestClaudeThirdPartyExtraUsageKeyOnlySurvivesOuterReplay(t *testing.T) {
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "oauth-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-a"},
+			{ID: "oauth-b", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-b"},
+			{ID: "claude:key", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-key"},
+		},
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+	}
+	var oauthB, keyHits int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if req.Header.Get("X-Api-Key") == "tok-key" {
+			keyHits++
+			return &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{},
+				Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`))}
+		}
+		if req.Header.Get("Authorization") == "Bearer tok-b" {
+			oauthB++
+		}
+		return &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{},
+			Body: io.NopCloser(strings.NewReader(anthropicThirdPartyExtraUsageBody))}
+	}}
+	budget := newAttemptBudget(6)
+	first := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-third-party-outer", account: "oauth-a",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 4, budget: budget,
+	}
+	response, err := first.RoundTrip(claudeThirdPartyOAuthRequest(t, "tok-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	// The outer layer replays on the account the request last used.
+	replay := first
+	replay.account = "claude:key"
+	response, err = replay.RoundTrip(claudeCostTierRequest(t, "tok-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if oauthB != 0 || keyHits != 2 {
+		t.Fatalf("oauth-b calls %d, key calls %d; want 0 and 2", oauthB, keyHits)
+	}
+	assertClaudeAccountUnmarked(t, server, "oauth-b")
+}

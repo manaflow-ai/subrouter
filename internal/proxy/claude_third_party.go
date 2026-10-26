@@ -110,13 +110,12 @@ func (s Server) claudeAPIKeyRetryCandidate(ctx context.Context, poolModel string
 }
 
 // claudeThirdPartyExtraUsageResponse replaces the upstream refusal with
-// subrouter's own explanation, in Anthropic's error shape and with the
-// upstream status, marked non-retryable so SDK clients do not loop on it.
+// subrouter's own explanation: a 400 in Anthropic's error shape, marked
+// non-retryable so SDK clients do not loop on it. It is always 400 (the
+// observed upstream status), so a 403 variant cannot read downstream as a
+// credential or entitlement failure of the account.
 func claudeThirdPartyExtraUsageResponse(upstream *http.Response, req *http.Request) *http.Response {
 	status := http.StatusBadRequest
-	if upstream != nil && upstream.StatusCode >= 400 && upstream.StatusCode < 500 {
-		status = upstream.StatusCode
-	}
 	if upstream != nil && upstream.Request != nil {
 		// Keep the upstream request: it carries the routed-account tag.
 		req = upstream.Request

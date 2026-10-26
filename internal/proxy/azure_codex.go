@@ -205,6 +205,10 @@ type attemptBudget struct {
 	// used for a transient Claude throttle. It is request-wide so nested
 	// transport replays cannot fan one burst out across the whole pool.
 	claudeTransient429Rerouted atomic.Bool
+	// claudeThirdPartyKeyOnly records that Anthropic refused this client on a
+	// subscription account (claude_third_party.go). Request-wide so an outer
+	// replay cannot send the request back to an OAuth account.
+	claudeThirdPartyKeyOnly atomic.Bool
 }
 
 func newAttemptBudget(retries int) *attemptBudget {

@@ -11359,7 +11359,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	// claudeThirdPartyKeyOnly: Anthropic refused this client on a
 	// subscription account (claude_third_party.go), so every later move of
 	// this request goes to another API key, never back to an OAuth account.
-	claudeThirdPartyKeyOnly := false
+	claudeThirdPartyKeyOnly := a.budget != nil && a.budget.claudeThirdPartyKeyOnly.Load()
 	claudeTransient429Retries := 0
 	claudeTransient429Rerouted := a.budget != nil && a.budget.claudeTransient429Rerouted.Load()
 	sealedStripped := false
@@ -11714,6 +11714,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			if thirdParty {
 				claudeThirdPartyKeyOnly = true
+				if a.budget != nil {
+					a.budget.claudeThirdPartyKeyOnly.Store(true)
+				}
 				if attempt < maxAttempts {
 					if next, ok := t.server.claudeAPIKeyRetryCandidate(req.Context(), t.poolModel, tried); ok && a.consume() {
 						if nextReq, replayErr := a.replay(replayReq, &next); replayErr == nil {
