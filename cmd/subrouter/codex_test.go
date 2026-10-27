@@ -63,6 +63,7 @@ func TestDefaultCodexBaseURLUsesExplicitDefaultServer(t *testing.T) {
 }
 
 func TestCodexNamedLoopbackServerIsNotBuiltInLocal(t *testing.T) {
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(t.TempDir(), "cloud.json"))
 	serverStore := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
 	if err := serverStore.save(srServerFile{
 		Default: "shadow",

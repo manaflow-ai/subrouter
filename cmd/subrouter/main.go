@@ -345,6 +345,8 @@ var directSRCommands = map[string]struct{}{
 	"usage":            {},
 	"use":              {},
 	"why":              {},
+	"wake":             {},
+	"auto-resume":      {},
 }
 
 func isDirectSRCommand(command string) bool {

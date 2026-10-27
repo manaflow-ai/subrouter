@@ -681,6 +681,7 @@ func TestServerAddPreservesTailscaleIdentityForSameURLAndClearsItForReplacement(
 }
 
 func TestCodexDefaultTailscaleDiscoveryFailureFallsBackLocally(t *testing.T) {
+	setLegacyCloudConfigForTest(t)
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -714,6 +715,7 @@ func TestCodexDefaultTailscaleDiscoveryFailureFallsBackLocally(t *testing.T) {
 }
 
 func TestCodexRegistryErrorDoesNotFallBackLocally(t *testing.T) {
+	setLegacyCloudConfigForTest(t)
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -730,6 +732,15 @@ func TestCodexRegistryErrorDoesNotFallBackLocally(t *testing.T) {
 	if err == nil || got != "" {
 		t.Fatalf("registry error resolved to %q, %v; want original failure", got, err)
 	}
+}
+
+func setLegacyCloudConfigForTest(t *testing.T) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "cloud.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"credentialSource":"legacy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", path)
 }
 
 func TestCodexPinnedTailscaleDiscoveryFailureDoesNotFallBackLocally(t *testing.T) {

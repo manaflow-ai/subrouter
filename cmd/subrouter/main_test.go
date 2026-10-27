@@ -523,6 +523,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"agy",
 		"antigravity",
 		"attach-project",
+		"auto-resume",
 		"az",
 		"azure",
 		"breadcrumbs",
@@ -572,6 +573,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"trace",
 		"usage",
 		"use",
+		"wake",
 		"key-credit",
 		"key-credits",
 		"whoami",
@@ -595,6 +597,14 @@ func TestDirectSRCommandNames(t *testing.T) {
 		if isDirectSRCommand(command) {
 			t.Fatalf("%s should stay a subrouter command", command)
 		}
+	}
+}
+
+func TestWakeCommandDoesNotRequireCloudConfig(t *testing.T) {
+	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(t.TempDir(), "missing-cloud.json"))
+	if err := runForProgram("sr", []string{"wake", "help"}); err != nil {
+		t.Fatalf("wake help should not load cloud config: %v", err)
 	}
 }
 
