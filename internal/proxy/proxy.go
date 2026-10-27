@@ -6890,10 +6890,16 @@ type webSocketModelState struct {
 	// alive without consuming a server-side reconnect budget.
 	autonomousRetrying bool
 	// regionRetry lets a non-autonomous connection that can dial other
-	// regions retry a self-contained pre-output capacity turn in another
-	// region, up to codexWebSocketRegionRetries times per turn.
+	// regions retry a pre-output capacity turn behind the open socket, up to
+	// codexWebSocketRegionRetries times per turn: a self-contained turn in
+	// another region, a chained one on its own connection.
 	regionRetry       bool
 	regionRetriesUsed int
+	// chainedResent marks a turn the relay resent on its connection with a
+	// previous_response_id. The upstream may have evicted that response when
+	// it failed the first send, so any failure of the resend becomes the 1012
+	// reconnect the client would have had anyway, never a terminal error.
+	chainedResent bool
 	// pendingBodies parallels pending with each response.create's body, kept
 	// only on autonomous connections so a failed turn can be resent upstream
 	// without the client reconnecting.
@@ -7057,6 +7063,31 @@ func (s *webSocketModelState) complete() {
 	s.turnCapacityAccount = ""
 	s.turnCapacityFailures = 0
 	s.regionRetriesUsed = 0
+	s.chainedResent = false
+}
+
+func (s *webSocketModelState) noteChainedResend() {
+	s.mu.Lock()
+	s.chainedResent = true
+	s.mu.Unlock()
+}
+
+func (s *webSocketModelState) chainedResendFailed(body []byte) bool {
+	s.mu.RLock()
+	resent, forwarded := s.chainedResent, s.outputForwarded
+	s.mu.RUnlock()
+	if !resent || forwarded {
+		return false
+	}
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil {
+		return false
+	}
+	switch strings.ToLower(stringField(event, "type")) {
+	case "error", "response.failed":
+		return true
+	}
+	return false
 }
 
 // pendingCreate is the response.create of the turn in flight, nil when none
@@ -7081,8 +7112,25 @@ func (s *webSocketModelState) turnRetryable() bool {
 	if s.autonomousRetrying {
 		return true
 	}
-	return s.regionRetry && s.regionRetriesUsed < codexWebSocketRegionRetries &&
-		!codexWebSocketCreateChained(s.pendingBodies[0])
+	return s.regionRetry && s.regionRetriesUsed < codexWebSocketRegionRetries
+}
+
+// retrySkipReason says why a non-autonomous capacity turn is not retried
+// behind the open socket, for the log.
+func (s *webSocketModelState) retrySkipReason() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	switch {
+	case !s.regionRetry:
+		return "no_region_retry"
+	case len(s.pendingBodies) == 0:
+		return "no_pending_turn"
+	case s.outputForwarded:
+		return "output_forwarded"
+	case s.regionRetriesUsed >= codexWebSocketRegionRetries:
+		return "budget_spent"
+	}
+	return "unknown"
 }
 
 // codexWebSocketRegionRetries bounds the region retries of one turn on a
@@ -7189,6 +7237,19 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			if provider == accounts.ProviderCodex && !codexChatGPTModelUnsupportedJSON(body) {
 				failureClass = codexTurnFailureClass(body)
 			}
+			if provider == accounts.ProviderCodex && (credentialUnauthorizedJSON(body) || failureClass != codexFailureServer && failureClass != codexFailureQuota) && modelState.chainedResendFailed(body) {
+				// Not a failure any layer below handles (capacity and quota
+				// have their own paths, both ending in a reconnect), so the
+				// old connection's reconnect is the safe answer.
+				if credentialUnauthorizedJSON(body) && reportLeaseFailure != nil {
+					reportLeaseFailure(http.StatusUnauthorized)
+				}
+				if s.Logger != nil {
+					s.Logger.Warn("codex websocket chained resend failed; closing 1012 so the session reconnects",
+						"agent", agentType, "session", sessionID, "account", accountID, "event", string(body[:min(len(body), 200)]))
+				}
+				return errCodexWebSocketCapacityRetry
+			}
 			capacityEvent := func(outcome string, attempts int) {
 				s.recordCodexCapacityEvent(CodexCapacityEvent{
 					Transport: "websocket", Region: s.codexRegions.name(link.currentRegion()), Account: accountID,
@@ -7278,6 +7339,11 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 						}
 						return errCodexWebSocketTurnRetry
 					}
+					if modelState.regionRetry && s.Logger != nil {
+						s.Logger.Warn("codex websocket capacity turn not retried behind the socket",
+							"agent", agentType, "session", sessionID, "account", accountID,
+							"region", s.codexRegions.name(link.currentRegion()), "reason", modelState.retrySkipReason())
+					}
 					if s.codexOverloadWebSocketRerouteWithPolicy(ctx, agentType, sessionID, accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), body, modelState.capacityPersist, modelState.autonomousRetrying, modelState.inputTokenEstimate()) {
 						if reportLeaseFailure != nil {
 							reportLeaseFailure(http.StatusServiceUnavailable)
@@ -7297,6 +7363,15 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 						if s.codexRetryableCapacityWebSocketReroute(ctx, agentType, sessionID, modelState.capacityPersist) {
 							return errCodexWebSocketCapacityRetry
 						}
+					}
+					if modelState.chainedResendFailed(body) {
+						// The relay resent this chained turn and the upstream
+						// has likely evicted its previous response: a reconnect
+						// with full context, never a terminal failure.
+						if credentialUnauthorizedJSON(body) && reportLeaseFailure != nil {
+							reportLeaseFailure(http.StatusUnauthorized)
+						}
+						return errCodexWebSocketCapacityRetry
 					}
 					// No layer took the turn: the failure goes to the client.
 					capacityEvent(codexCapacityOutcomeClientVisible, link.takeTurnCapacityFailures())

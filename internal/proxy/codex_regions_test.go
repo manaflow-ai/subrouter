@@ -605,9 +605,11 @@ func TestCodexRegionsNonAutonomousTurnServedFromNextRegion(t *testing.T) {
 }
 
 // A turn chained on previous_response_id cannot leave its connection, so a
-// non-autonomous client keeps the old behavior.
-func TestCodexRegionsNonAutonomousChainedTurnKeepsOldPath(t *testing.T) {
-	local := newRegionPool(t, "local", always(true))
+// non-autonomous client's capacity failure is resent on that same socket
+// instead of the 1012 reconnect it used to get.
+func TestCodexRegionsNonAutonomousChainedTurnResendsOnSameSocket(t *testing.T) {
+	var localCreates atomic.Int32
+	local := newRegionPool(t, "local", func() bool { return localCreates.Add(1) == 1 })
 	fra := newRegionPool(t, "fra", always(false))
 	rig := newRegionRig(t, local, fra)
 	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
@@ -619,8 +621,30 @@ func TestCodexRegionsNonAutonomousChainedTurnKeepsOldPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	turn, code := readWebSocketUntilCloseOrTurn(t, conn)
-	if strings.Contains(turn, "served-from-fra") || fra.creates.Load() != 0 {
-		t.Fatalf("turn=%q close=%d fra=%d, want no move to Frankfurt", turn, code, fra.creates.Load())
+	if code != 0 || !strings.Contains(turn, "served-from-local") || strings.Contains(turn, "response.failed") {
+		t.Fatalf("turn=%q close=%d, want the resend served on the same socket", turn, code)
+	}
+	if local.creates.Load() != 2 || fra.creates.Load() != 0 {
+		t.Fatalf("local=%d fra=%d creates, want the failure and one resend on local", local.creates.Load(), fra.creates.Load())
+	}
+}
+
+// A chained turn whose region keeps refusing stops after the budget.
+func TestCodexRegionsNonAutonomousChainedTurnIsBounded(t *testing.T) {
+	local := newRegionPool(t, "local", always(true))
+	fra := newRegionPool(t, "fra", always(false))
+	rig := newRegionRig(t, local, fra)
+	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	conn := dialRegionWebSocket(t, proxy.URL, "desktop-chained-bounded", false)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_prev","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+	if local.creates.Load() != 1+codexWebSocketRegionRetries || fra.creates.Load() != 0 {
+		t.Fatalf("local=%d fra=%d (turn=%q close=%d), want 1+%d on local only", local.creates.Load(), fra.creates.Load(), turn, code, codexWebSocketRegionRetries)
 	}
 }
 
@@ -681,5 +705,78 @@ func TestCodexRegionsNonAutonomousUpstreamCloseIsNotRetried(t *testing.T) {
 	_, code := readWebSocketUntilCloseOrTurn(t, conn)
 	if code != websocket.ClosePolicyViolation || creates.Load() != 1 || fra.creates.Load() != 0 {
 		t.Fatalf("close=%d upstream creates=%d fra=%d, want the 1008 passed through with no retry", code, creates.Load(), fra.creates.Load())
+	}
+}
+
+// The upstream may evict previous_response_id when it fails a chained turn,
+// so the resend can come back previous_response_not_found. That must reach
+// the client as the 1012 reconnect it had before, never as a failed turn.
+func TestCodexRegionsChainedResendFailureBecomesReconnect(t *testing.T) {
+	for name, resendFailure := range map[string]string{
+		"evicted":       `{"type":"error","error":{"type":"invalid_request_error","code":"previous_response_not_found","message":"Previous response not found."}}`,
+		"token_expired": `{"type":"error","status":401,"error":{"type":"invalid_request_error","code":"token_expired","message":"Provided authentication token is expired."}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			var creates atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				for {
+					if _, _, err := conn.ReadMessage(); err != nil {
+						return
+					}
+					if creates.Add(1) == 1 {
+						_ = conn.WriteMessage(websocket.TextMessage, []byte(turnRetryCapacityFailure))
+						continue
+					}
+					_ = conn.WriteMessage(websocket.TextMessage, []byte(resendFailure))
+				}
+			}))
+			defer upstream.Close()
+			upstreamURL, _ := url.Parse(upstream.URL)
+			fra := newRegionPool(t, "fra", always(false))
+			rig := newRegionRig(t, &regionPool{name: "local", url: upstreamURL}, fra)
+			rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+			proxy := httptest.NewServer(rig.server.Handler())
+			defer proxy.Close()
+
+			conn := dialRegionWebSocket(t, proxy.URL, "desktop-resend-"+name, false)
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_prev","input":[]}`)); err != nil {
+				t.Fatal(err)
+			}
+			turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+			if code != websocket.CloseServiceRestart || strings.Contains(turn, `"error"`) {
+				t.Fatalf("turn=%q close=%d, want a 1012 and no error event", turn, code)
+			}
+			// One resend only: a failed resend never spends the rest of the
+			// budget on the same socket.
+			if creates.Load() != 2 {
+				t.Fatalf("upstream creates=%d, want the failure and one resend", creates.Load())
+			}
+		})
+	}
+}
+
+// A resent chained turn whose budget runs out on capacity failures ends in a
+// reconnect, not a failed turn, even when no reroute layer takes it.
+func TestCodexRegionsChainedResendBudgetEndsInReconnect(t *testing.T) {
+	local := newRegionPool(t, "local", always(true))
+	fra := newRegionPool(t, "fra", always(false))
+	rig := newRegionRig(t, local, fra)
+	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	conn := dialRegionWebSocket(t, proxy.URL, "desktop-chained-exhausted", false)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_prev","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+	if code != websocket.CloseServiceRestart || strings.Contains(turn, "response.failed") {
+		t.Fatalf("turn=%q close=%d, want a 1012 with no failure event", turn, code)
 	}
 }
