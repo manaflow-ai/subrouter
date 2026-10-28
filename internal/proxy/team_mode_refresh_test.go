@@ -2,10 +2,12 @@ package proxy
 
 import (
 	"context"
+	"net/http"
 	"sync/atomic"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
@@ -46,10 +48,17 @@ func TestTeamModeNeverRefreshesLocalAccounts(t *testing.T) {
 	}
 
 	newServer := func(refreshes *int32, credBroker CredentialBroker) Server {
+		// Keep the refresh-ownership assertion independent of developer accounts
+		// and detached network requests that could outlive TempDir cleanup.
+		client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return usageOKResponse(), nil
+		})}
+		ref := NewAccountRef(newStore(), local, client)
+		ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
 		return Server{
 			Accounts:     local,
 			SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
-			AccountRef:   NewAccountRef(newStore(), local, nil),
+			AccountRef:   ref,
 			RefreshAccountFn: func(_ context.Context, a accounts.Account) (accounts.Account, error) {
 				atomic.AddInt32(refreshes, 1)
 				return a, nil

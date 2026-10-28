@@ -239,7 +239,23 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
 		// The ordinary endpoint's model bucket is newer than our probe cache.
 		// Save it so a later ordinary response that omits the bucket does not
 		// resurrect older supplemental evidence.
-		r.rememberClaudeSupplemental(account, windows)
+		// Routing includes placeholders for unused model families. Only
+		// provider-reported buckets can clear a previous model rejection.
+		observed := make([]accounts.UsageWindow, 0, len(windows))
+		for _, window := range windows {
+			switch window.Feature {
+			case agentclaude.OpusFeature:
+				if usage.SevenDayOpus == nil || usage.SevenDayOpus.Utilization == nil {
+					continue
+				}
+			case agentclaude.SonnetFeature:
+				if usage.SevenDaySonnet == nil || usage.SevenDaySonnet.Utilization == nil {
+					continue
+				}
+			}
+			observed = append(observed, window)
+		}
+		r.rememberClaudeSupplemental(account, observed)
 		return windows, true, nil
 	}
 
