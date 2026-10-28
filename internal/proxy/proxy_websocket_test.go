@@ -127,7 +127,7 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 	}
 }
 
-func TestWebSocketTracksInflightUntilConnectionCloses(t *testing.T) {
+func TestRealtimeWebSocketTracksInflightUntilConnectionCloses(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	upstreamStarted := make(chan struct{})
 	upstreamRelease := make(chan struct{})
@@ -166,7 +166,7 @@ func TestWebSocketTracksInflightUntilConnectionCloses(t *testing.T) {
 	proxy := httptest.NewServer(handler)
 	defer proxy.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/v1/responses"
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/v1/live/call-inflight"
 	conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"X-Codex-Session-ID": []string{"ws-inflight"}})
 	if err != nil {
 		t.Fatalf("dial: %v", err)

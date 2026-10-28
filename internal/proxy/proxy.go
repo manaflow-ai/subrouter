@@ -6602,13 +6602,12 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		return
 	}
 
-	// A WebSocket is one long-lived physical attempt on the selected account.
-	// Keep it in the same live-load signal as streaming HTTP until the
-	// connection ends. Broker leases are centrally selected and do not use the
-	// local SchedulerRef, so they stay outside this accounting.
+	// Responses connections can remain idle between turns. Only realtime and
+	// non-Codex sockets hold admission for the connection's lifetime.
+	turnScoped := account.Provider == accounts.ProviderCodex && !codexLivePath(r.URL.Path)
 	releaseInflight := func() {}
 	var admissionLease *admissionLease
-	if s.CredentialBroker == nil && s.admission != nil {
+	if !turnScoped && s.CredentialBroker == nil && s.admission != nil {
 		key := admissionKeyFor(schedulerAccountProvider(account.Provider), account.ID, poolModel)
 		var err error
 		admissionLease, err = s.admission.acquireFor(r.Context(), key, admissionSessionKey{agent: agentType, session: sessionID})
@@ -6620,7 +6619,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 			return
 		}
 	}
-	if s.SchedulerRef != nil && s.CredentialBroker == nil {
+	if !turnScoped && s.SchedulerRef != nil && s.CredentialBroker == nil {
 		releaseInflight = s.SchedulerRef.BeginInflight(schedulerAccountProvider(account.Provider), account.ID)
 	}
 	defer func() {
@@ -6734,12 +6733,32 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		capacityRetryable:  r.Header.Get(CodexCapacityRetryableHeader) == "1",
 		autonomousRetrying: autonomousRetry && account.Provider == accounts.ProviderCodex,
 	}
+	defer modelState.releaseReplayBodies()
+	// The broker owns leased accounts. Keep their pre-existing exclusion
+	// from the local pool's admission policy and scheduler counters.
+	if turnScoped && s.CredentialBroker == nil {
+		modelState.admission = &webSocketTurnAdmission{
+			gate: s.admission, ref: s.SchedulerRef,
+			provider: schedulerAccountProvider(account.Provider), account: account.ID,
+			who: admissionSessionKey{agent: agentType, session: sessionID},
+		}
+		defer modelState.admission.close()
+	}
 	// A connection that could dial other regions retries a self-contained
 	// turn there behind the open socket, a few times, before falling back
 	// to the 1012 reconnect a non-autonomous client sees.
 	modelState.regionRetry = !modelState.autonomousRetrying && link.regional && !modelState.realtime &&
 		account.Provider == accounts.ProviderCodex
-	if modelState.autonomousRetrying || modelState.regionRetry {
+	if !modelState.autonomousRetrying && !modelState.regionRetry && !modelState.realtime &&
+		!modelState.capacityRetryable && azureDivert == nil &&
+		account.Provider == accounts.ProviderCodex && !s.CodexOverloadFailover.enabled() &&
+		!subrouterNoRetryRequest(r) && session.ExtractAccountID(r) == "" && s.CredentialBroker == nil {
+		policy := s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger)
+		stay, _ := s.CodexOverloadFailover.stayPolicy(policy)
+		modelState.sameAccountRetry = &stay
+		modelState.replayBudget = codexWebSocketReplayBudget
+	}
+	if modelState.autonomousRetrying || modelState.regionRetry || modelState.sameAccountRetry != nil {
 		regionKey := azureCodexSessionKeyFor(agentType, sessionID)
 		link.redial = func(ctx context.Context) (*websocket.Conn, error) {
 			slot := link.nextRedialSlot(s.codexRegions, webSocketTurnModel(modelState, compatibilityModel), codexFaultFrom(r.Context()), regionKey)
@@ -6791,15 +6810,19 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		)
 	}
 	var wg sync.WaitGroup
+	copyContext, cancelCopy := context.WithCancel(r.Context())
+	defer cancelCopy()
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(r.Context(), account.Provider, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, link, nil, nil)
+		s.copyWebSocketMessages(copyContext, account.Provider, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, link, nil, nil)
+		cancelCopy()
 		link.close()
 	}()
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(r.Context(), account.Provider, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "upstream_to_client", clientConn, link, reportLeaseFailure, azureDivert)
+		s.copyWebSocketMessages(copyContext, account.Provider, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "upstream_to_client", clientConn, link, reportLeaseFailure, azureDivert)
+		cancelCopy()
 		_ = clientConn.Close()
 	}()
 	wg.Wait()
@@ -6867,9 +6890,10 @@ func cloneWebSocketResponseHeaders(headers http.Header) http.Header {
 }
 
 type webSocketModelState struct {
-	mu      sync.RWMutex
-	model   string
-	pending []string
+	admission *webSocketTurnAdmission
+	mu        sync.RWMutex
+	model     string
+	pending   []string
 	// Voice events are not Responses turns. Pass their errors through without
 	// replay, quota reroutes, or Responses token accounting.
 	realtime bool
@@ -6889,6 +6913,10 @@ type webSocketModelState struct {
 	// autonomousRetrying lets pooled launches keep pre-output capacity turns
 	// alive without consuming a server-side reconnect budget.
 	autonomousRetrying bool
+	// Native CLI clients do not send launcher headers. Give their capacity
+	// failures the same bounded, same-account wait as HTTP Responses.
+	sameAccountRetry   *overloadRetryPolicy
+	sameAccountRetries int
 	// regionRetry lets a non-autonomous connection that can dial other
 	// regions retry a self-contained pre-output capacity turn in another
 	// region, up to codexWebSocketRegionRetries times per turn.
@@ -6897,7 +6925,9 @@ type webSocketModelState struct {
 	// pendingBodies parallels pending with each response.create's body, kept
 	// only on autonomous connections so a failed turn can be resent upstream
 	// without the client reconnecting.
-	pendingBodies [][]byte
+	pendingBodies    [][]byte
+	replayBudget     *webSocketByteBudget
+	pendingBodyBytes []int64
 	// usageClient labels this connection's token usage rows; it is resolved
 	// once per connection at the upgrade.
 	usageClient         func() string
@@ -7009,9 +7039,18 @@ func (s *webSocketModelState) observe(body []byte) {
 	}
 	s.pending = append(s.pending, model)
 	s.pendingTiers = append(s.pendingTiers, tier)
-	if s.autonomousRetrying || s.regionRetry {
+	if s.autonomousRetrying || s.regionRetry || s.sameAccountRetry != nil {
 		// The observed body is a pooled buffer released after forwarding.
-		s.pendingBodies = append(s.pendingBodies, bytes.Clone(body))
+		var replay []byte
+		var reserved int64
+		if s.replayBudget == nil || s.replayBudget.tryReserve(int64(len(body))) {
+			replay = bytes.Clone(body)
+			if s.replayBudget != nil {
+				reserved = int64(len(body))
+			}
+		}
+		s.pendingBodies = append(s.pendingBodies, replay)
+		s.pendingBodyBytes = append(s.pendingBodyBytes, reserved)
 	}
 	s.pendingStarts = append(s.pendingStarts, time.Now())
 	s.requestBytes = max(s.requestBytes, int64(len(body)))
@@ -7050,13 +7089,21 @@ func (s *webSocketModelState) complete() {
 		s.pendingStarts = s.pendingStarts[1:]
 	}
 	if len(s.pendingBodies) > 0 {
+		s.pendingBodies[0] = nil
 		s.pendingBodies = s.pendingBodies[1:]
+	}
+	if len(s.pendingBodyBytes) > 0 {
+		if s.replayBudget != nil {
+			s.replayBudget.release(s.pendingBodyBytes[0])
+		}
+		s.pendingBodyBytes = s.pendingBodyBytes[1:]
 	}
 	s.headFirstByte = time.Time{}
 	s.outputForwarded = false
 	s.turnCapacityAccount = ""
 	s.turnCapacityFailures = 0
 	s.regionRetriesUsed = 0
+	s.sameAccountRetries = 0
 }
 
 // pendingCreate is the response.create of the turn in flight, nil when none
@@ -7075,10 +7122,10 @@ func (s *webSocketModelState) pendingCreate() []byte {
 func (s *webSocketModelState) turnRetryable() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if len(s.pendingBodies) == 0 || s.outputForwarded {
+	if len(s.pendingBodies) == 0 || len(s.pendingBodies[0]) == 0 || s.outputForwarded {
 		return false
 	}
-	if s.autonomousRetrying {
+	if s.autonomousRetrying || s.sameAccountRetry != nil {
 		return true
 	}
 	return s.regionRetry && s.regionRetriesUsed < codexWebSocketRegionRetries &&
@@ -7182,6 +7229,14 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			return nil
 		}
 		if messageType == websocket.TextMessage && direction == "client_to_upstream" && provider == accounts.ProviderCodex {
+			if model, create := codexWebSocketRequestModelEvent(body); create && modelState.admission != nil {
+				if model == "" {
+					model = modelState.current()
+				}
+				if err := modelState.admission.begin(ctx, model); err != nil {
+					return err
+				}
+			}
 			modelState.observe(body)
 		}
 		if direction == "upstream_to_client" && messageType == websocket.TextMessage {
@@ -7190,11 +7245,13 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				failureClass = codexTurnFailureClass(body)
 			}
 			capacityEvent := func(outcome string, attempts int) {
+				advisedBody, advised := codexCapacityClientRetryAdvice(body)
 				s.recordCodexCapacityEvent(CodexCapacityEvent{
 					Transport: "websocket", Region: s.codexRegions.name(link.currentRegion()), Account: accountID,
 					Model: webSocketTurnModel(modelState, poolModel), Tier: modelState.currentTier(),
 					Reason: codexCapacityReason(body, "websocket"), Agent: agentType, Session: sessionID,
 					Outcome: outcome, Attempts: attempts,
+					ClientRetryAdvised: advised && bytes.Equal(advisedBody, body),
 				})
 			}
 			if failureClass == codexFailureServer {
@@ -7217,8 +7274,10 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), true)
 				}
 				if s.Logger != nil {
+					advisedBody, advised := codexCapacityClientRetryAdvice(body)
 					s.Logger.Warn("codex websocket turn failed after output was forwarded; passing the failure through",
-						"agent", agentType, "session", sessionID, "account", accountID, "class", int(failureClass))
+						"agent", agentType, "session", sessionID, "account", accountID, "class", int(failureClass),
+						"client_retry_advised", advised && bytes.Equal(advisedBody, body))
 				}
 				failureClass = codexFailureNone
 			}
@@ -7240,7 +7299,8 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
-					if provider == accounts.ProviderCodex && modelState.turnRetryable() {
+					if provider == accounts.ProviderCodex && modelState.turnRetryable() &&
+						(modelState.sameAccountRetry == nil || codexCapacityFailureJSON(body)) {
 						model := webSocketTurnModel(modelState, poolModel)
 						tier := modelState.currentTier()
 						if s.CodexOverloadFailover.enabled() {
@@ -7352,6 +7412,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), false)
 				}
 				if codexWebSocketResponseFinished(body) {
+					modelState.admission.finish()
 					modelState.complete()
 					// A turn's capacity count ends with the turn.
 					link.takeTurnCapacityFailures()
@@ -7361,6 +7422,13 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 		return nil
 	}
 	toUpstream := direction == "client_to_upstream"
+	var clientMessages *webSocketClientMessages
+	if toUpstream && modelState.admission != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		clientMessages = newWebSocketClientMessages(ctx, cancel, client, webSocketAdmissionBuffers)
+	}
 	// reconnectVisible records a 1012 close that ends a turn which hit
 	// capacity: the client sees the turn fail and reconnects.
 	reconnectVisible := func() {
@@ -7379,14 +7447,34 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 		if !toUpstream {
 			src, dst = link.current(), client
 			openWriter = func(messageType int) (io.WriteCloser, error) {
-				if modelState.autonomousRetrying || modelState.regionRetry {
-					return &bufferedWebSocketWriter{conn: client, messageType: messageType}, nil
+				if modelState.autonomousRetrying || modelState.regionRetry || modelState.sameAccountRetry != nil || modelState.admission != nil {
+					writer := &bufferedWebSocketWriter{conn: client, messageType: messageType}
+					writer.clientRetryAdvice = messageType == websocket.TextMessage && modelState.sameAccountRetry != nil && modelState.hasForwardedOutput()
+					if modelState.admission != nil {
+						writer.budget = webSocketAdmissionResponseBuffers
+					}
+					return writer, nil
 				}
 				return client.NextWriter(messageType)
 			}
 		}
-		err := s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, openWriter, observeMessage)
+		var err error
+		if clientMessages != nil {
+			err = s.forwardQueuedWebSocketMessage(ctx, agentType, sessionID, clientMessages, openWriter, observeMessage)
+			if errors.Is(err, context.Canceled) {
+				err = clientMessages.failure()
+			}
+		} else {
+			err = s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, openWriter, observeMessage)
+		}
 		if err != nil {
+			if toUpstream && admissionRejected(err) {
+				retryAfter := max(minAdmissionRetryAfter, admissionRetryAfterSeconds(err))
+				_ = client.WriteControl(websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseTryAgainLater, fmt.Sprintf("%s; retry after %ds", err, retryAfter)),
+					time.Now().Add(webSocketCloseWriteTimeout))
+				return
+			}
 			if !toUpstream && provider == accounts.ProviderCodex &&
 				// A region retry covers capacity failures only: an upstream drop
 				// or refusal still reaches a non-autonomous client as before.
@@ -7424,6 +7512,41 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			return
 		}
 	}
+}
+
+func (s Server) forwardQueuedWebSocketMessage(ctx context.Context, agentType, sessionID string, q *webSocketClientMessages, openWriter func(int) (io.WriteCloser, error), observe func(int, []byte) error) error {
+	var message webSocketQueuedMessage
+	select {
+	case queued, ok := <-q.messages:
+		if !ok {
+			return q.failure()
+		}
+		message = queued
+	case <-ctx.Done():
+		return q.failure()
+	}
+	defer message.release()
+	if err := ctx.Err(); err != nil {
+		return q.failure()
+	}
+	observer := newWebSocketMessageObserver(s.Transcripts, agentType, sessionID, "client_to_upstream", message.opcode)
+	observer.requestID = transcriptRequestIDFrom(ctx)
+	observer.observe(message.body)
+	_, releaseCapture := observer.finish()
+	defer releaseCapture()
+	if err := observe(message.opcode, message.body); err != nil {
+		return err
+	}
+	writer, err := openWriter(message.opcode)
+	if err != nil {
+		return err
+	}
+	_, writeErr := writer.Write(message.body)
+	closeErr := writer.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
 }
 
 func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionID, direction string, src *websocket.Conn, openWriter func(messageType int) (io.WriteCloser, error), observe func(int, []byte) error) error {
@@ -7477,7 +7600,8 @@ func streamWebSocketMessage(
 	// bufferedWebSocketWriter would deliver the bytes read so far as if they
 	// were a complete message; a streaming writer keeps its old close.
 	abandon := func() {
-		if _, held := writer.(*bufferedWebSocketWriter); held {
+		if held, ok := writer.(*bufferedWebSocketWriter); ok {
+			held.discard()
 			writerOpen = false
 		}
 	}
@@ -7512,10 +7636,21 @@ func streamWebSocketMessage(
 	}
 	body, release := observer.finish()
 	if beforeClose != nil {
-		if err := beforeClose(body); err != nil {
+		observed := body
+		if held, ok := writer.(*bufferedWebSocketWriter); ok {
+			if err := held.addClientRetryAdvice(); err != nil {
+				abandon()
+				return body, release, err
+			}
+			// Admission and terminal-event detection must still work when the
+			// transcript capture budget is full and observer returns no body.
+			observed = held.buffer.Bytes()
+		}
+		if err := beforeClose(observed); err != nil {
 			// The message must not be delivered: mark the writer closed
 			// without closing it, so the final frame is never flushed, and
 			// surface the veto to the copy loop.
+			abandon()
 			writerOpen = false
 			return body, release, err
 		}

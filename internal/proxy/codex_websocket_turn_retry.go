@@ -26,6 +26,22 @@ const (
 	codexWebSocketTurnRetryMax  = 30 * time.Second
 )
 
+// Native clients retain their turn while capacity recovers. Bound that extra
+// retained input independently of transient forwarding/transcript buffers.
+var codexWebSocketReplayBudget = newWebSocketByteBudget(64 << 20)
+
+func (s *webSocketModelState) releaseReplayBodies() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.replayBudget != nil {
+		for _, reserved := range s.pendingBodyBytes {
+			s.replayBudget.release(reserved)
+		}
+	}
+	s.pendingBodyBytes = nil
+	s.pendingBodies = nil
+}
+
 // codexWebSocketTurnRetryDelay is the wait before the attempt'th replay:
 // exponential from codexWebSocketTurnRetryBase, capped at
 // codexWebSocketTurnRetryMax, jittered into its upper half so sessions that
@@ -99,6 +115,39 @@ func (l *webSocketUpstreamLink) send(body []byte) error {
 	return l.conn.WriteMessage(websocket.TextMessage, body)
 }
 
+// A peer that stops reading must not hold the link lock past the retry
+// budget, or prevent disconnect cleanup from acquiring that lock.
+func (l *webSocketUpstreamLink) sendContext(ctx context.Context, body []byte) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return websocket.ErrCloseSent
+	}
+	conn := l.conn
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+		close(interrupted)
+	})
+	defer func() {
+		if !stop() {
+			<-interrupted
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetWriteDeadline(deadline)
+		defer conn.SetWriteDeadline(time.Time{})
+	}
+	err := conn.WriteMessage(websocket.TextMessage, body)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
+
 // swap replaces the upstream connection; false (and conn closed) when the
 // client already went away.
 func (l *webSocketUpstreamLink) swap(conn *websocket.Conn) bool {
@@ -158,14 +207,57 @@ func (w *lockedWebSocketWriter) Close() error {
 // autonomous connection keeps writing after a veto, so its client messages
 // are held until they are known to be deliverable.
 type bufferedWebSocketWriter struct {
-	conn        *websocket.Conn
-	messageType int
-	buffer      bytes.Buffer
+	conn              *websocket.Conn
+	messageType       int
+	buffer            bytes.Buffer
+	budget            *webSocketByteBudget
+	reserved          int64
+	clientRetryAdvice bool
 }
 
-func (w *bufferedWebSocketWriter) Write(p []byte) (int, error) { return w.buffer.Write(p) }
+func (w *bufferedWebSocketWriter) addClientRetryAdvice() error {
+	if !w.clientRetryAdvice {
+		return nil
+	}
+	body, advised := codexCapacityClientRetryAdvice(w.buffer.Bytes())
+	if !advised || bytes.Equal(body, w.buffer.Bytes()) {
+		return nil
+	}
+	delta := int64(len(body) - w.buffer.Len())
+	if w.budget != nil {
+		if delta > 0 && !w.budget.tryReserve(delta) {
+			return errWebSocketAdmissionBufferFull
+		}
+		if delta < 0 {
+			w.budget.release(-delta)
+		}
+		w.reserved += delta
+	}
+	w.buffer.Reset()
+	_, err := w.buffer.Write(body)
+	return err
+}
+
+func (w *bufferedWebSocketWriter) Write(p []byte) (int, error) {
+	if w.budget != nil {
+		if !w.budget.tryReserve(int64(len(p))) {
+			return 0, errWebSocketAdmissionBufferFull
+		}
+		w.reserved += int64(len(p))
+	}
+	return w.buffer.Write(p)
+}
+
+func (w *bufferedWebSocketWriter) discard() {
+	if w.budget != nil && w.reserved > 0 {
+		w.budget.release(w.reserved)
+		w.reserved = 0
+	}
+	w.buffer.Reset()
+}
 
 func (w *bufferedWebSocketWriter) Close() error {
+	defer w.discard()
 	return w.conn.WriteMessage(w.messageType, w.buffer.Bytes())
 }
 
@@ -202,6 +294,17 @@ func (s Server) retryCodexWebSocketTurn(ctx context.Context, link *webSocketUpst
 		// non-autonomous client did not opt into waiting on it.
 		return false
 	}
+	if policy := modelState.sameAccountRetry; policy != nil && !policy.unbounded {
+		modelState.mu.RLock()
+		started := time.Now()
+		if len(modelState.pendingStarts) > 0 {
+			started = modelState.pendingStarts[0]
+		}
+		modelState.mu.RUnlock()
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, started.Add(policy.maxWaitOr(codexCapacityDefaultStayMaxWait)))
+		defer cancel()
+	}
 	if connAlive && !chained && link.regional {
 		// A self-contained turn that hit capacity redials out of the next
 		// healthy region; a resend on the same socket stays in the region
@@ -210,10 +313,20 @@ func (s Server) retryCodexWebSocketTurn(ctx context.Context, link *webSocketUpst
 		connAlive = false
 	}
 	for attempt := 0; ; attempt++ {
-		if !modelState.spendRegionRetry() {
+		if modelState.sameAccountRetry == nil && !modelState.spendRegionRetry() {
 			return false
 		}
-		if !link.wait(ctx, s.webSocketTurnRetryDelay(attempt)) {
+		delay := s.webSocketTurnRetryDelay(attempt)
+		if policy := modelState.sameAccountRetry; policy != nil {
+			modelState.mu.Lock()
+			retry := modelState.sameAccountRetries
+			modelState.sameAccountRetries++
+			modelState.mu.Unlock()
+			if s.codexWebSocketTurnRetryDelay == nil {
+				delay = s.CodexOverloadFailover.stayDelay(retry, policy.intervalOr(codexCapacityDefaultStayInterval))
+			}
+		}
+		if !link.wait(ctx, delay) {
 			return false
 		}
 		if !connAlive {
@@ -239,7 +352,7 @@ func (s Server) retryCodexWebSocketTurn(ctx context.Context, link *webSocketUpst
 				return false
 			}
 		}
-		if err := link.send(body); err != nil {
+		if err := link.sendContext(ctx, body); err != nil {
 			connAlive = false
 			continue
 		}
