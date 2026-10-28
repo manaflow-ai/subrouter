@@ -124,7 +124,7 @@ jobs:
   github-release:
     name: Publish GitHub release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     permissions:
       contents: write
