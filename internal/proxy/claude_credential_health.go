@@ -515,14 +515,28 @@ func (s Server) noteClaudeProxySuccess(account accounts.Account) {
 }
 
 // claudeFableProbe runs the Messages probe for a Claude OAuth account and
-// records what it proves: a credential death, or a live credential. It
-// returns what agentclaude.FetchFableUsageWindows returns.
+// records credential death or liveness. Inference-only tokens blocked by
+// Fable's credit gate use an ordinary model to discover account-wide quota.
 func (r *AccountRef) claudeFableProbe(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
 	result, err := agentclaude.FableProbe(ctx, client, account.Token)
 	if err != nil {
 		return nil, err
 	}
 	r.noteClaudeProbeResult(account, result)
+	if result.CreditsRequired && !fableProbeHasPrimaryWindows(result.Windows) && r.claudeUsageScopeDeniedFor(ctx, account) {
+		// A setup token cannot read /usage, and Fable's credit gate says
+		// nothing about its ordinary subscription quota. Bootstrap that quota
+		// with one ordinary-model probe instead of excluding the account.
+		primary, err := agentclaude.PrimaryUsageProbe(ctx, client, account.Token)
+		if err != nil {
+			return nil, err
+		}
+		r.noteClaudeProbeResult(account, primary)
+		if primary.Failure != nil {
+			return nil, primary.Failure
+		}
+		result.Windows = mergeUsageWindows(result.Windows, primary.Windows)
+	}
 	if len(result.Windows) > 0 {
 		return result.Windows, nil
 	}

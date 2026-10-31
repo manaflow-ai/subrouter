@@ -224,7 +224,11 @@ func VerifyAccessTokenIdentity(ctx context.Context, client *http.Client, accessT
 }
 
 func newFableProbeRequest(ctx context.Context, accessToken string) (*http.Request, error) {
-	body := bytes.NewBufferString(`{"model":"` + FableModel + `","max_tokens":1,"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[{"role":"user","content":"."}]}`)
+	return newMessagesProbeRequest(ctx, accessToken, FableModel)
+}
+
+func newMessagesProbeRequest(ctx context.Context, accessToken, model string) (*http.Request, error) {
+	body := bytes.NewBufferString(`{"model":"` + model + `","max_tokens":1,"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[{"role":"user","content":"."}]}`)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, messagesURL, body)
 	if err != nil {
 		return nil, err

@@ -39,8 +39,9 @@ const (
 var messagesURL = "https://api.anthropic.com/v1/messages"
 
 const (
-	FableModel      = "claude-fable-5"
-	FableWindowName = "oauth-apps-weekly"
+	FableModel        = "claude-fable-5"
+	primaryUsageModel = "claude-sonnet-5"
+	FableWindowName   = "oauth-apps-weekly"
 	// Quota-pool family keys stamped on Claude usage windows and matched
 	// against canonicalized request models ("claude-opus-4-8[1m]" and
 	// "claude-opus-4-8" both belong to the opus pool).
@@ -4397,7 +4398,9 @@ func FetchFableUsageWindows(ctx context.Context, client *http.Client, accessToke
 type FableProbeResult struct {
 	StatusCode int
 	Windows    []accounts.UsageWindow
-	Failure    *ProbeError
+	// CreditsRequired is a model credit gate, not account-wide exhaustion.
+	CreditsRequired bool
+	Failure         *ProbeError
 	// quotaHeaders is set when the answer carried anthropic-ratelimit-unified-*
 	// headers, which only an authenticated credential gets.
 	quotaHeaders bool
@@ -4424,13 +4427,22 @@ func hasUnifiedQuotaHeaders(header http.Header) bool {
 // FableProbe sends the Claude Code shaped Messages probe and reports its
 // status, its quota headers, and the provider's error envelope on failure.
 func FableProbe(ctx context.Context, client *http.Client, accessToken string) (FableProbeResult, error) {
+	return messagesUsageProbe(ctx, client, accessToken, FableModel)
+}
+
+// PrimaryUsageProbe reads account-wide quota without requiring access to Fable.
+func PrimaryUsageProbe(ctx context.Context, client *http.Client, accessToken string) (FableProbeResult, error) {
+	return messagesUsageProbe(ctx, client, accessToken, primaryUsageModel)
+}
+
+func messagesUsageProbe(ctx context.Context, client *http.Client, accessToken, model string) (FableProbeResult, error) {
 	if accessToken == "" {
 		return FableProbeResult{}, nil
 	}
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
-	req, err := newFableProbeRequest(ctx, accessToken)
+	req, err := newMessagesProbeRequest(ctx, accessToken, model)
 	if err != nil {
 		return FableProbeResult{}, err
 	}
@@ -4443,6 +4455,19 @@ func FableProbe(ctx context.Context, client *http.Client, accessToken string) (F
 	result := FableProbeResult{
 		StatusCode: res.StatusCode, Windows: usageWindowsFromFableHeaders(res.Header, time.Now()),
 		quotaHeaders: hasUnifiedQuotaHeaders(res.Header),
+	}
+	if res.StatusCode == http.StatusTooManyRequests {
+		var rejection struct {
+			Error struct {
+				Type    string `json:"type"`
+				Details struct {
+					Code string `json:"error_code"`
+				} `json:"details"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(body, &rejection) == nil {
+			result.CreditsRequired = rejection.Error.Type == "rate_limit_error" && rejection.Error.Details.Code == "credits_required"
+		}
 	}
 	if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
 		failure := NewProbeError(res.StatusCode, res.Status, res.Header, body)
