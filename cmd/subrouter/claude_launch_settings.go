@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -33,6 +34,10 @@ func init() {
 // and unlinked inodes are not compatible. A separate copy of subrouter watches
 // a CLOEXEC pipe and removes the scoped directory if this process is killed.
 func attachClaudeLaunchSettings(_ *exec.Cmd, body []byte) (string, func(), error) {
+	body, err := withClaudeTranscriptRetention(body)
+	if err != nil {
+		return "", func() {}, err
+	}
 	dir, err := createSecureClaudeSettingsDir()
 	if err != nil {
 		return "", func() {}, err
@@ -144,4 +149,26 @@ func validClaudeSettingsDir(dir string) bool {
 	}
 	tempRoot, err := filepath.Abs(os.TempDir())
 	return err == nil && filepath.Clean(filepath.Dir(clean)) == filepath.Clean(tempRoot)
+}
+
+// claudeKeepTranscriptsDays keeps Claude transcripts forever. Claude deletes
+// transcripts older than cleanupPeriodDays (default 30) at startup, and every
+// profile shares one projects directory, so one launch without this setting
+// deletes the history of every profile.
+const claudeKeepTranscriptsDays = 999999
+
+// withClaudeTranscriptRetention sets cleanupPeriodDays in launch settings
+// unless the caller already chose a value.
+func withClaudeTranscriptRetention(body []byte) ([]byte, error) {
+	settings := map[string]any{}
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &settings); err != nil {
+			return nil, fmt.Errorf("parse Claude launch settings: %w", err)
+		}
+	}
+	if _, ok := settings["cleanupPeriodDays"]; ok {
+		return body, nil
+	}
+	settings["cleanupPeriodDays"] = claudeKeepTranscriptsDays
+	return json.Marshal(settings)
 }
