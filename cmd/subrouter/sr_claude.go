@@ -1678,10 +1678,17 @@ func prepareClaudeLoginFastPath(configDir string) error {
 			return fmt.Errorf("parse %s: %w", settingsPath, err)
 		}
 	}
-	if _, ok := settings["forceLoginMethod"]; ok {
+	_, hasLoginMethod := settings["forceLoginMethod"]
+	_, hasRetention := settings["cleanupPeriodDays"]
+	if hasLoginMethod && hasRetention {
 		return nil
 	}
-	settings["forceLoginMethod"] = "claudeai"
+	if !hasLoginMethod {
+		settings["forceLoginMethod"] = "claudeai"
+	}
+	if !hasRetention {
+		settings["cleanupPeriodDays"] = claudeKeepTranscriptsDays
+	}
 	out, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return err
