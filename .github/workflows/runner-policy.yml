@@ -1,0 +1,25 @@
+name: Runner policy
+
+# Every job runs on Blacksmith or an owned runner, so a GitHub billing block
+# cannot stop CI. scripts/ci/check-runner-labels.py lists the rules.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  runner-policy:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install YAML parser
+        run: python3 -m pip install --user --disable-pip-version-check --no-warn-script-location -r scripts/ci/requirements.txt
+      - name: Test runner policy checker
+        run: python3 scripts/ci/test-check-runner-labels.py
+      - name: Refuse GitHub-hosted runner labels
+        run: python3 scripts/ci/check-runner-labels.py

@@ -50,7 +50,7 @@ env:
 jobs:
   deploy:
     name: Preflight ${{ inputs.release_tag }} for ${{ inputs.deploy_environment }} ${{ inputs.operation }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 360
     environment: subrouter-${{ inputs.deploy_environment }}
     steps:
