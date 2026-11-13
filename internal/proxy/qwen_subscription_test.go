@@ -88,6 +88,74 @@ func TestQwenSubscriptionRepairRechecksEnrollmentBeforePublishing(t *testing.T) 
 
 type qwenUserinfoTransport struct{}
 
+func TestQwenSubscriptionMembershipDoesNotClearQuotaExhaustion(t *testing.T) {
+	store := qwensubscription.Store{Dir: t.TempDir()}
+	acct, err := store.SaveManagedCredential("work", qwensubscription.CredentialInfo{AccessToken: "subscription-access", RefreshToken: "subscription-refresh", ExpiresAt: time.Now().Add(time.Hour), Subject: "verified-qwen-owner", MemberType: "pro"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: qwenUserinfoTransport{}}
+	ref, err := OpenAccountRefWithSources(t.Context(), accounts.CodexStore{Dir: t.TempDir()}, agentclaude.Store{Dir: t.TempDir()}, client, []OAuthAccountSource{store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan, windows, err := store.FetchUsage(t.Context(), client, acct); err != nil || plan != "pro" || len(windows) != 0 {
+		t.Fatal("membership probe failed", err)
+	}
+	scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{AccountID: acct.ID, Provider: acct.Provider, Headroom: 1, ShortHeadroom: 1}}))
+	until := time.Now().Add(time.Hour)
+	scheduler.MarkExhaustedUntil(acct.Provider, acct.ID, "", until)
+	server := Server{AccountRef: ref, SchedulerRef: scheduler}
+	scores, scored := server.scoreAccounts(t.Context(), []accounts.Account{acct})
+	scheduler.Set(selectacct.NewScheduler(scores))
+	if got, blocked := scheduler.BlockedUntilFor(acct.Provider, acct.ID, "", time.Now()); scored != 0 || !blocked || !got.Equal(until) {
+		t.Fatalf("membership cleared quota exhaustion: scored=%d blocked=%t until=%v", scored, blocked, got)
+	}
+}
+
+func TestQwenSubscriptionCatalogRepairsRejectedAccessToken(t *testing.T) {
+	for _, secondStatus := range []int{http.StatusOK, http.StatusUnauthorized} {
+		t.Run(http.StatusText(secondStatus), func(t *testing.T) {
+			store := qwensubscription.Store{Dir: t.TempDir()}
+			if _, err := store.SaveManagedCredential("work", qwensubscription.CredentialInfo{AccessToken: "subscription-access", RefreshToken: "subscription-refresh", ExpiresAt: time.Now().Add(time.Hour), Subject: "verified-qwen-owner", MemberType: "pro"}); err != nil {
+				t.Fatal(err)
+			}
+			ref, err := OpenAccountRefWithSources(t.Context(), accounts.CodexStore{Dir: t.TempDir()}, agentclaude.Store{Dir: t.TempDir()}, &http.Client{Transport: qwenUserinfoTransport{}}, []OAuthAccountSource{store})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) == 1 {
+					http.Error(w, "expired", http.StatusUnauthorized)
+					return
+				}
+				if r.Header.Get("Authorization") != "Bearer attested-access" {
+					t.Error("catalog did not use the repaired grant")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(secondStatus)
+				_, _ = io.WriteString(w, `{"data":[{"id":"qwen3.8-max"}]}`)
+			}))
+			defer upstream.Close()
+			sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+			server := Server{AccountRef: ref, Sessions: sessions, SchedulerRef: scheduler, QwenOAuthUpstream: mustParseURL(t, upstream.URL+"/v1")}
+			recorder := httptest.NewRecorder()
+			server.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/qwen-oauth/v1/models", nil))
+			if calls.Load() != 2 || recorder.Code != secondStatus {
+				t.Fatalf("catalog repair calls=%d HTTP=%d", calls.Load(), recorder.Code)
+			}
+			if _, blocked := scheduler.BlockedUntilFor(accounts.ProviderQwenOAuth, "qwen-subscription:work", "", time.Now()); secondStatus == http.StatusOK && blocked {
+				t.Fatal("repaired catalog request left the account exhausted")
+			}
+		})
+	}
+}
+
 func TestQwenSubscriptionImportWithSchedulerPublishesWithoutDeadlock(t *testing.T) {
 	store := qwensubscription.Store{Dir: t.TempDir()}
 	ref, err := OpenAccountRefWithSources(t.Context(), accounts.CodexStore{Dir: t.TempDir()}, agentclaude.Store{Dir: t.TempDir()}, &http.Client{Transport: qwenUserinfoTransport{}}, []OAuthAccountSource{store})

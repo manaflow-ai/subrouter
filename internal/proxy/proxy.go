@@ -666,7 +666,8 @@ type OAuthAccountSource interface {
 // OAuthUsageSource is an OAuth provider whose subscription service publishes
 // quota windows. Keeping this optional means credential-only providers still
 // participate in routing without pretending that an unavailable quota API
-// exists.
+// exists. A successful response with no windows may carry membership metadata,
+// but supplies no quota recovery evidence.
 type OAuthUsageSource interface {
 	OAuthAccountSource
 	FetchUsage(ctx context.Context, client *http.Client, account accounts.Account) (planType string, windows []accounts.UsageWindow, err error)
@@ -5251,9 +5252,9 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 				}
 				return
 			}
-			if !fresh {
-				// Stale last-known-good windows are not a confident signal. Keep
-				// the seeded score rather than risk demoting a healthy account.
+			if !fresh || len(windows) == 0 {
+				// Stale observations and membership-only probes do not measure
+				// quota recovery. Preserve the seed and its exhaustion overlay.
 				return
 			}
 			scoreMu.Lock()
@@ -6298,6 +6299,9 @@ func (s Server) proxyHandler() http.Handler {
 					account:   accounts.Account{ID: account.ID, Provider: requestProvider},
 				},
 			}
+		}
+		if !noRetry && requestProvider == accounts.ProviderQwenOAuth && r.Method == http.MethodGet && s.CredentialBroker == nil {
+			transport = qwenSubscriptionReadRepairTransport{base: transport, server: &s, account: account}
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
