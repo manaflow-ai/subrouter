@@ -47,7 +47,8 @@ func (c *blockedReplayConn) Close() error {
 	return c.Conn.Close()
 }
 
-func TestCodexWebSocketReplayWriteCancels(t *testing.T) {
+func blockedWebSocketLink(t *testing.T) (*webSocketUpstreamLink, *blockedReplayConn) {
+	t.Helper()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
 		if err != nil {
@@ -72,7 +73,11 @@ func TestCodexWebSocketReplayWriteCancels(t *testing.T) {
 	}
 	t.Cleanup(func() { conn.Close() })
 	transport.block.Store(true)
-	link := newWebSocketUpstreamLink(conn)
+	return newWebSocketUpstreamLink(conn), transport
+}
+
+func TestCodexWebSocketReplayWriteCancels(t *testing.T) {
+	link, transport := blockedWebSocketLink(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -90,6 +95,106 @@ func TestCodexWebSocketReplayWriteCancels(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("replay write ignored cancellation")
+	}
+	link.close()
+}
+
+func TestCodexWebSocketCancellationInterruptsForwardedWrite(t *testing.T) {
+	for _, replay := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replay=%t", replay), func(t *testing.T) {
+			link, transport := blockedWebSocketLink(t)
+			writer, err := link.openWriter(websocket.TextMessage)
+			if err != nil {
+				t.Fatal(err)
+			}
+			forwarded := make(chan struct{})
+			go func() {
+				defer close(forwarded)
+				_, _ = writer.Write(make([]byte, 8192))
+				_ = writer.Close()
+			}()
+			select {
+			case <-transport.entered:
+			case <-time.After(time.Second):
+				t.Fatal("forwarded write did not block")
+			}
+			finished := make(chan error, 1)
+			if replay {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				go func() { finished <- link.sendContext(ctx, []byte("replay")) }()
+				cancel()
+			} else {
+				go func() { link.close(); finished <- nil }()
+			}
+			select {
+			case err := <-finished:
+				if replay && !errors.Is(err, context.Canceled) {
+					t.Fatalf("replay cancellation = %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("cancellation waited for the blocked writer mutex")
+			}
+			select {
+			case <-forwarded:
+			case <-time.After(time.Second):
+				t.Fatal("cancelled forwarded write did not finish")
+			}
+			link.close()
+		})
+	}
+}
+
+func TestCodexWebSocketClientDisconnectInterruptsQueuedWrite(t *testing.T) {
+	link, transport := blockedWebSocketLink(t)
+	accepted := make(chan *websocket.Conn, 1)
+	clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err == nil {
+			accepted <- conn
+		}
+	}))
+	t.Cleanup(clientServer.Close)
+	client, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(clientServer.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	t.Cleanup(func() { _ = client.Close() })
+	proxyClient := <-accepted
+	t.Cleanup(func() { _ = proxyClient.Close() })
+	gate := newAdmissionControl()
+	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	admission := &webSocketTurnAdmission{gate: gate, ref: ref, provider: accounts.ProviderCodex, account: "account", who: admissionSessionKey{agent: "codex", session: "blocked"}}
+	state := &webSocketModelState{admission: admission}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		defer admission.close()
+		defer state.releaseReplayBodies()
+		Server{SchedulerRef: ref, admission: gate}.copyWebSocketMessages(t.Context(), accounts.ProviderCodex, "codex", "blocked", "", "account", "", state, "client_to_upstream", proxyClient, link, nil, nil)
+	}()
+	body := `{"type":"response.create","model":"gpt-6.1-sol","input":"` + strings.Repeat("x", 8192) + `"}`
+	if err := client.WriteMessage(websocket.TextMessage, []byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-transport.entered:
+	case <-time.After(time.Second):
+		t.Fatal("queued upstream write did not block")
+	}
+	if counts := ref.InflightCounts(); counts[selectacct.ScoreKey(accounts.ProviderCodex, "account")] != 1 {
+		t.Fatalf("blocked write did not hold turn accounting: %v", counts)
+	}
+	_ = client.Close()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("client disconnect did not interrupt queued upstream write")
+	}
+	waitWebSocketAdmission(t, gate, 0, 0)
+	if counts := ref.InflightCounts(); len(counts) != 0 {
+		t.Fatalf("cancelled write retained turn accounting: %v", counts)
 	}
 	link.close()
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -67,7 +68,7 @@ func (s Server) webSocketTurnRetryDelay(attempt int) time.Duration {
 // client-to-upstream copy.
 type webSocketUpstreamLink struct {
 	mu     sync.Mutex
-	conn   *websocket.Conn
+	conn   atomic.Pointer[websocket.Conn]
 	closed bool
 	// done closes when the client side is finished; a retry waiting on a
 	// backoff stops there.
@@ -85,20 +86,20 @@ type webSocketUpstreamLink struct {
 }
 
 func newWebSocketUpstreamLink(conn *websocket.Conn) *webSocketUpstreamLink {
-	return &webSocketUpstreamLink{conn: conn, done: make(chan struct{})}
+	l := &webSocketUpstreamLink{done: make(chan struct{})}
+	l.conn.Store(conn)
+	return l
 }
 
 func (l *webSocketUpstreamLink) current() *websocket.Conn {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.conn
+	return l.conn.Load()
 }
 
 // openWriter holds the link until the returned writer closes, so a resend or
 // swap never interleaves with a forwarded client message.
 func (l *webSocketUpstreamLink) openWriter(messageType int) (io.WriteCloser, error) {
 	l.mu.Lock()
-	writer, err := l.conn.NextWriter(messageType)
+	writer, err := l.current().NextWriter(messageType)
 	if err != nil {
 		l.mu.Unlock()
 		return nil, err
@@ -112,21 +113,15 @@ func (l *webSocketUpstreamLink) send(body []byte) error {
 	if l.closed {
 		return websocket.ErrCloseSent
 	}
-	return l.conn.WriteMessage(websocket.TextMessage, body)
+	return l.current().WriteMessage(websocket.TextMessage, body)
 }
 
 // A peer that stops reading must not hold the link lock past the retry
 // budget, or prevent disconnect cleanup from acquiring that lock.
 func (l *webSocketUpstreamLink) sendContext(ctx context.Context, body []byte) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.closed {
-		return websocket.ErrCloseSent
-	}
-	conn := l.conn
 	interrupted := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
-		_ = conn.Close()
+		_ = l.current().Close()
 		close(interrupted)
 	})
 	defer func() {
@@ -134,6 +129,12 @@ func (l *webSocketUpstreamLink) sendContext(ctx context.Context, body []byte) er
 			<-interrupted
 		}
 	}()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return websocket.ErrCloseSent
+	}
+	conn := l.current()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -157,20 +158,21 @@ func (l *webSocketUpstreamLink) swap(conn *websocket.Conn) bool {
 		_ = conn.Close()
 		return false
 	}
-	old := l.conn
-	l.conn = conn
+	old := l.conn.Swap(conn)
 	l.mu.Unlock()
 	_ = old.Close()
 	return true
 }
 
 func (l *webSocketUpstreamLink) close() {
+	// Closing the socket first interrupts a writer that holds mu in network I/O.
+	_ = l.current().Close()
 	l.mu.Lock()
 	if !l.closed {
 		l.closed = true
 		close(l.done)
 	}
-	conn := l.conn
+	conn := l.current()
 	l.mu.Unlock()
 	_ = conn.Close()
 }

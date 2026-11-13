@@ -7460,7 +7460,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 		}
 		var err error
 		if clientMessages != nil {
-			err = s.forwardQueuedWebSocketMessage(ctx, agentType, sessionID, clientMessages, openWriter, observeMessage)
+			err = s.forwardQueuedWebSocketMessage(ctx, agentType, sessionID, clientMessages, link, observeMessage)
 			if errors.Is(err, context.Canceled) {
 				err = clientMessages.failure()
 			}
@@ -7514,7 +7514,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 	}
 }
 
-func (s Server) forwardQueuedWebSocketMessage(ctx context.Context, agentType, sessionID string, q *webSocketClientMessages, openWriter func(int) (io.WriteCloser, error), observe func(int, []byte) error) error {
+func (s Server) forwardQueuedWebSocketMessage(ctx context.Context, agentType, sessionID string, q *webSocketClientMessages, link *webSocketUpstreamLink, observe func(int, []byte) error) error {
 	var message webSocketQueuedMessage
 	select {
 	case queued, ok := <-q.messages:
@@ -7537,7 +7537,12 @@ func (s Server) forwardQueuedWebSocketMessage(ctx context.Context, agentType, se
 	if err := observe(message.opcode, message.body); err != nil {
 		return err
 	}
-	writer, err := openWriter(message.opcode)
+	// The queue reader observes client disconnects while this write is blocked.
+	// Interrupt only the write phase so admission cancellation can still forward
+	// the client's close frame through the normal error path.
+	stop := context.AfterFunc(ctx, link.close)
+	defer stop()
+	writer, err := link.openWriter(message.opcode)
 	if err != nil {
 		return err
 	}
