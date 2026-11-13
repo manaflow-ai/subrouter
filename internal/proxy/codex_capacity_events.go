@@ -35,16 +35,17 @@ const (
 
 // CodexCapacityEvent is one line of codex-capacity-events.jsonl.
 type CodexCapacityEvent struct {
-	Time      time.Time `json:"time"`
-	Transport string    `json:"transport"`
-	Region    string    `json:"region,omitempty"`
-	Account   string    `json:"account,omitempty"`
-	Model     string    `json:"model,omitempty"`
-	Tier      string    `json:"tier,omitempty"`
-	Reason    string    `json:"reason,omitempty"`
-	Agent     string    `json:"agent,omitempty"`
-	Session   string    `json:"session,omitempty"`
-	Outcome   string    `json:"outcome"`
+	Time               time.Time `json:"time"`
+	Transport          string    `json:"transport"`
+	Region             string    `json:"region,omitempty"`
+	Account            string    `json:"account,omitempty"`
+	Model              string    `json:"model,omitempty"`
+	Tier               string    `json:"tier,omitempty"`
+	Reason             string    `json:"reason,omitempty"`
+	Agent              string    `json:"agent,omitempty"`
+	Session            string    `json:"session,omitempty"`
+	Outcome            string    `json:"outcome"`
+	ClientRetryAdvised bool      `json:"client_retry_advised,omitempty"`
 	// Attempts is the request's capacity failures, on absorbed and
 	// client_visible events.
 	Attempts int `json:"attempts,omitempty"`

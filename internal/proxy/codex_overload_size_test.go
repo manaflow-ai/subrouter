@@ -180,7 +180,7 @@ func TestCodexOverloadFailoverKeepsAccount(t *testing.T) {
 // whatever its size, like the HTTP failover: the connection's size (from the
 // input tokens its finished turns report, or a large response.create) no
 // longer keeps it on a shedding account. Without the failover the failure
-// passes through on the same account, unmarked.
+// retries on the same account without marking it.
 func TestCodexWebSocketOverloadRerouteIgnoresConversationSize(t *testing.T) {
 	failed := `{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"Selected model is at capacity."}}}`
 	completed := func(inputTokens int) string {
@@ -224,12 +224,16 @@ func TestCodexWebSocketOverloadRerouteIgnoresConversationSize(t *testing.T) {
 					return
 				}
 				_ = conn.WriteMessage(websocket.TextMessage, []byte(failed))
-				_, _, _ = conn.ReadMessage()
+				if _, _, err := conn.ReadMessage(); err == nil && !tc.failover {
+					_ = conn.WriteMessage(websocket.TextMessage, []byte(completed(200_000)))
+					_, _, _ = conn.ReadMessage()
+				}
 			}))
 			defer upstream.Close()
 			upstreamURL, _ := url.Parse(upstream.URL)
 			server := codexEgressServer(t, upstreamURL, nil, 2)
 			server.CodexOverloadFailover = &CodexOverloadFailoverConfig{Enabled: tc.failover}
+			server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
 			server.SchedulerRef = selectacct.NewSchedulerRef(server.Scheduler)
 			if _, err := server.Sessions.Put("codex", "ws-size", "codex-account-0", ""); err != nil {
 				t.Fatal(err)
@@ -272,8 +276,8 @@ func TestCodexWebSocketOverloadRerouteIgnoresConversationSize(t *testing.T) {
 				}
 				return
 			}
-			if err != nil || !strings.Contains(string(body), "server_is_overloaded") {
-				t.Fatalf("body=%q err=%v, want the capacity failure passed through on the same connection", body, err)
+			if err != nil || !strings.Contains(string(body), "response.completed") {
+				t.Fatalf("body=%q err=%v, want recovery on the same connection", body, err)
 			}
 			if marked {
 				t.Fatal("a failure without the failover marked its account at capacity")
@@ -289,9 +293,6 @@ func TestCodexWebSocketOverloadRerouteIgnoresConversationSize(t *testing.T) {
 		})
 	}
 }
-
-// The default path passes a capacity event through the existing websocket so the
-// Codex process remains alive; account failover is an explicit opt-in.
 
 // Capacity marks left on an account by other sessions evict its sticky
 // sessions at placement, but not one too large for the failover to move: it
