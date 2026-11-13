@@ -20,6 +20,7 @@ import (
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
+	"github.com/manaflow-ai/subrouter/internal/agents/qwensubscription"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
@@ -364,7 +365,7 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 		ManagedDir: kimiDir,
 	}
 	agyStore := (&agentantigravity.Store{ManagedDir: filepath.Join(dir, "antigravity")}).ForServing()
-	ref, err := OpenAccountRefWithSources(ctx, codexStore, claudeStore, client, []OAuthAccountSource{kimiStore, agyStore})
+	ref, err := OpenAccountRefWithSources(ctx, codexStore, claudeStore, client, []OAuthAccountSource{kimiStore, agyStore, qwensubscription.Store{Dir: filepath.Join(dir, "qwen-subscription")}})
 	if err != nil {
 		return nil, err
 	}

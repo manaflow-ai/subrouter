@@ -40,6 +40,7 @@ import (
 	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
+	"github.com/manaflow-ai/subrouter/internal/agents/qwensubscription"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/buildversion"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
@@ -107,6 +108,7 @@ type Server struct {
 	// OAuth) terminates; API-key accounts keep GrokUpstream.
 	GrokSubscriptionUpstream *url.URL
 	QwenUpstream             *url.URL
+	QwenOAuthUpstream        *url.URL
 	QwenTokenUpstream        *url.URL
 	QwenAnthropicUpstream    *url.URL
 	// AntigravityUpstream fronts Google's cloudcode-pa endpoint, which the
@@ -583,6 +585,17 @@ func (r *AccountRef) kimiStore() agentkimi.Store {
 		}
 	}
 	return agentkimi.ServingStore()
+}
+
+func (r *AccountRef) qwenSubscriptionStore() (qwensubscription.Store, bool) {
+	if r != nil {
+		for _, source := range r.oauthSources {
+			if store, ok := source.(qwensubscription.Store); ok {
+				return store, true
+			}
+		}
+	}
+	return qwensubscription.Store{}, false
 }
 
 func (r *AccountRef) antigravityStore() (*agentantigravity.Store, bool) {
@@ -1304,6 +1317,9 @@ func OpenAccountRefWithSources(ctx context.Context, store accounts.CodexStore, c
 	}
 	for i, source := range configuredSources {
 		switch store := source.(type) {
+		case qwensubscription.Store:
+			store.RefreshTransaction = refreshTransaction
+			configuredSources[i] = store
 		case *agentantigravity.Store:
 			if store != nil {
 				store.ForServing()
@@ -3427,7 +3443,7 @@ func (s Server) withSessionCounts(statuses []AccountUsageStatus) []AccountUsageS
 	for i := range out {
 		out[i].AssignedSessions = counts[selectacct.ScoreKey(accountProviderFor(out[i].Provider), out[i].ID)]
 		out[i].SessionsKnown = true
-		if out[i].Provider == accounts.ProviderKimi || out[i].Provider == accounts.ProviderAntigravity ||
+		if out[i].Provider == accounts.ProviderKimi || out[i].Provider == accounts.ProviderQwenOAuth || out[i].Provider == accounts.ProviderAntigravity ||
 			(out[i].Provider == accounts.ProviderGrok && out[i].AuthMode == accounts.AuthModeOAuth) {
 			out[i].Active = out[i].AssignedSessions > 0
 		}
@@ -3699,11 +3715,12 @@ const (
 )
 
 type accountImportRequest struct {
-	Provider    accounts.Provider            `json:"provider"`
-	Codex       *accounts.StoredCodexAccount `json:"codex,omitempty"`
-	Claude      *claudeAccountImport         `json:"claude,omitempty"`
-	Kimi        *kimiAccountImport           `json:"kimi,omitempty"`
-	Antigravity *antigravityAccountImport    `json:"antigravity,omitempty"`
+	Provider         accounts.Provider              `json:"provider"`
+	Codex            *accounts.StoredCodexAccount   `json:"codex,omitempty"`
+	Claude           *claudeAccountImport           `json:"claude,omitempty"`
+	Kimi             *kimiAccountImport             `json:"kimi,omitempty"`
+	QwenSubscription *qwenSubscriptionAccountImport `json:"qwen_subscription,omitempty"`
+	Antigravity      *antigravityAccountImport      `json:"antigravity,omitempty"`
 }
 
 type antigravityAccountImport struct {
@@ -3715,6 +3732,12 @@ type antigravityAccountImport struct {
 type claudeAccountImport struct {
 	Name       string                     `json:"name"`
 	Credential agentclaude.CredentialInfo `json:"credential"`
+}
+
+type qwenSubscriptionAccountImport struct {
+	Label      string                          `json:"label"`
+	Credential qwensubscription.CredentialInfo `json:"credential,omitempty"`
+	Remove     bool                            `json:"remove,omitempty"`
 }
 
 type kimiAccountImport struct {
@@ -3731,6 +3754,15 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		providers := append([]string{"codex", "claude"}, keyedProviderNames()...)
+		if _, configured := s.AccountRef.qwenSubscriptionStore(); !configured {
+			filtered := providers[:0]
+			for _, provider := range providers {
+				if provider != string(accounts.ProviderQwenOAuth) {
+					filtered = append(filtered, provider)
+				}
+			}
+			providers = filtered
+		}
 		if _, configured := s.AccountRef.antigravityStore(); configured {
 			providers = append(providers, string(accounts.ProviderAntigravity))
 		}
@@ -3918,7 +3950,49 @@ func rejectTrailingJSON(decoder *json.Decoder) error {
 
 func (s Server) installImportedAccount(ctx context.Context, input accountImportRequest) (accountID string, err error) {
 	return s.installAccountMutation(ctx, func() (string, func() error, error) {
+		if input.QwenSubscription != nil && (input.Provider != accounts.ProviderQwenOAuth || input.Kimi != nil || input.Claude != nil || input.Codex != nil || input.Antigravity != nil) {
+			return "", nil, invalidAccountImport("exactly one matching account payload is required")
+		}
 		switch {
+		case input.Provider == accounts.ProviderQwenOAuth && input.QwenSubscription != nil:
+			request := input.QwenSubscription
+			if request.Remove && (request.Credential.AccessToken != "" || request.Credential.RefreshToken != "") {
+				return "", nil, invalidAccountImport("Qwen removal must not include a credential")
+			}
+			id, err := qwensubscription.ManagedAccountID(request.Label)
+			if err != nil {
+				return "", nil, invalidAccountImport("Qwen subscription label is invalid")
+			}
+			store, configured := s.AccountRef.qwenSubscriptionStore()
+			if !configured {
+				return "", nil, invalidAccountImport("Qwen subscription import is not configured")
+			}
+			exists, err := store.ManagedAccountExists(request.Label)
+			if err != nil {
+				return "", nil, err
+			}
+			if request.Remove {
+				if !exists {
+					return "", nil, invalidAccountImport("Qwen subscription was not found")
+				}
+				return id, func() error { _, _, err := store.RemoveManagedAccount(request.Label); return err }, nil
+			}
+			if !exists {
+				if err := s.ensureNewOAuthSourceAccountImportCapacity(ctx, accounts.ProviderQwenOAuth, id); err != nil {
+					return "", nil, err
+				}
+			}
+			credential, err := qwensubscription.AttestCredential(ctx, s.AccountRef.client, request.Credential)
+			if err != nil {
+				return "", nil, invalidAccountImport("Qwen subscription credential could not be verified by the server")
+			}
+			if err := store.CheckImportCredential(request.Label, credential); err != nil {
+				return "", nil, invalidAccountImport("Qwen membership is already enrolled or the credential is invalid")
+			}
+			return id, func() error {
+				_, err := store.ImportVerifiedCredential(ctx, s.AccountRef.client, request.Label, credential)
+				return err
+			}, nil
 		case input.Provider == accounts.ProviderAntigravity && input.Antigravity != nil:
 			if input.Codex != nil || input.Claude != nil || input.Kimi != nil {
 				return "", nil, invalidAccountImport("exactly one matching account payload is required")
@@ -4289,6 +4363,9 @@ func validateStoredAccountImport(provider accounts.Provider, account accounts.St
 }
 
 func validateStoredAccountImportOrigin(provider accounts.Provider, account accounts.StoredCodexAccount, requireTrustedOrigin bool) (accounts.StoredCodexAccount, error) {
+	if entry, ok := keyedProviderFor(provider); ok && entry.OAuthOnly {
+		return accounts.StoredCodexAccount{}, invalidAccountImport("provider requires subscription OAuth")
+	}
 	account.Email = strings.TrimSpace(account.Email)
 	if account.Email == "" || strings.HasPrefix(account.Email, ".") || len(account.Email) > 320 || strings.ContainsAny(account.Email, "/\\") || containsTerminalControl(account.Email) {
 		return account, invalidAccountImport("account identifier is invalid")
@@ -11355,6 +11432,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	// request, which (unlike an overload reroute) justifies moving stickiness.
 	overloadRerouted, quotaFailedOver := false, false
 	failoverReason := accountMoveUsageLimit
+	var qwenAuthRetried map[string]bool
 	claudeExtraUsageRetried := false
 	// claudeThirdPartyKeyOnly: Anthropic refused this client on a
 	// subscription account (claude_third_party.go), so every later move of
@@ -11532,6 +11610,29 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		if err != nil || !a.replayable() || req.Context().Err() != nil {
 			return response, tagRoutedAttemptError(err, attemptReq, addressed)
+		}
+		if response != nil && response.StatusCode == http.StatusUnauthorized && t.provider == accounts.ProviderQwenOAuth && t.server != nil && t.server.AccountRef != nil && !qwenAuthRetried[accountID] && a.consume() {
+			if qwenAuthRetried == nil {
+				qwenAuthRetried = make(map[string]bool)
+			}
+			qwenAuthRetried[accountID] = true
+			if store, ok := t.server.AccountRef.qwenSubscriptionStore(); ok {
+				rejected := accounts.Account{ID: accountID, Provider: t.provider, AuthMode: accounts.AuthModeOAuth, CredentialVersion: accountCredential}
+				if repaired, refreshErr := store.RefreshRejectedAccount(req.Context(), t.server.AccountRef.client, rejected); refreshErr == nil && repaired.CredentialIdentity() != accountCredential {
+					if nextReq, replayErr := a.replay(replayReq, &repaired); replayErr == nil {
+						_ = response.Body.Close()
+						t.server.AccountRef.replace(repaired)
+						accountCredential = repaired.CredentialIdentity()
+						addressed = repaired
+						attemptReq = nextReq
+						response, err = a.send(base, attemptReq, addressed)
+						response = tagRoutedResponseAccount(response, addressed)
+						if err != nil || req.Context().Err() != nil {
+							return response, tagRoutedAttemptError(err, attemptReq, addressed)
+						}
+					}
+				}
+			}
 		}
 		// Anthropic overload (529/5xx): retry the SAME account on a bounded,
 		// growing backoff (claudeOverloadHold). Overload is API-wide, not

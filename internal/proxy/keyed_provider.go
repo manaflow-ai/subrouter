@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/agents/qwensubscription"
 	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
@@ -84,6 +85,8 @@ const (
 // statements that are easy to leave half-updated.
 type keyedProvider struct {
 	Provider accounts.Provider
+	// OAuthOnly excludes subscription-only routes from API-key enrollment.
+	OAuthOnly bool
 	// PathPrefix is the first path segment that selects this provider, so
 	// /<PathPrefix>/... routes here and the segment is stripped upstream.
 	PathPrefix string
@@ -143,6 +146,20 @@ type keyedProvider struct {
 // declare further OpenAI-compatible providers at startup — see
 // ConfigureOpenAICompatibleProviders.
 var builtinKeyedProviders = []keyedProvider{
+	{
+		Provider:               accounts.ProviderQwenOAuth,
+		OAuthOnly:              true,
+		DefaultUpstream:        qwensubscription.DefaultUpstream,
+		PathPrefix:             "qwen-oauth",
+		Metering:               "subscription",
+		HealthPath:             "/models",
+		PlanLabel:              "Qwen Plus/Pro",
+		CollapseVersionSegment: true,
+		LeaseAPI:               "openai-completions",
+		LeasePath:              "/qwen-oauth/chat/completions",
+		LeaseEnv:               leaseEnvOpenAI,
+		Upstream:               func(s Server, _ accounts.AuthMode) *url.URL { return s.QwenOAuthUpstream },
+	},
 	{
 		Provider:               accounts.ProviderKimi,
 		DefaultUpstream:        "https://api.kimi.com/coding/v1",
@@ -426,6 +443,9 @@ func keyedProviderNames() []string {
 // applyKeyedProviderAuth presents the account's API key the way this provider
 // expects it. Authorization is already set to the bearer form by the caller.
 func applyKeyedProviderAuth(headers http.Header, account accounts.Account, entry keyedProvider, model string) {
+	if entry.Provider == accounts.ProviderQwenOAuth {
+		headers.Set("User-Agent", "subrouter")
+	}
 	if entry.Provider == accounts.ProviderGrok {
 		// The subscription proxy rejects a normal API bearer token unless the
 		// request is explicitly identified as Grok CLI OAuth. Always clear these
@@ -484,7 +504,7 @@ func collapseDuplicateVersionSegment(path string, upstream *url.URL) string {
 // the CLI does not carry a second copy of the alias list.
 func APIKeyProviderForName(name string) (accounts.Provider, bool) {
 	entry, ok := keyedProviderForName(name)
-	if !ok {
+	if !ok || entry.OAuthOnly {
 		return "", false
 	}
 	return entry.Provider, true
@@ -500,7 +520,12 @@ func APIKeyAccountProvider(provider accounts.Provider) accounts.Provider {
 // APIKeyProviderList renders the providers a user may name, for flag help and
 // for the error returned when they name something else.
 func APIKeyProviderList() string {
-	names := append([]string{"codex", "claude"}, keyedProviderNames()...)
+	names := []string{"codex", "claude"}
+	for _, entry := range keyedProviders() {
+		if !entry.OAuthOnly {
+			names = append(names, string(entry.Provider))
+		}
+	}
 	if len(names) == 1 {
 		return names[0]
 	}
