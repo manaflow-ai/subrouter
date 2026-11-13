@@ -24,6 +24,7 @@ import (
 	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
+	"github.com/manaflow-ai/subrouter/internal/agents/qwensubscription"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
@@ -84,6 +85,8 @@ Usage:
                         List pooled Claude/Codex sessions, the account serving each
                         one now with its 5h/weekly limits, and past account switches
                         (alias: sr whoami)
+  sr qwen subscription login <label>
+                        Add an isolated Qwen.ai Plus/Pro subscription
   sr qwen login [--console-account <email-or-label>] <account>
                         Authorize live Lite/Pro and quota status for one Token Plan
   sr qwen [args]        Run Qwen Code through the selected Token Plan pool
@@ -697,7 +700,7 @@ func isQwenManagementCommand(args []string) bool {
 		return false
 	}
 	switch args[0] {
-	case "help", "-h", "--help", "login", "label":
+	case "subscription", "help", "-h", "--help", "login", "label":
 		return true
 	default:
 		return false
@@ -1152,6 +1155,9 @@ func (r srRunner) autoImportIfEmpty(ctx context.Context) error {
 		grokStore = defaultStore
 	}
 	if providerAccounts, providerErr := grokStore.ListAccounts(ctx); len(providerAccounts) > 0 || providerErr != nil {
+		return nil
+	}
+	if listed, err := (qwensubscription.Store{}).ListAccounts(ctx); len(listed) > 0 || err != nil {
 		return nil
 	}
 	// PublishAccountDiskMutation deliberately publishes before invoking the
@@ -1805,6 +1811,22 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		}()
 	}
 	wg.Wait()
+	qwenStore := qwensubscription.Store{}
+	qwenAccounts, qwenErr := qwenStore.ListAccounts(ctx)
+	if qwenErr != nil {
+		rows = append(rows, srUsageRow{email: "qwen-oauth", provider: accounts.ProviderQwenOAuth, authMode: accounts.AuthModeOAuth, planType: "subscription", err: qwenErr})
+	}
+	for _, acct := range qwenAccounts {
+		row := srUsageRow{email: acct.ID, displayAccount: acct.Label, provider: accounts.ProviderQwenOAuth, authMode: accounts.AuthModeOAuth, planType: "subscription", score: selectacct.Score{AccountID: acct.ID, Headroom: 1, ShortHeadroom: 1}}
+		refreshed, err := r.refreshStatusOAuthAccount(ctx, acct, qwenStore)
+		if err == nil {
+			row.planType, _, err = qwenStore.FetchUsage(ctx, r.client, refreshed)
+		}
+		row.err = err
+		row.authChecked = true
+		row.authValid = err == nil
+		rows = append(rows, row)
+	}
 	kimiAccounts, kimiErr := kimiStore.ListAccounts(ctx)
 	if kimiErr != nil {
 		rows = append(rows, srUsageRow{
@@ -1922,10 +1944,10 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 			counts := proxy.SchedulerSessionCounts(sessionStore)
 			for i := range rows {
 				if rows[i].authMode == accounts.AuthModeAPIKey ||
-					((rows[i].provider == accounts.ProviderKimi || rows[i].provider == accounts.ProviderGrok) && rows[i].authMode == accounts.AuthModeOAuth) {
+					((rows[i].provider == accounts.ProviderKimi || rows[i].provider == accounts.ProviderQwenOAuth || rows[i].provider == accounts.ProviderGrok) && rows[i].authMode == accounts.AuthModeOAuth) {
 					rows[i].assignedSessions = counts[selectacct.ScoreKey(rows[i].provider, rows[i].email)]
 					rows[i].sessionsKnown = true
-					if rows[i].provider == accounts.ProviderKimi || rows[i].provider == accounts.ProviderGrok {
+					if rows[i].provider == accounts.ProviderKimi || rows[i].provider == accounts.ProviderQwenOAuth || rows[i].provider == accounts.ProviderGrok {
 						rows[i].active = rows[i].assignedSessions > 0
 					}
 				}
@@ -3284,6 +3306,9 @@ func usageRowErrorHint(row srUsageRow) string {
 	if row.err == nil || !authErrorNeedsReadd(row.err) {
 		return ""
 	}
+	if usageProvider(row) == accounts.ProviderQwenOAuth && strings.HasPrefix(row.email, "qwen-subscription:") {
+		return " (re-add with: sr qwen subscription login " + shellQuote(strings.TrimPrefix(row.email, "qwen-subscription:")) + ")"
+	}
 	return " (re-add with: " + providerReaddCommand(usageProvider(row)) + ")"
 }
 
@@ -3291,6 +3316,8 @@ func providerReaddCommand(provider accounts.Provider) string {
 	switch provider {
 	case accounts.ProviderClaude:
 		return "sr add claude"
+	case accounts.ProviderQwenOAuth:
+		return "sr qwen subscription login <label>"
 	case "gemini":
 		return "sr gemini add"
 	default:

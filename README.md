@@ -839,6 +839,40 @@ not additional quota pools. The current API-key response does not expose a
 verified membership owner identity; use distinct labels and do not assume two
 keys represent separate subscriptions.
 
+### Qwen.ai Plus/Pro subscriptions
+
+Qwen.ai Plus/Pro uses a browser OAuth login, separate from Alibaba Model Studio
+Coding Plan and Token Plan API keys. Authorize an isolated subscription on the
+selected router:
+
+```sh
+sr qwen subscription login work
+sr qwen subscription list
+sr qwen subscription remove work
+```
+
+Login prints a Qwen authorization link and user code. The selected server must
+advertise `qwen-oauth` account import before login starts. The server verifies
+the account with Qwen's authenticated userinfo endpoint, stores the grant in
+its own private profile, and refreshes it under the account mutation lock.
+The plain Qwen CLI's login files are never imported or changed.
+Each membership can appear under only one label. Rotated grants awaiting an
+identity check are kept for recovery and cannot serve requests until verified.
+
+OpenAI-compatible clients, including pi, use `/qwen-oauth/v1` beneath the
+router origin with the router's proxy token and the `openai-completions` API.
+Discover the models available to the membership with `GET /qwen-oauth/v1/models`.
+Subscription accounts form their own sticky, failover-capable pool. Alibaba
+plan keys cannot serve this route. `sr qwen` continues to launch the Token Plan
+pool, so use the explicit subscription URL for Plus/Pro clients.
+
+`sr status` and `/_subrouter/usage-status` report the authenticated membership
+and account health. Qwen's subscription client exposes no quota-window API,
+so percentages and reset times remain unknown. Routed token consumption is
+still recorded by `/_subrouter/token-usage`.
+
+### Qwen Token Plan accounts
+
 For each Qwen Token Plan account, authorize the Alibaba console once:
 
 ```bash

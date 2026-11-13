@@ -29,6 +29,7 @@ import (
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
+	"github.com/manaflow-ai/subrouter/internal/agents/qwensubscription"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
@@ -373,6 +374,7 @@ func serve(args []string) error {
 	flags.Var(&openAICompatibleRaw, "openai-compatible", "declare an OpenAI-compatible provider as name=BASE_URL (repeatable); aliases may follow the name as name|alias=BASE_URL")
 	qwenAnthropicUpstreamRaw := flags.String("qwen-anthropic-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwenAnthropic), "Alibaba Model Studio Token Plan Anthropic-protocol upstream base URL (Beijing: https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic)")
 	qwenTokenUpstreamRaw := flags.String("qwen-token-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwenToken), "Alibaba Model Studio Token Plan upstream base URL (Beijing: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1)")
+	qwenOAuthUpstreamRaw := flags.String("qwen-oauth-upstream", qwensubscription.DefaultUpstream, "Qwen.ai Plus/Pro upstream base URL")
 	qwenUpstreamRaw := flags.String("qwen-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwen), "Alibaba Model Studio Coding Plan upstream base URL (Beijing: https://coding.dashscope.aliyuncs.com/v1)")
 	antigravityUpstreamRaw := flags.String("antigravity-upstream", "https://daily-cloudcode-pa.googleapis.com", "Antigravity subscription upstream base URL")
 	antigravityLocalCredential := flags.Bool("antigravity-local-credential", true, "serve managed Antigravity profiles, falling back to the invoking user's CLI credential until the first import")
@@ -573,6 +575,10 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	qwenOAuthUpstream, err := url.Parse(*qwenOAuthUpstreamRaw)
+	if err != nil {
+		return err
+	}
 	qwenUpstream, err := url.Parse(*qwenUpstreamRaw)
 	if err != nil {
 		return err
@@ -716,7 +722,7 @@ func serve(args []string) error {
 	// stores, so serve fails closed until each legacy account is re-added.
 	codexStore.RequireIsolatedOAuth = true
 	claudeStore := agentclaude.DefaultStoreForReadOnlyInspection()
-	oauthSources := []proxy.OAuthAccountSource{agentkimi.ServingStore(), agentgrok.DefaultStore()}
+	oauthSources := []proxy.OAuthAccountSource{agentkimi.ServingStore(), agentgrok.DefaultStore(), qwensubscription.Store{}}
 	if *antigravityLocalCredential {
 		oauthSources = append(oauthSources, agentantigravity.ServingStore())
 	}
@@ -912,6 +918,7 @@ func serve(args []string) error {
 		GrokUpstream:             grokUpstream,
 		GrokSubscriptionUpstream: grokSubscriptionUpstream,
 		QwenUpstream:             qwenUpstream,
+		QwenOAuthUpstream:        qwenOAuthUpstream,
 		QwenTokenUpstream:        qwenTokenUpstream,
 		QwenAnthropicUpstream:    qwenAnthropicUpstream,
 		AntigravityUpstream:      antigravityUpstream,
@@ -1955,7 +1962,7 @@ Usage:
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles (routing scaffold only)
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--openrouter-upstream URL] [--deepseek-upstream URL] [--together-upstream URL] [--fireworks-upstream URL] [--opencode-zen-upstream URL] [--grok-upstream URL] [--grok-subscription-upstream URL] [--qwen-upstream URL] [--qwen-token-upstream URL] [--qwen-anthropic-upstream URL] [--antigravity-upstream URL] [--openai-compatible name=URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--openrouter-upstream URL] [--deepseek-upstream URL] [--together-upstream URL] [--fireworks-upstream URL] [--opencode-zen-upstream URL] [--grok-upstream URL] [--grok-subscription-upstream URL] [--qwen-oauth-upstream URL] [--qwen-upstream URL] [--qwen-token-upstream URL] [--qwen-anthropic-upstream URL] [--antigravity-upstream URL] [--openai-compatible name=URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
   %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--local-data-socket PATH] [--upgrade-inhibit-file PATH] [--expect-proxy-protocol] [--drain-timeout 10m] [--worker-stop-grace 30s] -- [serve flags]
   %[1]s front --backend-id ID --backend-address ADDRESS [--backend-network tcp|unix] [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-front.sock] [--listener-transfer-socket /var/run/subrouter-front-listener.sock]
   %[1]s probe [--url http://127.0.0.1:31415]

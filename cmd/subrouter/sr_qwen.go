@@ -25,8 +25,13 @@ import (
 )
 
 func (r srRunner) qwen(ctx context.Context, args []string) error {
+	if len(args) > 0 && args[0] == "subscription" {
+		return r.qwenSubscription(ctx, args[1:], nil)
+	}
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
-		fmt.Fprint(r.out, `Qwen Token Plan accounts use the standard provider account lifecycle:
+		fmt.Fprint(r.out, `Qwen.ai Plus/Pro: sr qwen subscription login <label>
+
+Qwen Token Plan accounts use the standard provider account lifecycle:
   sr add-key --provider qwen-token
                            Add a Token Plan API-key account
   sr status                List accounts and show available plan/quota status
@@ -117,6 +122,9 @@ func (r srRunner) qwenLogin(ctx context.Context, selector, consoleAccount string
 }
 
 func (r srRunner) qwenRemote(ctx context.Context, server srServerConfig, args []string) error {
+	if len(args) > 0 && args[0] == "subscription" {
+		return r.qwenSubscription(ctx, args[1:], &server)
+	}
 	if len(args) == 3 && args[0] == "label" {
 		remoteAccounts, err := r.fetchServerAccounts(ctx, server)
 		if err != nil {
@@ -218,6 +226,17 @@ func matchRemoteQwenAccount(all []remoteServerAccount, selector string) (string,
 }
 
 func (r srRunner) cloudQwen(ctx context.Context, args []string) error {
+	if len(args) > 0 && args[0] == "subscription" {
+		config, _, _, err := loadCloudClient(true)
+		if err != nil {
+			return err
+		}
+		if !config.HostedTenantReady() {
+			return fmt.Errorf("Qwen subscriptions require a hosted tenant endpoint; run 'sr login' to refresh this machine's team configuration")
+		}
+		server := srServerConfig{Name: "cmux", URL: strings.TrimRight(config.HostedURL, "/"), TenantKey: config.TenantKey}
+		return r.qwenSubscription(ctx, args[1:], &server)
+	}
 	if len(args) == 3 && args[0] == "label" {
 		config, _, client, err := loadCloudClient(true)
 		if err != nil {
