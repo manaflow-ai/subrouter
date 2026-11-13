@@ -168,6 +168,59 @@ func TestQwenSubscriptionMembershipDoesNotClearQuotaExhaustion(t *testing.T) {
 	}
 }
 
+func TestQwenSubscriptionMembershipRecoversAuthScoreWithoutClearingQuota(t *testing.T) {
+	for _, deniedStatus := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		for _, quotaBlocked := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%d/quota=%t", deniedStatus, quotaBlocked), func(t *testing.T) {
+				store := qwensubscription.Store{Dir: t.TempDir()}
+				acct, err := store.SaveManagedCredential("work", qwensubscription.CredentialInfo{AccessToken: "subscription-access", RefreshToken: "subscription-refresh", ExpiresAt: time.Now().Add(time.Hour), Subject: "verified-qwen-owner", MemberType: "pro"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var recovered atomic.Bool
+				client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					if !recovered.Load() {
+						return &http.Response{StatusCode: deniedStatus, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+					}
+					return (qwenUserinfoTransport{}).RoundTrip(r)
+				})}
+				ref, err := OpenAccountRefWithSources(t.Context(), accounts.CodexStore{Dir: t.TempDir()}, agentclaude.Store{Dir: t.TempDir()}, client, []OAuthAccountSource{store})
+				if err != nil {
+					t.Fatal(err)
+				}
+				other := accounts.Account{ID: "kimi", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth, Token: "kimi-access"}
+				ref.oauthSources = append(ref.oauthSources, &stubOAuthUsageSource{
+					stubOAuthSource: stubOAuthSource{provider: other.Provider, refreshed: other},
+					windows:         []accounts.UsageWindow{{Name: "5h", UsedPercent: 20}},
+				})
+				scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+				server := Server{AccountRef: ref, SchedulerRef: scheduler}
+				available := []accounts.Account{acct, other}
+				scores, scored := server.scoreAccounts(t.Context(), available)
+				if scored != 1 || selectacct.NewScheduler(scores).ScoreFor(acct.Provider, acct.ID).Headroom != 0 {
+					t.Fatalf("mixed sweep did not retain auth failure: scored=%d scores=%+v", scored, scores)
+				}
+				scheduler.Set(selectacct.NewScheduler(scores))
+				until := time.Now().Add(time.Hour)
+				if quotaBlocked {
+					scheduler.MarkExhaustedUntil(acct.Provider, acct.ID, "", until)
+				}
+				recovered.Store(true)
+				scores, scored = server.scoreAccounts(t.Context(), available)
+				restored := selectacct.NewScheduler(scores).ScoreFor(acct.Provider, acct.ID)
+				if scored == 0 || restored.Headroom <= 0 || restored.Fresh {
+					t.Fatalf("membership recovery did not restore an unmeasured routing score: scored=%d score=%+v", scored, restored)
+				}
+				scheduler.Set(selectacct.NewScheduler(scores))
+				got, blocked := scheduler.BlockedUntilFor(acct.Provider, acct.ID, "", time.Now())
+				if blocked != quotaBlocked || (blocked && !got.Equal(until)) {
+					t.Fatalf("auth recovery changed quota state: blocked=%t until=%v", blocked, got)
+				}
+			})
+		}
+	}
+}
+
 func TestQwenSubscriptionCatalogRepairsRejectedAccessToken(t *testing.T) {
 	for _, secondStatus := range []int{http.StatusOK, http.StatusUnauthorized} {
 		t.Run(http.StatusText(secondStatus), func(t *testing.T) {

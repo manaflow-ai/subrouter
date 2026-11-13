@@ -5252,6 +5252,19 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 				}
 				return
 			}
+			if fresh && len(windows) == 0 && refreshed.Provider == accounts.ProviderQwenOAuth {
+				scoreMu.Lock()
+				key := selectacct.ScoreKey(schedulerAccountProvider(refreshed.Provider), refreshed.ID)
+				if idx, ok := scoreByID[key]; ok && scores[idx].Headroom == 0 {
+					// Qwen has no quota measurements. Its base zero records an
+					// auth failure, so verified membership restores the neutral
+					// rank without Fresh quota evidence that could erase a 429 hold.
+					scores[idx] = selectacct.NewScheduler(nil).ScoreFor(schedulerAccountProvider(refreshed.Provider), refreshed.ID)
+					scored++
+				}
+				scoreMu.Unlock()
+				return
+			}
 			if !fresh || len(windows) == 0 {
 				// Stale observations and membership-only probes do not measure
 				// quota recovery. Preserve the seed and its exhaustion overlay.
