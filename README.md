@@ -871,6 +871,8 @@ and account health. Qwen's subscription client exposes no quota-window API,
 so percentages and reset times remain unknown. Routed token consumption is
 still recorded by `/_subrouter/token-usage`.
 
+### Qwen Token Plan accounts
+
 For each Qwen Token Plan account, authorize the Alibaba console once:
 
 ```bash

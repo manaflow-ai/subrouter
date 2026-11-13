@@ -44,7 +44,7 @@ func TestQwenSubscriptionCommandsUseSelectedServerAndProtectedImport(t *testing.
 	defer server.Close()
 	var out bytes.Buffer
 	r := srRunner{out: &out, errOut: &out, client: server.Client()}
-	target := srServerConfig{Name: "loreland", URL: server.URL, AdminToken: "admin-secret", AccountImportToken: "import-secret"}
+	target := srServerConfig{Name: "team", URL: server.URL, AdminToken: "admin-secret", AccountImportToken: "import-secret"}
 	if !isQwenManagementCommand([]string{"subscription", "login", "work"}) {
 		t.Fatal("subscription command would launch the Token Plan client")
 	}
