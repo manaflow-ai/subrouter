@@ -210,7 +210,8 @@ func (s Store) write(label string, credential CredentialInfo) (committed bool, e
 // CheckImportCredential must run under the account mutation lock, before
 // redeeming a grant. One membership is one quota pool even across device grants.
 func (s Store) CheckImportCredential(label string, credential CredentialInfo) error {
-	if _, err := ManagedAccountID(label); err != nil {
+	id, err := ManagedAccountID(label)
+	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(credential.AccessToken) == "" || strings.TrimSpace(credential.RefreshToken) == "" || !credential.ExpiresAt.After(time.Now()) || credential.Subject == "" {
@@ -221,7 +222,11 @@ func (s Store) CheckImportCredential(label string, credential CredentialInfo) er
 		return err
 	}
 	for _, existing := range labels {
-		if strings.EqualFold(existing, strings.TrimSpace(label)) {
+		existingID, err := ManagedAccountID(existing)
+		if err != nil {
+			return err
+		}
+		if existingID == id {
 			continue
 		}
 		other, ok, err := s.read(existing)

@@ -187,6 +187,23 @@ func TestQwenSubscriptionRejectsDuplicateGrantAndUnsafeLabels(t *testing.T) {
 	}
 }
 
+func TestQwenSubscriptionDuplicateMembershipUsesCanonicalID(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	credential := testCredential()
+	if _, err := store.SaveManagedCredential("σ", credential); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SaveManagedCredential("ς", credential); err == nil {
+		t.Fatal("distinct canonical IDs accepted the same membership")
+	}
+	if _, err := store.SaveManagedCredential("Σ", credential); err != nil {
+		t.Fatalf("same canonical ID could not replace its own credential: %v", err)
+	}
+	if ids, err := store.AccountInventoryIDs(t.Context()); err != nil || len(ids) != 1 {
+		t.Fatalf("inventory = %v, %v; want one membership", ids, err)
+	}
+}
+
 func TestQwenSubscriptionUserinfoRejectsRedirectsAndIdentityChange(t *testing.T) {
 	var destinationCalls atomic.Int32
 	destination := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { destinationCalls.Add(1) }))
