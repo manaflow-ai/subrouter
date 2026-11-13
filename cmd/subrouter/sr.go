@@ -3306,6 +3306,9 @@ func usageRowErrorHint(row srUsageRow) string {
 	if row.err == nil || !authErrorNeedsReadd(row.err) {
 		return ""
 	}
+	if usageProvider(row) == accounts.ProviderQwenOAuth && strings.HasPrefix(row.email, "qwen-subscription:") {
+		return " (re-add with: sr qwen subscription login " + shellQuote(strings.TrimPrefix(row.email, "qwen-subscription:")) + ")"
+	}
 	return " (re-add with: " + providerReaddCommand(usageProvider(row)) + ")"
 }
 
@@ -3313,6 +3316,8 @@ func providerReaddCommand(provider accounts.Provider) string {
 	switch provider {
 	case accounts.ProviderClaude:
 		return "sr add claude"
+	case accounts.ProviderQwenOAuth:
+		return "sr qwen subscription login <label>"
 	case "gemini":
 		return "sr gemini add"
 	default:

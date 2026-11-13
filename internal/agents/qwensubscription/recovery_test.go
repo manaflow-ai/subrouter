@@ -3,6 +3,7 @@ package qwensubscription
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -140,6 +141,44 @@ func TestQwenSubscriptionImportChecksMembershipBeforeRedemption(t *testing.T) {
 	saved, ok, err := store.read("existing")
 	if err != nil || !ok || saved.RefreshToken != credential.RefreshToken {
 		t.Fatal("duplicate import changed the existing grant")
+	}
+}
+
+func TestQwenSubscriptionFreshAccountDoesNotWaitForAnotherRefresh(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	acct, err := store.SaveManagedCredential("work", testCredential())
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshGate <- struct{}{}
+	defer func() { <-refreshGate }()
+	done := make(chan error, 1)
+	go func() {
+		_, err := store.RefreshAccount(t.Context(), nil, acct)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fresh account waited for another account's refresh lock")
+	}
+}
+
+func TestQwenSubscriptionRefreshWaitRespectsCancellation(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	first, err := store.SaveManagedCredential("work", testCredential())
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshGate <- struct{}{}
+	defer func() { <-refreshGate }()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := store.RefreshRejectedAccount(ctx, nil, first); !errors.Is(err, context.Canceled) {
+		t.Fatalf("refresh lock wait ignored cancellation: %v", err)
 	}
 }
 

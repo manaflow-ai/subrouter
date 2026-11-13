@@ -3,13 +3,23 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
+
+func TestQwenSubscriptionAuthErrorSuggestsSubscriptionLogin(t *testing.T) {
+	row := srUsageRow{provider: accounts.ProviderQwenOAuth, email: "qwen-subscription:work account", err: errors.New("userinfo HTTP 401")}
+	if got := usageRowErrorHint(row); got != " (re-add with: sr qwen subscription login 'work account')" {
+		t.Fatalf("wrong Qwen recovery command: %s", got)
+	}
+}
 
 func TestQwenSubscriptionCommandsUseSelectedServerAndProtectedImport(t *testing.T) {
 	var removals atomic.Int32

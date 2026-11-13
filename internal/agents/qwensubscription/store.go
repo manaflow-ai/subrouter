@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 
@@ -339,7 +338,9 @@ func AttestCredential(ctx context.Context, client *http.Client, credential Crede
 	return credential, nil
 }
 
-var refreshMu sync.Mutex
+// Serving refreshes already share the account transaction. Fresh reads bypass
+// this gate, and cancelled refreshers can stop waiting before that transaction.
+var refreshGate = make(chan struct{}, 1)
 
 // ImportVerifiedCredential takes refresh ownership after the server has
 // attested the submitted access token's Subject. The caller holds the account
@@ -419,8 +420,16 @@ func (s Store) RefreshRejectedAccount(ctx context.Context, client *http.Client, 
 }
 
 func (s Store) refreshAccount(ctx context.Context, client *http.Client, acct account.Account, rejectedIdentity string) (current account.Account, committed bool, err error) {
-	refreshMu.Lock()
-	defer refreshMu.Unlock()
+	current, needed, err := s.AccountRefreshState(acct, time.Now())
+	if err != nil || (!needed && (rejectedIdentity == "" || current.CredentialIdentity() != rejectedIdentity)) {
+		return current, false, err
+	}
+	select {
+	case refreshGate <- struct{}{}:
+		defer func() { <-refreshGate }()
+	case <-ctx.Done():
+		return current, false, ctx.Err()
+	}
 	current = acct
 	refresh := func() error {
 		fresh, needed, err := s.AccountRefreshState(acct, time.Now())

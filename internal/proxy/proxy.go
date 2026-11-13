@@ -598,6 +598,33 @@ func (r *AccountRef) qwenSubscriptionStore() (qwensubscription.Store, bool) {
 	return qwensubscription.Store{}, false
 }
 
+// publishQwenSubscriptionAccount re-reads the grant under the removal transaction so
+// a completed refresh cannot resurrect a removed or replaced enrollment.
+func (r *AccountRef) publishQwenSubscriptionAccount(ctx context.Context, refreshed accounts.Account) (current accounts.Account, err error) {
+	// An unchanged credential needs no publication and must not wait behind
+	// another account's network refresh while holding the transaction.
+	if cached := r.credentialSnapshot(refreshed.Provider, refreshed.ID); refreshed.Token != "" && cached.CredentialIdentity() == refreshed.CredentialIdentity() {
+		return refreshed, nil
+	}
+	store, ok := r.qwenSubscriptionStore()
+	if !ok {
+		return current, errors.New("Qwen subscription store is not configured")
+	}
+	err = withAccountDiskTransaction(ctx, r.store, func() error {
+		var readErr error
+		current, _, readErr = store.AccountRefreshState(refreshed, time.Now())
+		if readErr != nil {
+			return readErr
+		}
+		if current.Token == "" {
+			return errors.New("Qwen subscription is awaiting identity verification")
+		}
+		r.replace(current)
+		return nil
+	})
+	return current, err
+}
+
 func (r *AccountRef) antigravityStore() (*agentantigravity.Store, bool) {
 	if r != nil {
 		for _, source := range r.oauthSources {
@@ -1541,6 +1568,9 @@ func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (acc
 		refreshed, err := source.RefreshAccount(ctx, r.client, account)
 		if err != nil {
 			return account, err
+		}
+		if account.Provider == accounts.ProviderQwenOAuth {
+			return r.publishQwenSubscriptionAccount(ctx, refreshed)
 		}
 		r.replace(refreshed)
 		return refreshed, nil
@@ -2534,13 +2564,18 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 						return
 					}
 					refreshed, refreshErr := source.RefreshAccount(sweepCtx, r.client, sourceAccount)
+					if refreshErr == nil && sourceAccount.Provider == accounts.ProviderQwenOAuth {
+						refreshed, refreshErr = r.publishQwenSubscriptionAccount(sweepCtx, refreshed)
+					}
 					if refreshErr != nil {
 						status.Error = refreshErr.Error()
 						batch[accountIndex] = status
 						return
 					}
 					status.AuthValid = true
-					r.replace(refreshed)
+					if sourceAccount.Provider != accounts.ProviderQwenOAuth {
+						r.replace(refreshed)
+					}
 					if !hasUsage {
 						status.PlanType = "subscription"
 						batch[accountIndex] = status
@@ -11619,16 +11654,18 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if store, ok := t.server.AccountRef.qwenSubscriptionStore(); ok {
 				rejected := accounts.Account{ID: accountID, Provider: t.provider, AuthMode: accounts.AuthModeOAuth, CredentialVersion: accountCredential}
 				if repaired, refreshErr := store.RefreshRejectedAccount(req.Context(), t.server.AccountRef.client, rejected); refreshErr == nil && repaired.CredentialIdentity() != accountCredential {
-					if nextReq, replayErr := a.replay(replayReq, &repaired); replayErr == nil {
-						_ = response.Body.Close()
-						t.server.AccountRef.replace(repaired)
-						accountCredential = repaired.CredentialIdentity()
-						addressed = repaired
-						attemptReq = nextReq
-						response, err = a.send(base, attemptReq, addressed)
-						response = tagRoutedResponseAccount(response, addressed)
-						if err != nil || req.Context().Err() != nil {
-							return response, tagRoutedAttemptError(err, attemptReq, addressed)
+					repaired, publishErr := t.server.AccountRef.publishQwenSubscriptionAccount(req.Context(), repaired)
+					if publishErr == nil {
+						if nextReq, replayErr := a.replay(replayReq, &repaired); replayErr == nil {
+							_ = response.Body.Close()
+							accountCredential = repaired.CredentialIdentity()
+							addressed = repaired
+							attemptReq = nextReq
+							response, err = a.send(base, attemptReq, addressed)
+							response = tagRoutedResponseAccount(response, addressed)
+							if err != nil || req.Context().Err() != nil {
+								return response, tagRoutedAttemptError(err, attemptReq, addressed)
+							}
 						}
 					}
 				}

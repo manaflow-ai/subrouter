@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,7 +19,102 @@ import (
 	"github.com/manaflow-ai/subrouter/session"
 )
 
+func TestQwenSubscriptionRepairRechecksEnrollmentBeforePublishing(t *testing.T) {
+	for _, remove := range []bool{true, false} {
+		t.Run(map[bool]string{true: "removed", false: "replaced"}[remove], func(t *testing.T) {
+			store := qwensubscription.Store{Dir: t.TempDir()}
+			credential := qwensubscription.CredentialInfo{AccessToken: "subscription-access", RefreshToken: "subscription-refresh", ExpiresAt: time.Now().Add(time.Hour), Subject: "verified-qwen-owner", MemberType: "pro"}
+			if _, err := store.SaveManagedCredential("work", credential); err != nil {
+				t.Fatal(err)
+			}
+			ref, err := OpenAccountRefWithSources(t.Context(), accounts.CodexStore{Dir: t.TempDir()}, agentclaude.Store{Dir: t.TempDir()}, &http.Client{Transport: qwenUserinfoTransport{}}, []OAuthAccountSource{store})
+			if err != nil {
+				t.Fatal(err)
+			}
+			configured, _ := ref.qwenSubscriptionStore()
+			transaction := configured.RefreshTransaction
+			configured.RefreshTransaction = func(ctx context.Context, refresh func() error) error {
+				if err := transaction(ctx, refresh); err != nil {
+					return err
+				}
+				// Complete removal or re-login after refresh releases its disk lock,
+				// then reload so the stale repair cannot rely on a later generation.
+				if err := PublishAccountDiskMutation(ctx, ref.store.StoreDir(), func() (bool, error) {
+					if remove {
+						_, changed, err := store.RemoveManagedAccount("work")
+						return changed, err
+					}
+					credential.AccessToken, credential.RefreshToken = "replacement-access", "replacement-refresh"
+					_, err := store.SaveManagedCredential("work", credential)
+					return err == nil, err
+				}); err != nil {
+					return err
+				}
+				_, err := ref.Reload()
+				return err
+			}
+			ref.oauthSources[0] = configured
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) == 1 {
+					http.Error(w, "expired", http.StatusUnauthorized)
+					return
+				}
+				if r.Header.Get("Authorization") != "Bearer replacement-access" {
+					t.Error("repair replayed a credential superseded by re-login")
+				}
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+			}))
+			defer upstream.Close()
+			sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := Server{AccountRef: ref, Sessions: sessions, SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)), QwenOAuthUpstream: mustParseURL(t, upstream.URL+"/v1"), MaxBodyBytes: 4096}
+			req := httptest.NewRequest(http.MethodPost, "/qwen-oauth/v1/chat/completions", strings.NewReader(`{"model":"qwen3.8-max","messages":[]}`))
+			recorder := httptest.NewRecorder()
+			server.Handler().ServeHTTP(recorder, req)
+			available, _ := ref.Snapshot()
+			if remove {
+				if calls.Load() != 1 || len(available) != 0 || recorder.Code == http.StatusOK {
+					t.Fatalf("removed enrollment returned: calls=%d accounts=%d HTTP=%d", calls.Load(), len(available), recorder.Code)
+				}
+			} else if calls.Load() != 2 || len(available) != 1 || available[0].Token != "replacement-access" || recorder.Code != http.StatusOK {
+				t.Fatalf("replacement enrollment not used: calls=%d accounts=%d HTTP=%d", calls.Load(), len(available), recorder.Code)
+			}
+		})
+	}
+}
+
 type qwenUserinfoTransport struct{}
+
+func TestQwenSubscriptionImportWithSchedulerPublishesWithoutDeadlock(t *testing.T) {
+	store := qwensubscription.Store{Dir: t.TempDir()}
+	ref, err := OpenAccountRefWithSources(t.Context(), accounts.CodexStore{Dir: t.TempDir()}, agentclaude.Store{Dir: t.TempDir()}, &http.Client{Transport: qwenUserinfoTransport{}}, []OAuthAccountSource{store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := Server{AccountRef: ref, AccountImportToken: "import-secret", SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))}
+	body, err := json.Marshal(accountImportRequest{Provider: accounts.ProviderQwenOAuth, QwenSubscription: &qwenSubscriptionAccountImport{Label: "work", Credential: qwensubscription.CredentialInfo{AccessToken: "subscription-access", RefreshToken: "subscription-refresh", ExpiresAt: time.Now().Add(time.Hour)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/_subrouter/account-import", strings.NewReader(string(body))).WithContext(ctx)
+	req.RemoteAddr = "100.64.0.2:3000"
+	req.Header.Set("Authorization", "Bearer import-secret")
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK || ctx.Err() != nil {
+		t.Fatalf("subscription import stalled during scoring: HTTP %d, %v: %s", recorder.Code, ctx.Err(), recorder.Body.String())
+	}
+	available, _ := ref.Snapshot()
+	if len(available) != 1 || available[0].Token != "attested-access" {
+		t.Fatal("scheduled import did not publish the verified credential")
+	}
+}
 
 func (qwenUserinfoTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if r.URL.String() == "https://auth.qwen.ai/api/oauth/token" {
