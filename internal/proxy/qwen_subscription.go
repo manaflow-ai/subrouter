@@ -6,15 +6,16 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
-// Catalog GETs bypass the inference retry stack. Repair a rejected credential
-// before response capture can turn a refreshable grant into an exhaustion mark.
-type qwenSubscriptionReadRepairTransport struct {
+// Catalog reads and pinned inference bypass account failover. Repair only their
+// selected credential before response capture can mark it exhausted.
+type qwenSubscriptionRepairTransport struct {
 	base    http.RoundTripper
 	server  *Server
 	account accounts.Account
+	attempt *upstreamAttempt
 }
 
-func (t qwenSubscriptionReadRepairTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (t qwenSubscriptionRepairTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	response, err := t.base.RoundTrip(req)
 	if err != nil || response.StatusCode != http.StatusUnauthorized || req.Context().Err() != nil || t.server.AccountRef == nil {
 		return response, err
@@ -32,8 +33,23 @@ func (t qwenSubscriptionReadRepairTransport) RoundTrip(req *http.Request) (*http
 		return response, nil
 	}
 	replay := req.Clone(req.Context())
-	setAccountAuthHeaders(replay.Header, repaired, "")
+	if t.attempt != nil {
+		replay, err = t.attempt.replay(req, &repaired)
+		if err != nil {
+			return response, nil
+		}
+		if !t.attempt.consume() {
+			_ = replay.Body.Close()
+			return response, nil
+		}
+	} else {
+		setAccountAuthHeaders(replay.Header, repaired, "")
+	}
 	_ = response.Body.Close()
-	response, err = t.base.RoundTrip(replay)
+	if t.attempt != nil {
+		response, err = t.attempt.send(t.base, replay, repaired)
+	} else {
+		response, err = t.base.RoundTrip(replay)
+	}
 	return tagRoutedResponseAccount(response, repaired), err
 }

@@ -264,6 +264,84 @@ func TestQwenSubscriptionCatalogRepairsRejectedAccessToken(t *testing.T) {
 	}
 }
 
+func TestQwenSubscriptionPinnedInferenceRepairsOnlyItsOwnCredential(t *testing.T) {
+	for _, leased := range []bool{false, true} {
+		for _, noRetry := range []bool{false, true} {
+			for _, secondStatus := range []int{http.StatusOK, http.StatusUnauthorized} {
+				t.Run(fmt.Sprintf("lease=%t/no-retry=%t/%d", leased, noRetry, secondStatus), func(t *testing.T) {
+					store := qwensubscription.Store{Dir: t.TempDir()}
+					credential := qwensubscription.CredentialInfo{AccessToken: "subscription-access", RefreshToken: "subscription-refresh", ExpiresAt: time.Now().Add(time.Hour), Subject: "verified-qwen-owner", MemberType: "pro"}
+					acct, err := store.SaveManagedCredential("work", credential)
+					if err != nil {
+						t.Fatal(err)
+					}
+					credential.AccessToken, credential.RefreshToken, credential.Subject = "other-access", "other-refresh", "other-owner"
+					if _, err := store.SaveManagedCredential("other", credential); err != nil {
+						t.Fatal(err)
+					}
+					var repairs atomic.Int32
+					client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+						if r.URL.Path == "/api/oauth/token" {
+							repairs.Add(1)
+						}
+						return (qwenUserinfoTransport{}).RoundTrip(r)
+					})}
+					ref, err := OpenAccountRefWithSources(t.Context(), accounts.CodexStore{Dir: t.TempDir()}, agentclaude.Store{Dir: t.TempDir()}, client, []OAuthAccountSource{store})
+					if err != nil {
+						t.Fatal(err)
+					}
+					const body = `{"model":"qwen3.8-max","messages":[{"role":"user","content":"preserve this body"}]}`
+					var calls atomic.Int32
+					upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if got, err := io.ReadAll(r.Body); err != nil || string(got) != body {
+							t.Error("pinned replay did not preserve the request body", err)
+						}
+						if calls.Add(1) == 1 {
+							if r.Header.Get("Authorization") != "Bearer subscription-access" {
+								t.Error("initial request borrowed another membership")
+							}
+							http.Error(w, "expired", http.StatusUnauthorized)
+							return
+						}
+						if r.Header.Get("Authorization") != "Bearer attested-access" {
+							t.Error("pinned repair borrowed another membership")
+						}
+						w.WriteHeader(secondStatus)
+						_, _ = io.WriteString(w, `{}`)
+					}))
+					defer upstream.Close()
+					sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					leases := newSessionLeaseStore()
+					server := Server{AccountRef: ref, Sessions: sessions, sessionLeases: leases, SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)), QwenOAuthUpstream: mustParseURL(t, upstream.URL+"/v1"), MaxBodyBytes: 4096}
+					req := httptest.NewRequest(http.MethodPost, "/qwen-oauth/chat/completions", strings.NewReader(body))
+					if leased {
+						lease, err := leases.put(sessionLease{ScopeKey: "pinned", SessionKey: "pinned", Agent: "pi", Provider: acct.Provider, AccountID: acct.ID, AuthMode: acct.AuthMode})
+						if err != nil {
+							t.Fatal(err)
+						}
+						req.Header.Set("X-Subrouter-Lease", lease.Token)
+					} else {
+						req.Header.Set("X-Subrouter-Account-ID", acct.ID)
+					}
+					wantCalls, wantRepairs, wantStatus := int32(2), int32(1), secondStatus
+					if noRetry {
+						req.Header.Set(subrouterNoRetryHeader, "1")
+						wantCalls, wantRepairs, wantStatus = 1, 0, http.StatusUnauthorized
+					}
+					recorder := httptest.NewRecorder()
+					server.Handler().ServeHTTP(recorder, req)
+					if calls.Load() != wantCalls || repairs.Load() != wantRepairs || recorder.Code != wantStatus {
+						t.Fatalf("HTTP=%d calls=%d repairs=%d, want %d/%d/%d", recorder.Code, calls.Load(), repairs.Load(), wantStatus, wantCalls, wantRepairs)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestQwenSubscriptionImportWithSchedulerPublishesWithoutDeadlock(t *testing.T) {
 	store := qwensubscription.Store{Dir: t.TempDir()}
 	ref, err := OpenAccountRefWithSources(t.Context(), accounts.CodexStore{Dir: t.TempDir()}, agentclaude.Store{Dir: t.TempDir()}, &http.Client{Transport: qwenUserinfoTransport{}}, []OAuthAccountSource{store})
