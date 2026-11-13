@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -87,6 +88,60 @@ func TestQwenSubscriptionRepairRechecksEnrollmentBeforePublishing(t *testing.T) 
 }
 
 type qwenUserinfoTransport struct{}
+
+func TestQwenSubscriptionFailedRepairPreservesFailoverBudget(t *testing.T) {
+	store := qwensubscription.Store{Dir: t.TempDir()}
+	var available []accounts.Account
+	var scores []selectacct.Score
+	for i := range 4 {
+		label := fmt.Sprintf("member-%d", i)
+		acct, err := store.SaveManagedCredential(label, qwensubscription.CredentialInfo{
+			AccessToken: label, RefreshToken: "refresh-" + label, Subject: label,
+			ExpiresAt: time.Now().Add(time.Hour), MemberType: "pro",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		available = append(available, acct)
+		scores = append(scores, selectacct.Score{AccountID: acct.ID, Provider: acct.Provider, Headroom: 1 - float64(i)/10, ShortHeadroom: 1})
+	}
+	var repairs atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/api/oauth/token" {
+			t.Errorf("unexpected auth request: %s", r.URL.Path)
+		}
+		repairs.Add(1)
+		return &http.Response{StatusCode: 400, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":"invalid_grant"}`))}, nil
+	})}
+	ref, err := OpenAccountRefWithSources(t.Context(), accounts.CodexStore{Dir: t.TempDir()}, agentclaude.Store{Dir: t.TempDir()}, client, []OAuthAccountSource{store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) <= 3 {
+			http.Error(w, "expired", http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer upstream.Close()
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Put("qwen-oauth", "repair-budget", available[0].ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	server := Server{AccountRef: ref, Sessions: sessions, SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(scores)), QwenOAuthUpstream: mustParseURL(t, upstream.URL+"/v1"), MaxBodyBytes: 4096}
+	req := httptest.NewRequest(http.MethodPost, "/qwen-oauth/v1/chat/completions", strings.NewReader(`{"model":"qwen3.8-max","messages":[]}`))
+	req.Header.Set("X-Subrouter-Session", "repair-budget")
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK || requests.Load() != 4 || repairs.Load() != 3 {
+		t.Fatalf("HTTP=%d requests=%d repairs=%d; want healthy fourth account after three failed repairs", recorder.Code, requests.Load(), repairs.Load())
+	}
+}
 
 func TestQwenSubscriptionMembershipDoesNotClearQuotaExhaustion(t *testing.T) {
 	store := qwensubscription.Store{Dir: t.TempDir()}

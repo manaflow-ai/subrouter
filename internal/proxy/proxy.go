@@ -11650,7 +11650,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if err != nil || !a.replayable() || req.Context().Err() != nil {
 			return response, tagRoutedAttemptError(err, attemptReq, addressed)
 		}
-		if response != nil && response.StatusCode == http.StatusUnauthorized && t.provider == accounts.ProviderQwenOAuth && t.server != nil && t.server.AccountRef != nil && !qwenAuthRetried[accountID] && a.consume() {
+		if response != nil && response.StatusCode == http.StatusUnauthorized && t.provider == accounts.ProviderQwenOAuth && t.server != nil && t.server.AccountRef != nil && !qwenAuthRetried[accountID] {
 			if qwenAuthRetried == nil {
 				qwenAuthRetried = make(map[string]bool)
 			}
@@ -11660,7 +11660,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				if repaired, refreshErr := store.RefreshRejectedAccount(req.Context(), t.server.AccountRef.client, rejected); refreshErr == nil && repaired.CredentialIdentity() != accountCredential {
 					repaired, publishErr := t.server.AccountRef.publishQwenSubscriptionAccount(req.Context(), repaired)
 					if publishErr == nil {
-						if nextReq, replayErr := a.replay(replayReq, &repaired); replayErr == nil {
+						if nextReq, replayErr := a.replay(replayReq, &repaired); replayErr == nil && a.consume() {
 							_ = response.Body.Close()
 							accountCredential = repaired.CredentialIdentity()
 							addressed = repaired
