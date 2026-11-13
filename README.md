@@ -712,8 +712,11 @@ OpenAI-compatible subscription endpoint
 claim it can import or fail over either product's subscription.
 
 `sr status` groups these under their own provider rather than under Codex. Kimi
-OAuth subscriptions report their independent 5-hour and weekly windows and
-reset times from Kimi's usage endpoint. The condensed API-key rows report key
+OAuth subscriptions report their 5-hour, weekly, monthly total, and monthly
+code windows when Kimi exposes them. Calendar-month limits retain the actual
+reset timestamp without assuming a fixed month length. `sr status --json`
+includes every quota window with utilization, reset, and any reported quantities;
+missing quantities remain null. The condensed API-key rows report key
 health and only quota data the provider actually exposes.
 
 The Antigravity CLI exposes one fixed Keychain login and no account selector.

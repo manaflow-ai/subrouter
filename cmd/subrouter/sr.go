@@ -2488,6 +2488,7 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 			UsedPercent:        window.UsedPercent,
 			LimitWindowSeconds: window.LimitWindowSeconds,
 			ResetAfterSeconds:  window.ResetAfterSeconds,
+			ResetAt:            window.ResetAt,
 			Feature:            window.Feature,
 		})
 		if hasFableWindow && window.Feature == "" {
@@ -2496,6 +2497,7 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 				UsedPercent:        window.UsedPercent,
 				LimitWindowSeconds: window.LimitWindowSeconds,
 				ResetAfterSeconds:  window.ResetAfterSeconds,
+				ResetAt:            window.ResetAt,
 				Feature:            agentclaude.FableFeature,
 			})
 		}
@@ -3450,18 +3452,25 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 				columns = appendUsageGridColumnIfFits(columns, candidate, termWidth)
 			}
 		}
-	} else if provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
-		columns = dropUsageGridColumn(columns, "Pick")
-		columns = dropUsageGridColumn(columns, "Plan")
-		columns = append(columns,
-			usageGridColumn{Key: "5h", Title: "5h", Width: 12},
-			usageGridColumn{Key: "Weekly", Title: "Weekly", Width: 12},
-		)
-	} else if provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeAPIKey && row.quotaUsageKnown {
-		columns = append(columns,
-			usageGridColumn{Key: "5h", Title: "5h", Width: 12},
-			usageGridColumn{Key: "Weekly", Title: "Weekly", Width: 12},
-		)
+	} else if provider == accounts.ProviderKimi && (row.authMode == accounts.AuthModeOAuth || row.quotaUsageKnown) {
+		if row.authMode == accounts.AuthModeOAuth {
+			columns = dropUsageGridColumn(columns, "Pick")
+			columns = dropUsageGridColumn(columns, "Plan")
+		}
+		columns = append(columns, usageGridColumn{Key: "5h", Title: "5h", Width: 12})
+		hasMonthly := usageGridRowsHaveValue(rows, "Monthly") || usageGridRowsHaveValue(rows, "Monthly code")
+		if hasMonthly {
+			columns = dropUsageGridColumn(columns, "Pick")
+			columns = dropUsageGridColumn(columns, "Plan")
+		}
+		if usageGridRowsHaveValue(rows, "Weekly") || !hasMonthly {
+			columns = append(columns, usageGridColumn{Key: "Weekly", Title: "Weekly", Width: 12})
+		}
+		for _, column := range []usageGridColumn{{Key: "Monthly", Title: "Monthly", Width: 12}, {Key: "Monthly code", Title: "Code/mo", Width: 12}} {
+			if usageGridRowsHaveValue(rows, column.Key) {
+				columns = append(columns, column)
+			}
+		}
 	} else if provider == accounts.ProviderQwenToken && row.authMode == accounts.AuthModeAPIKey {
 		// Token Plan names are longer than the generic API-key plan labels, while
 		// their Use text is compact. Reserve enough space to show Lite, Standard,
@@ -3646,6 +3655,8 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Detail":          usageGridClaudeDetailCell(row),
 		"Session":         usageGridWindowCell(row.windows, isClaudeSessionWindow),
 		"Weekly":          usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
+		"Monthly":         usageGridWindowCell(row.windows, func(w accounts.UsageWindow) bool { return w.Name == "monthly" }),
+		"Monthly code":    usageGridWindowCell(row.windows, func(w accounts.UsageWindow) bool { return w.Name == "monthly-code" }),
 		"Fable wk":        usageGridWindowCell(row.windows, isClaudeOAuthAppsWeeklyWindow),
 		"Opus wk":         usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
 		"Sonnet wk":       usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
