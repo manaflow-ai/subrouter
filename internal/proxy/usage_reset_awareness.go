@@ -60,6 +60,7 @@ func (s Server) mergeClaudeResponseQuotaScore(account accounts.Account, windows 
 		return
 	}
 	s.AccountRef.RefreshUsageStatusSnapshotFromWindows(score)
+	s.reconcileClaudeAdmissionQuota()
 }
 
 // allOAuthAccountsWaitingForReset is true only when every locally managed

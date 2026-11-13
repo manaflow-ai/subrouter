@@ -930,7 +930,9 @@ class FunctionalCanaryTest(unittest.TestCase):
             while time.monotonic() < deadline and not runner_state.exists():
                 time.sleep(0.02)
             self.assertTrue(runner_state.exists(), "runner did not finish its timed-out leg")
-            while time.monotonic() < deadline and not sibling_state.exists():
+            while time.monotonic() < deadline and (
+                not sibling_state.exists() or not sibling_state.read_text()
+            ):
                 time.sleep(0.02)
             self.assertEqual(sibling_state.read_text(), "alive")
             release.write_text("done\n")
