@@ -69,7 +69,7 @@ func (s Server) webSocketTurnRetryDelay(attempt int) time.Duration {
 type webSocketUpstreamLink struct {
 	mu     sync.Mutex
 	conn   atomic.Pointer[websocket.Conn]
-	closed bool
+	closed atomic.Bool
 	// done closes when the client side is finished; a retry waiting on a
 	// backoff stops there.
 	done chan struct{}
@@ -99,6 +99,10 @@ func (l *webSocketUpstreamLink) current() *websocket.Conn {
 // swap never interleaves with a forwarded client message.
 func (l *webSocketUpstreamLink) openWriter(messageType int) (io.WriteCloser, error) {
 	l.mu.Lock()
+	if l.closed.Load() {
+		l.mu.Unlock()
+		return nil, websocket.ErrCloseSent
+	}
 	writer, err := l.current().NextWriter(messageType)
 	if err != nil {
 		l.mu.Unlock()
@@ -110,7 +114,7 @@ func (l *webSocketUpstreamLink) openWriter(messageType int) (io.WriteCloser, err
 func (l *webSocketUpstreamLink) send(body []byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.closed {
+	if l.closed.Load() {
 		return websocket.ErrCloseSent
 	}
 	return l.current().WriteMessage(websocket.TextMessage, body)
@@ -131,7 +135,7 @@ func (l *webSocketUpstreamLink) sendContext(ctx context.Context, body []byte) er
 	}()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.closed {
+	if l.closed.Load() {
 		return websocket.ErrCloseSent
 	}
 	conn := l.current()
@@ -153,28 +157,30 @@ func (l *webSocketUpstreamLink) sendContext(ctx context.Context, body []byte) er
 // client already went away.
 func (l *webSocketUpstreamLink) swap(conn *websocket.Conn) bool {
 	l.mu.Lock()
-	if l.closed {
+	if l.closed.Load() {
 		l.mu.Unlock()
 		_ = conn.Close()
 		return false
 	}
 	old := l.conn.Swap(conn)
+	closing := l.closed.Load()
 	l.mu.Unlock()
+	if closing {
+		_ = conn.Close()
+		_ = old.Close()
+		return false
+	}
 	_ = old.Close()
 	return true
 }
 
 func (l *webSocketUpstreamLink) close() {
-	// Closing the socket first interrupts a writer that holds mu in network I/O.
-	_ = l.current().Close()
-	l.mu.Lock()
-	if !l.closed {
-		l.closed = true
+	// Retire the link before closing its socket so a redial cannot install a
+	// replacement that queued writers keep alive during shutdown.
+	if !l.closed.Swap(true) {
 		close(l.done)
 	}
-	conn := l.current()
-	l.mu.Unlock()
-	_ = conn.Close()
+	_ = l.current().Close()
 }
 
 // wait sleeps d unless the request or the client ends first.

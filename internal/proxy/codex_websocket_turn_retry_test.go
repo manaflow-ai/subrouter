@@ -27,10 +27,12 @@ import (
 
 type blockedReplayConn struct {
 	net.Conn
-	block   atomic.Bool
-	entered chan struct{}
-	closed  chan struct{}
-	once    sync.Once
+	block         atomic.Bool
+	entered       chan struct{}
+	closed        chan struct{}
+	once          sync.Once
+	closeEntered  chan struct{}
+	closeContinue chan struct{}
 }
 
 func (c *blockedReplayConn) Write(body []byte) (int, error) {
@@ -43,7 +45,13 @@ func (c *blockedReplayConn) Write(body []byte) (int, error) {
 }
 
 func (c *blockedReplayConn) Close() error {
-	c.once.Do(func() { close(c.closed) })
+	c.once.Do(func() {
+		close(c.closed)
+		if c.closeEntered != nil {
+			close(c.closeEntered)
+			<-c.closeContinue
+		}
+	})
 	return c.Conn.Close()
 }
 
@@ -142,6 +150,36 @@ func TestCodexWebSocketCancellationInterruptsForwardedWrite(t *testing.T) {
 			}
 			link.close()
 		})
+	}
+}
+
+func TestCodexWebSocketShutdownRejectsConcurrentReplacement(t *testing.T) {
+	link, transport := blockedWebSocketLink(t)
+	replacement, replacementTransport := blockedWebSocketLink(t)
+	transport.closeEntered = make(chan struct{})
+	transport.closeContinue = make(chan struct{})
+	defer close(transport.closeContinue)
+	closing := make(chan struct{})
+	go func() { link.close(); close(closing) }()
+	select {
+	case <-transport.closeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not start closing the old connection")
+	}
+	swapped := make(chan bool, 1)
+	go func() { swapped <- link.swap(replacement.current()) }()
+	select {
+	case <-replacementTransport.closed:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown left a replacement connection open for queued writers")
+	}
+	select {
+	case installed := <-swapped:
+		if installed {
+			t.Fatal("shutdown accepted a replacement connection")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement waited for shutdown's writer mutex")
 	}
 }
 
