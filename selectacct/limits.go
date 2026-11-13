@@ -217,7 +217,12 @@ func isShortWindow(window LimitWindow) bool {
 }
 
 func isLongWindow(window LimitWindow) bool {
-	return window.LimitWindowSeconds >= longWindowMinSeconds
+	if window.LimitWindowSeconds > 0 {
+		return window.LimitWindowSeconds >= longWindowMinSeconds
+	}
+	// Calendar months have a reset but no fixed length. They constrain long
+	// headroom; unpacedSurplus stays zero without a reported duration.
+	return window.Name == "monthly" || window.Name == "monthly-code"
 }
 
 // isNonShortResettingWindow drives fable drain pressure: any resetting

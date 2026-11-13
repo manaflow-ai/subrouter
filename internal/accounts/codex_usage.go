@@ -31,6 +31,11 @@ type UsageWindow struct {
 	// account-wide primary/secondary windows. Used to route a request to its
 	// model-specific quota pool without matching on display strings.
 	Feature string
+	// Provider quota quantities, when exposed. These are not necessarily tokens
+	// or money; nil means the provider supplied only utilization, not counts.
+	Used      *float64 `json:"used,omitempty"`
+	Remaining *float64 `json:"remaining,omitempty"`
+	Limit     *float64 `json:"limit,omitempty"`
 	// ExtraUsage carries Claude's paid-usage allowance on the synthetic
 	// "extra" window. It is status and fallback-routing metadata, not a
 	// subscription quota window, so scoring code must exclude it.

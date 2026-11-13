@@ -16,8 +16,8 @@ func IsModelScopedWindow(window UsageWindow) bool {
 	return strings.TrimSpace(window.Feature) != ""
 }
 
-// IsLongQuotaWindow reports whether a window is the weekly quota. A reported
-// length decides; without one, the name does. Codex once reported the weekly
+// IsLongQuotaWindow reports whether a window is a weekly or monthly quota.
+// A reported length decides; without one, the name does. Codex once reported the weekly
 // window only as "secondary" and now sometimes only as "primary" with a
 // length, so the slot name alone is never trusted when a length is present.
 func IsLongQuotaWindow(window UsageWindow) bool {
@@ -25,10 +25,10 @@ func IsLongQuotaWindow(window UsageWindow) bool {
 		return window.LimitWindowSeconds >= longQuotaWindowMinSeconds
 	}
 	name := strings.ToLower(window.Name)
-	return name == "secondary" || strings.Contains(name, "7d") || strings.Contains(name, "weekly")
+	return name == "secondary" || strings.Contains(name, "7d") || strings.Contains(name, "weekly") || name == "monthly" || name == "monthly-code"
 }
 
-// WeeklyCookedWindow returns the first account-wide weekly window that is
+// WeeklyCookedWindow returns the first account-wide long window that is
 // fully consumed. When no account-wide weekly window is reported at all, the
 // synthetic "reached" window (upstream limit_reached) stands in for it,
 // unless a full shorter window already explains the limit.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -21,11 +22,17 @@ const defaultUsageURL = "https://api.kimi.com/coding/v1/usages"
 var usageURL = defaultUsageURL
 
 type usagePayload struct {
-	Usage  quotaDetail `json:"usage"`
+	Usage  quotaDetail            `json:"usage"`
+	Usages map[string]ratioDetail `json:"usages"`
 	Limits []struct {
 		Window quotaWindow `json:"window"`
 		Detail quotaDetail `json:"detail"`
 	} `json:"limits"`
+}
+
+type ratioDetail struct {
+	UsedRatio json.RawMessage `json:"used_ratio"`
+	ResetTime string          `json:"reset_time"`
 }
 
 type quotaWindow struct {
@@ -87,6 +94,44 @@ func (s Store) FetchUsage(ctx context.Context, client *http.Client, acct account
 			windows = append(windows, window)
 		}
 	}
+	// New memberships expose ratios independently of the legacy rounded
+	// quantities. Preserve both monthly pools and prefer the precise ratio
+	// when the same session/weekly window appears in both response shapes.
+	for _, definition := range []struct {
+		key, name string
+		seconds   int64
+	}{
+		{"limit_5h", "5h", 5 * 60 * 60},
+		{"limit_7d", "weekly", 7 * 24 * 60 * 60},
+		{"limit_month_total", "monthly", 0},
+		{"limit_month_code", "monthly-code", 0},
+	} {
+		detail, present := payload.Usages[definition.key]
+		if !present {
+			continue
+		}
+		ratio, valid := quotaValue(detail.UsedRatio)
+		if !valid || ratio < 0 {
+			return "subscription", nil, fmt.Errorf("Kimi usage %s contained an invalid usage ratio", definition.key)
+		}
+		window := accounts.UsageWindow{Name: definition.name, UsedPercent: math.Min(ratio, 1) * 100, LimitWindowSeconds: definition.seconds}
+		setResetTime(&window, detail.ResetTime, now)
+		replaced := false
+		for i := range windows {
+			if windows[i].Name == window.Name {
+				window.Used, window.Remaining, window.Limit = windows[i].Used, windows[i].Remaining, windows[i].Limit
+				if window.ResetAt.IsZero() {
+					window.ResetAt, window.ResetAfterSeconds = windows[i].ResetAt, windows[i].ResetAfterSeconds
+				}
+				windows[i] = window
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			windows = append(windows, window)
+		}
+	}
 	if len(windows) == 0 {
 		return "subscription", nil, fmt.Errorf("Kimi usage response contained no quota windows")
 	}
@@ -106,6 +151,7 @@ func kimiUsageWindow(name string, seconds int64, detail quotaDetail, now time.Ti
 	if !haveUsed {
 		return accounts.UsageWindow{}, false
 	}
+	quantityUsed := used
 	if used < 0 {
 		used = 0
 	}
@@ -116,12 +162,21 @@ func kimiUsageWindow(name string, seconds int64, detail quotaDetail, now time.Ti
 		Name:               name,
 		UsedPercent:        100 * used / limit,
 		LimitWindowSeconds: seconds,
+		Used:               &quantityUsed,
+		Limit:              &limit,
 	}
-	if reset, err := time.Parse(time.RFC3339Nano, detail.ResetTime); err == nil {
+	if remaining, ok := quotaValue(detail.Remaining); ok {
+		window.Remaining = &remaining
+	}
+	setResetTime(&window, detail.ResetTime, now)
+	return window, true
+}
+
+func setResetTime(window *accounts.UsageWindow, value string, now time.Time) {
+	if reset, err := time.Parse(time.RFC3339Nano, value); err == nil {
 		window.ResetAt = reset
 		window.ResetAfterSeconds = max(0, int64(reset.Sub(now).Seconds()))
 	}
-	return window, true
 }
 
 func quotaValue(raw json.RawMessage) (float64, bool) {
@@ -130,7 +185,7 @@ func quotaValue(raw json.RawMessage) (float64, bool) {
 		return 0, false
 	}
 	n, err := strconv.ParseFloat(value, 64)
-	return n, err == nil
+	return n, err == nil && !math.IsNaN(n) && !math.IsInf(n, 0)
 }
 
 func kimiWindowDuration(window quotaWindow) (int64, string, bool) {
@@ -150,6 +205,9 @@ func kimiWindowDuration(window quotaWindow) (int64, string, bool) {
 	duration := time.Duration(window.Duration) * unit
 	if duration <= 0 {
 		return 0, "", false
+	}
+	if duration == 7*24*time.Hour {
+		return int64(duration / time.Second), "weekly", true
 	}
 	label := duration.String()
 	if duration%(7*24*time.Hour) == 0 {
