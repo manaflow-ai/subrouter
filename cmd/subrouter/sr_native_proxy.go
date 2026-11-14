@@ -90,8 +90,8 @@ var (
 		route: "kimi", provider: accounts.ProviderKimi,
 	}
 	qwenNativeProxy = nativeProxySpec{
-		command: "qwen", display: "Qwen", agent: "qwen-token",
-		route: "qwen-token", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey,
+		command: "qwen", display: "Qwen", agent: "qwen",
+		route: "qwen", provider: accounts.ProviderQwen,
 	}
 )
 
@@ -452,7 +452,7 @@ func nativeProxyResumePickerRequested(spec nativeProxySpec, args []string) bool 
 	switch spec.provider {
 	case accounts.ProviderKimi:
 		pickerFlags = []string{"-S", "--session", "-r", "--resume"}
-	case accounts.ProviderQwenToken:
+	case accounts.ProviderQwen, accounts.ProviderQwenToken:
 		pickerFlags = []string{"-r", "--resume"}
 	default:
 		return false
@@ -641,7 +641,7 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	launchArgs := args
 	if spec.provider == accounts.ProviderKimi {
 		launchArgs = kimiNativeProxyArgs(args)
-	} else if spec.provider == accounts.ProviderQwenToken {
+	} else if spec.provider.Family() == accounts.ProviderQwen {
 		model, modelErr := qwenProxyModel(args)
 		if modelErr != nil {
 			return modelErr
@@ -677,7 +677,7 @@ func nativeProxyNeedsAccountInventory(options nativeProxyLaunchOptions) bool {
 }
 
 func nativeProxyBrokerLeaseSupported(spec nativeProxySpec) bool {
-	return spec.provider == accounts.ProviderQwenToken && spec.authMode == accounts.AuthModeAPIKey
+	return spec.provider.Family() == accounts.ProviderQwen
 }
 
 func nativeProxyServerToken(server srServerConfig, remote bool) (string, error) {
@@ -884,12 +884,12 @@ func nativeProxyTeamAccounts(ctx context.Context, config broker.Config, spec nat
 	}
 	eligible := make([]remoteServerAccount, 0, len(shared))
 	for _, item := range shared {
-		if item.Kind != string(spec.provider) {
+		if item.Kind != string(spec.provider) && !(spec.provider == accounts.ProviderQwen && accounts.Provider(item.Kind).Family() == accounts.ProviderQwen) {
 			continue
 		}
 		account := remoteServerAccount{
 			ID:       strings.TrimSpace(item.ID),
-			Provider: spec.provider,
+			Provider: accounts.Provider(item.Kind),
 			AuthMode: spec.authMode,
 			Label:    strings.TrimSpace(item.Label),
 			Email:    strings.TrimSpace(item.Email),
@@ -915,7 +915,7 @@ func (r srRunner) requireNativeProxyAccount(ctx context.Context, server srServer
 }
 
 func nativeProxyAccountEligible(spec nativeProxySpec, account remoteServerAccount) bool {
-	if account.Provider != spec.provider {
+	if account.Provider != spec.provider && !(spec.provider == accounts.ProviderQwen && account.Provider.Family() == spec.provider) {
 		return false
 	}
 	if spec.authMode != "" && account.AuthMode != spec.authMode {
@@ -950,6 +950,13 @@ func nativeProxyAccountSelectorValues(spec nativeProxySpec, account remoteServer
 	values := []string{id, strings.TrimSpace(account.Label), strings.TrimSpace(account.Email)}
 	if prefix := string(spec.provider) + ":"; strings.HasPrefix(strings.ToLower(id), strings.ToLower(prefix)) {
 		values = append(values, strings.TrimSpace(id[len(prefix):]))
+	}
+	if spec.provider == accounts.ProviderQwen {
+		for _, prefix := range []string{"qwen-token:", "qwen-subscription:"} {
+			if strings.HasPrefix(strings.ToLower(id), prefix) {
+				values = append(values, strings.TrimSpace(id[len(prefix):]))
+			}
+		}
 	}
 	if spec.provider == accounts.ProviderKimi {
 		const managedPrefix = "kimi-subscription:"
@@ -1511,7 +1518,7 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 			env = upsertEnv(env, key, value)
 		}
 		return env, cleanup, nil
-	case accounts.ProviderQwenToken:
+	case accounts.ProviderQwen, accounts.ProviderQwenToken:
 		model, err := qwenProxyModel(args)
 		if err != nil {
 			return nil, func() error { return nil }, err
@@ -1862,10 +1869,10 @@ func prepareQwenProxyOverlay(baseURL, model string, environ []string) (qwenProxy
 	}
 	routedModel := map[string]any{
 		"id":      model,
-		"name":    "Qwen Token Plan via Subrouter",
+		"name":    "Qwen via Subrouter",
 		"baseUrl": baseURL,
 		"generationConfig": map[string]any{
-			"customHeaders": map[string]string{"X-Subrouter-Agent": "qwen-token"},
+			"customHeaders": map[string]string{"X-Subrouter-Agent": "qwen"},
 		},
 	}
 	modelProviders := map[string]any{

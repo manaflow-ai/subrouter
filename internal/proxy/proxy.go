@@ -6200,7 +6200,7 @@ func (s Server) proxyHandler() http.Handler {
 				path:      r.URL.Path,
 				poolModel: retryPoolModel,
 				account: accounts.Account{
-					ID: account.ID, Provider: requestProvider, CredentialVersion: account.CredentialIdentity(),
+					ID: account.ID, Provider: account.Provider, AuthMode: account.AuthMode, CredentialVersion: account.CredentialIdentity(),
 				},
 				// One retry budget per client request, shared by every layer. It
 				// is required even without a fallback: otherwise each outer POST
@@ -6287,7 +6287,7 @@ func (s Server) proxyHandler() http.Handler {
 				}
 			}
 			transport = layers.build(transport, attempt)
-			if !noRetry && requestProvider == accounts.ProviderQwenOAuth && !installUsageFailover && s.CredentialBroker == nil {
+			if !noRetry && account.Provider == accounts.ProviderQwenOAuth && !installUsageFailover && s.CredentialBroker == nil {
 				transport = qwenSubscriptionRepairTransport{base: transport, server: &s, account: account, attempt: attempt}
 			}
 			if autonomousRetry && (requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude) {
@@ -6312,11 +6312,11 @@ func (s Server) proxyHandler() http.Handler {
 					session:   sessionID,
 					path:      r.URL.Path,
 					poolModel: requestPoolModel,
-					account:   accounts.Account{ID: account.ID, Provider: requestProvider},
+					account:   accounts.Account{ID: account.ID, Provider: account.Provider},
 				},
 			}
 		}
-		if !noRetry && requestProvider == accounts.ProviderQwenOAuth && r.Method == http.MethodGet && s.CredentialBroker == nil {
+		if !noRetry && account.Provider == accounts.ProviderQwenOAuth && r.Method == http.MethodGet && s.CredentialBroker == nil {
 			transport = qwenSubscriptionRepairTransport{base: transport, server: &s, account: account}
 		}
 		rp.Transport = transport
@@ -6424,7 +6424,7 @@ func (s Server) proxyHandler() http.Handler {
 				placementReservation.Commit()
 				placementReservation = nil
 			} else {
-				s.SchedulerRef.NoteRouted(schedulerAccountProvider(requestProvider), account.ID)
+				s.SchedulerRef.NoteRouted(schedulerAccountProvider(account.Provider), account.ID)
 			}
 		}
 		if s.Logger != nil {
@@ -9103,7 +9103,11 @@ func (s Server) pathForUpstream(path string, account accounts.Account) string {
 		return path
 	}
 	if entry, ok := keyedProviderFor(account.Provider); ok {
-		path = stripProviderPathPrefix(path, entry.PathPrefix)
+		if account.Provider.Family() == accounts.ProviderQwen && firstPathSegment(path) == "qwen" {
+			path = stripProviderPathPrefix(path, "qwen")
+		} else {
+			path = stripProviderPathPrefix(path, entry.PathPrefix)
+		}
 		if entry.CollapseVersionSegment {
 			return collapseDuplicateVersionSegment(path, entry.Upstream(s, account.AuthMode))
 		}
@@ -10257,6 +10261,12 @@ func filterAccountsForProvider(all []accounts.Account, provider accounts.Provide
 	filtered := make([]accounts.Account, 0, len(all))
 	legacy := make([]accounts.Account, 0)
 	for _, account := range all {
+		if provider == accounts.ProviderQwen && account.Provider.Family() == accounts.ProviderQwen {
+			// Preserve the selected backend for credentials, quota and upstream.
+			account.Provider = accountProviderFor(account.Provider)
+			filtered = append(filtered, account)
+			continue
+		}
 		if account.Provider != "" && accountProviderFor(account.Provider) == credentialProvider {
 			account.Provider = provider
 			filtered = append(filtered, account)
@@ -10406,7 +10416,7 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	}
 	// Stale quota scores are retryable for Codex, but explicit account
 	// exclusions are authoritative and must never be bypassed by that policy.
-	if provider == accounts.ProviderCodex && s.SchedulerRef != nil {
+	if (provider == accounts.ProviderCodex || provider == accounts.ProviderQwen) && s.SchedulerRef != nil {
 		eligible := untried[:0]
 		for _, account := range untried {
 			_, allowed := s.SchedulerRef.RunIfAccountNotExplicitlyBlocked(
@@ -10989,6 +10999,10 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 		}
 	}
 	switch t.provider {
+	case accounts.ProviderQwen, accounts.ProviderQwenOAuth, accounts.ProviderQwenToken:
+		if response.StatusCode == http.StatusBadGateway || response.StatusCode == http.StatusServiceUnavailable || response.StatusCode == http.StatusGatewayTimeout {
+			return true, false, false, nil
+		}
 	case accounts.ProviderDeepSeek:
 		// DeepSeek documents 402 as exhausted balance and 429 as a transient
 		// request-rate limit. Both may use an alternate key for this replay, but
@@ -11393,6 +11407,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	a := t.attempt
 	attemptReq := req
 	accountID := t.account
+	accountProvider := t.provider
+	if selected := a.current(); selected.ID == accountID {
+		accountProvider = selected.Provider
+	}
 	accountCredential := t.accountCredential
 	tried := map[string]struct{}{}
 	if selected := a.current(); selected.ID != "" && selected.ID != accountID {
@@ -11403,6 +11421,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			tried[accountID] = struct{}{}
 		}
 		accountID = selected.ID
+		accountProvider = selected.Provider
 		accountCredential = selected.CredentialVersion
 	}
 	// Native AGY includes the project selected by the local CLI in every
@@ -11519,7 +11538,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// instead of repeating the denied upstream request.
 		if a.replayable() && t.server != nil && t.server.SchedulerRef != nil {
 			if _, blocked := t.server.SchedulerRef.ExplicitBlockedUntilFor(
-				schedulerAccountProvider(t.provider), accountID, t.poolModel, time.Now(),
+				schedulerAccountProvider(accountProvider), accountID, t.poolModel, time.Now(),
 			); blocked {
 				tried[accountID] = struct{}{}
 				var next accounts.Account
@@ -11540,6 +11559,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 					return nil, replayErr
 				}
 				accountID = next.ID
+				accountProvider = next.Provider
 				accountCredential = next.CredentialIdentity()
 				tried[accountID] = struct{}{}
 				attemptReq = nextReq
@@ -11563,6 +11583,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				return nil, replayErr
 			}
 			accountID = next.ID
+			accountProvider = next.Provider
 			accountCredential = next.CredentialIdentity()
 			tried[accountID] = struct{}{}
 			attemptReq = nextReq
@@ -11598,12 +11619,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 					spilledFrom = accountID
 				}
 				accountID = next.ID
+				accountProvider = next.Provider
 				accountCredential = next.CredentialIdentity()
 				tried[accountID] = struct{}{}
 				attemptReq = nextReq
 			}
 		}
-		addressed := accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential}
+		addressed := accounts.Account{ID: accountID, Provider: accountProvider, CredentialVersion: accountCredential}
 		response, err := a.send(base, attemptReq, addressed)
 		response = tagRoutedResponseAccount(response, addressed)
 		// The admission limiter turned this account away before any upstream
@@ -11656,6 +11678,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 						failoverReason = accountMoveCapacity
 					}
 					accountID = next.ID
+					accountProvider = next.Provider
 					accountCredential = next.CredentialIdentity()
 					tried[accountID] = struct{}{}
 					attemptReq = nextReq
@@ -11666,13 +11689,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if err != nil || !a.replayable() || req.Context().Err() != nil {
 			return response, tagRoutedAttemptError(err, attemptReq, addressed)
 		}
-		if response != nil && response.StatusCode == http.StatusUnauthorized && t.provider == accounts.ProviderQwenOAuth && t.server != nil && t.server.AccountRef != nil && !qwenAuthRetried[accountID] {
+		if response != nil && response.StatusCode == http.StatusUnauthorized && accountProvider == accounts.ProviderQwenOAuth && t.server != nil && t.server.AccountRef != nil && !qwenAuthRetried[accountID] {
 			if qwenAuthRetried == nil {
 				qwenAuthRetried = make(map[string]bool)
 			}
 			qwenAuthRetried[accountID] = true
 			if store, ok := t.server.AccountRef.qwenSubscriptionStore(); ok {
-				rejected := accounts.Account{ID: accountID, Provider: t.provider, AuthMode: accounts.AuthModeOAuth, CredentialVersion: accountCredential}
+				rejected := accounts.Account{ID: accountID, Provider: accountProvider, AuthMode: accounts.AuthModeOAuth, CredentialVersion: accountCredential}
 				if repaired, refreshErr := store.RefreshRejectedAccount(req.Context(), t.server.AccountRef.client, rejected); refreshErr == nil && repaired.CredentialIdentity() != accountCredential {
 					repaired, publishErr := t.server.AccountRef.publishQwenSubscriptionAccount(req.Context(), repaired)
 					if publishErr == nil {
@@ -11754,12 +11777,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 						overloadRerouted = true
 						failoverReason = accountMoveOverload
 						claudeHold.markRerouted()
-						t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(t.provider), accountID, selectacct.FailoverCapacity)
+						t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(accountProvider), accountID, selectacct.FailoverCapacity)
 						accountID = next.ID
+						accountProvider = next.Provider
 						accountCredential = next.CredentialIdentity()
 						tried[accountID] = struct{}{}
 						if t.server.SchedulerRef != nil {
-							t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
+							t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(accountProvider), accountID)
 						}
 						attemptReq = nextReq
 						continue
@@ -11876,6 +11900,8 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			modelUnsupported, inspectErr = responseCodexChatGPTModelUnsupported(response)
 		case accounts.ProviderKimi:
 			modelUnsupported, inspectErr = responseKimiModelCapabilityFailure(response)
+		case accounts.ProviderQwen, accounts.ProviderQwenOAuth, accounts.ProviderQwenToken:
+			modelUnsupported, inspectErr = responseQwenModelCapabilityFailure(response)
 		}
 		if inspectErr != nil {
 			if t.logger != nil {
@@ -11913,11 +11939,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 							}
 							markTrafficRetryPath(attemptReq.Context(), "claude_third_party_api_key")
 							accountID = next.ID
+							accountProvider = next.Provider
 							accountCredential = next.CredentialIdentity()
 							markTrafficAccount(attemptReq.Context(), accountID)
 							tried[accountID] = struct{}{}
 							if t.server.SchedulerRef != nil {
-								t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
+								t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(accountProvider), accountID)
 							}
 							quotaFailedOver = true
 							failoverReason = accountMoveCredential
@@ -12105,14 +12132,14 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.server.markClaudeCreditExhausted(accountID)
 		} else if t.server != nil && persistentAuthorizationDenial && !modelUnsupported {
 			t.server.markPersistentAuthorizationDenial(accounts.Account{
-				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
+				ID: accountID, Provider: accountProvider, CredentialVersion: accountCredential,
 			})
 		} else if t.server != nil && credentialFailure && !modelUnsupported {
 			// Bind auth rejection to the exact credential identity captured for
 			// this attempt. A concurrent key rotation must make this late response
 			// harmless rather than cooking the repaired account generation.
 			t.server.markAccountExhaustedCredentialForAccount(accounts.Account{
-				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
+				ID: accountID, Provider: accountProvider, CredentialVersion: accountCredential,
 			})
 		} else if t.server != nil && exhausted && !modelUnsupported {
 			// Use the response's own reset time so the mark self-expires when the
@@ -12120,7 +12147,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// carries resets_in_seconds or a workspace-level reason instead, so
 			// re-read the inspected prefix for the hold-out.
 			t.server.markAccountExhaustedFromResponseBodyForAccount(accounts.Account{
-				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
+				ID: accountID, Provider: accountProvider, CredentialVersion: accountCredential,
 			}, exhaustionPool, response.StatusCode, response.Header, peekResponseBodyPrefix(response))
 		}
 		if claudeTransient429 && claudeTransient429Rerouted {
@@ -12252,9 +12279,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			failoverReason = accountMoveModel
 		}
 		if t.server != nil {
-			t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(t.provider), previousAccount, usageFailoverReason(credentialFailure, modelUnsupported))
+			t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(accountProvider), previousAccount, usageFailoverReason(credentialFailure, modelUnsupported))
 		}
 		accountID = nextAccount.ID
+		accountProvider = nextAccount.Provider
 		accountCredential = nextAccount.CredentialIdentity()
 		markTrafficAccount(attemptReq.Context(), accountID)
 		claudeTransient429Retries = 0
@@ -12262,7 +12290,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if nextReservation != nil {
 			nextReservation.Commit()
 		} else if t.server != nil && t.server.SchedulerRef != nil {
-			t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
+			t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(accountProvider), accountID)
 		}
 		// replay rebuilt the upstream URL and auth for the replacement account.
 		attemptReq = nextReq
@@ -12289,7 +12317,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.logger.Warn("retrying replayable upstream request after usage limit", "agent", t.agent, "session", t.session, "previous_account", previousAccount, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts)
 		}
 	}
-	addressed := accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential}
+	addressed := accounts.Account{ID: accountID, Provider: accountProvider, CredentialVersion: accountCredential}
 	response, err := a.send(base, attemptReq, addressed)
 	return tagRoutedResponseAccount(response, addressed), err
 }
@@ -12944,7 +12972,7 @@ func isTerminalCredentialError(err error) bool {
 // selected account regardless of how that account's credential is represented.
 func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, model string, tried map[string]struct{}) (accounts.Account, error) {
 	if model != "" && s.SchedulerRef != nil {
-		s.SchedulerRef.MarkModelIncompatible(provider, accountID, model)
+		s.SchedulerRef.MarkModelIncompatible(s.selectedAccountProvider(ctx, provider, accountID), accountID, model)
 	}
 	if tried == nil {
 		tried = make(map[string]struct{}, 1)
@@ -13053,7 +13081,7 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 			// attempts on accounts the controller has explicitly held out after an
 			// authoritative 429/401; keep an unmarked account available for the
 			// bounded optimistic failover path.
-			if provider == accounts.ProviderClaude && s.SchedulerRef != nil {
+			if (provider == accounts.ProviderClaude || provider == accounts.ProviderQwen) && s.SchedulerRef != nil {
 				now := time.Now()
 				eligible := candidates[:0]
 				for _, candidate := range candidates {

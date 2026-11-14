@@ -5010,7 +5010,7 @@ func TestUsageRowsGroupByTheirOwnProvider(t *testing.T) {
 		{provider: "", wantLabel: "Codex accounts", wantPlan: "api key"},
 		{provider: accounts.ProviderClaude, wantLabel: "Claude profiles", wantPlan: "claude key"},
 		{provider: accounts.ProviderQwenToken, wantLabel: "Qwen accounts", wantPlan: "qwen-token key"},
-		{provider: accounts.ProviderQwenAnthropic, wantLabel: "Qwen-anthropic accounts", wantPlan: "qwen-anthropic key"},
+		{provider: accounts.ProviderQwenAnthropic, wantLabel: "Qwen accounts", wantPlan: "qwen-anthropic key"},
 		{provider: accounts.ProviderGrok, wantLabel: "Grok accounts", wantPlan: "grok key"},
 	}
 	for _, tc := range cases {

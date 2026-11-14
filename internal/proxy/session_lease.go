@@ -508,9 +508,6 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	provider, model, err := sessionLeaseProvider(request.Provider, request.Model)
-	if err == nil && isBareQwenInference(request.Provider, request.Model, provider) {
-		provider = bareQwenProviderForAccounts(provider, s.accountListContext(r.Context()))
-	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -716,7 +713,8 @@ func (lease sessionLease) allowsRequest(r *http.Request) bool {
 
 func (lease sessionLease) allowsAccount(account accounts.Account) bool {
 	return account.ID == lease.AccountID &&
-		accountProviderOrCodex(account) == lease.Provider &&
+		(accountProviderOrCodex(account) == lease.Provider ||
+			(lease.Provider == accounts.ProviderQwen && account.Provider.Family() == accounts.ProviderQwen)) &&
 		account.AuthMode == lease.AuthMode
 }
 
@@ -1045,40 +1043,6 @@ func sessionLeaseProvider(providerValue, modelValue string) (accounts.Provider, 
 		}
 	}
 	return provider, model, nil
-}
-
-// sessionLeaseProviderForAccounts keeps bare-model inference useful when an
-// installation has only Qwen Token Plan credentials. Coding Plan and Token
-// Plan are independent subscriptions, so an explicit provider is never
-// redirected and Coding Plan remains the deterministic choice when both pools
-// exist. qwen-anthropic is a protocol view of the Token Plan pool and therefore
-// counts as Token Plan availability rather than a third credential pool.
-func sessionLeaseProviderForAccounts(providerValue, modelValue string, pool []accounts.Account) (accounts.Provider, string, error) {
-	provider, model, err := sessionLeaseProvider(providerValue, modelValue)
-	if err != nil || !isBareQwenInference(providerValue, modelValue, provider) {
-		return provider, model, err
-	}
-	return bareQwenProviderForAccounts(provider, pool), model, nil
-}
-
-func isBareQwenInference(providerValue, modelValue string, provider accounts.Provider) bool {
-	return strings.TrimSpace(providerValue) == "" && !strings.Contains(modelValue, "/") && provider == accounts.ProviderQwen
-}
-
-func bareQwenProviderForAccounts(fallback accounts.Provider, pool []accounts.Account) accounts.Provider {
-	var hasCodingPlan, hasTokenPlan bool
-	for _, account := range pool {
-		switch accountProviderFor(accountProviderOrCodex(account)) {
-		case accounts.ProviderQwen:
-			hasCodingPlan = true
-		case accounts.ProviderQwenToken:
-			hasTokenPlan = true
-		}
-	}
-	if !hasCodingPlan && hasTokenPlan {
-		return accounts.ProviderQwenToken
-	}
-	return fallback
 }
 
 func parseSessionLeaseProvider(providerName string) (accounts.Provider, error) {

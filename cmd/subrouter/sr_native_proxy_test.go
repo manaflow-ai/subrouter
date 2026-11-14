@@ -149,7 +149,7 @@ func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testi
 	for _, forbidden := range []string{
 		"http://" + relay.listener.Addr().String() + "/kimi/v1/messages",
 		relay.URL() + "/_subrouter/accounts",
-		relay.URL() + "/qwen-token/v1/chat/completions",
+		relay.URL() + "/qwen/v1/chat/completions",
 	} {
 		response, err := http.Get(forbidden)
 		if err != nil {
@@ -215,7 +215,7 @@ func TestNativeProxyRelayInjectsOnlyValidatedPinnedAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer relay.Close()
-	request, err := http.NewRequest(http.MethodPost, relay.URL()+"/qwen-token/v1/chat/completions", strings.NewReader(`{}`))
+	request, err := http.NewRequest(http.MethodPost, relay.URL()+"/qwen/v1/chat/completions", strings.NewReader(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +233,7 @@ func TestNativeProxyRelayInjectsOnlyValidatedPinnedAccount(t *testing.T) {
 	if authorization := got.Header.Get("Authorization"); authorization != "Bearer router-token" {
 		t.Fatalf("router authorization = %q", authorization)
 	}
-	if got.Header.Get("X-Subrouter-Agent") != "qwen-token" || got.Header.Get("X-Subrouter-Session") != "pinned-session" {
+	if got.Header.Get("X-Subrouter-Agent") != "qwen" || got.Header.Get("X-Subrouter-Session") != "pinned-session" {
 		t.Fatalf("routing headers were removed by client hop metadata: agent=%q session=%q", got.Header.Get("X-Subrouter-Agent"), got.Header.Get("X-Subrouter-Session"))
 	}
 	if got.Header.Get("Connection") != "" {
@@ -472,7 +472,7 @@ func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 		case "/_subrouter/accounts":
 			accountRequests.Add(1)
 			_, _ = io.WriteString(w, `[]`)
-		case "/qwen-token/v1/chat/completions":
+		case "/qwen/v1/chat/completions":
 			if got := request.Header.Get("X-Subrouter-Account-ID"); got != "qwen-token:work" {
 				t.Errorf("pinned request account = %q", got)
 			}
@@ -632,12 +632,12 @@ func TestRemoteTenantNativeProxyAuthenticatesPreflightAndRelayWithoutExposingKey
 		case request.Method == http.MethodHead && request.URL.Path == "/t/"+testTenantKey+"/":
 			preflights.Add(1)
 			response.WriteHeader(http.StatusNoContent)
-		case request.Method == http.MethodPost && request.URL.Path == "/t/"+testTenantKey+"/qwen-token/v1/chat/completions":
+		case request.Method == http.MethodPost && request.URL.Path == "/t/"+testTenantKey+"/qwen/v1/chat/completions":
 			if preflights.Load() != 1 {
 				http.Error(response, "routed request arrived before authenticated preflight", http.StatusPreconditionFailed)
 				return
 			}
-			if request.Header.Get("X-Subrouter-Agent") != "qwen-token" || request.Header.Get("X-Subrouter-Session") == "" {
+			if request.Header.Get("X-Subrouter-Agent") != "qwen" || request.Header.Get("X-Subrouter-Session") == "" {
 				http.Error(response, "missing routed session identity", http.StatusBadRequest)
 				return
 			}
@@ -1077,7 +1077,7 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 		"ALL_PROXY=socks5://credential-sink.invalid", "NO_PROXY=vendor.invalid",
 	}
 	qwenRelay := "http://127.0.0.1:43210/private-relay-capability"
-	qwenProviderURL := qwenRelay + "/qwen-token/v1"
+	qwenProviderURL := qwenRelay + "/qwen/v1"
 	qwenEnv, qwenCleanup, err := nativeProxyEnvironment(qwenNativeProxy, qwenRelay, original, []string{"--model", "qwen-test-model"})
 	if err != nil {
 		t.Fatal(err)

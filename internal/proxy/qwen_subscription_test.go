@@ -540,8 +540,12 @@ func TestQwenSubscriptionQuotaFailureFailsOverWithinOAuthPool(t *testing.T) {
 }
 
 func TestQwenSubscriptionRepairsOnePreExpiry401BeforeFailover(t *testing.T) {
-	for _, secondStatus := range []int{http.StatusOK, http.StatusUnauthorized} {
-		t.Run(http.StatusText(secondStatus), func(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		path   string
+	}{{200, "/qwen-oauth/v1/chat/completions"}, {401, "/qwen-oauth/v1/chat/completions"}, {200, "/qwen/v1/chat/completions"}, {401, "/qwen/v1/chat/completions"}} {
+		secondStatus := test.status
+		t.Run(test.path+"/"+http.StatusText(secondStatus), func(t *testing.T) {
 			store := qwensubscription.Store{Dir: t.TempDir()}
 			_, err := store.SaveManagedCredential("work", qwensubscription.CredentialInfo{
 				AccessToken: "subscription-access", RefreshToken: "subscription-refresh", ExpiresAt: time.Now().Add(time.Hour),
@@ -577,7 +581,7 @@ func TestQwenSubscriptionRepairsOnePreExpiry401BeforeFailover(t *testing.T) {
 				t.Fatal(err)
 			}
 			server := Server{AccountRef: ref, Sessions: sessions, SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)), QwenOAuthUpstream: mustParseURL(t, upstream.URL+"/v1"), MaxBodyBytes: 4096}
-			req := httptest.NewRequest(http.MethodPost, "/qwen-oauth/v1/chat/completions", strings.NewReader(`{"model":"qwen3.8-max","messages":[]}`))
+			req := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(`{"model":"qwen3.8-max","messages":[]}`))
 			req.Header.Set("X-Subrouter-Session", "repair-session")
 			recorder := httptest.NewRecorder()
 			server.Handler().ServeHTTP(recorder, req)

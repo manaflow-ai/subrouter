@@ -1093,6 +1093,7 @@ func parseAddKeyProviderArgs(command string, errOut io.Writer, args []string) (a
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(errOut)
 	providerRaw := flags.String("provider", string(accounts.ProviderCodex), "API-key provider: "+proxy.APIKeyProviderList())
+	backend := flags.String("backend", "", "Qwen account backend: token-plan or coding-plan")
 	if err := flags.Parse(args); err != nil {
 		return "", err
 	}
@@ -1102,6 +1103,18 @@ func parseAddKeyProviderArgs(command string, errOut io.Writer, args []string) (a
 	provider, err := parseAPIKeyProvider(*providerRaw)
 	if err != nil {
 		return "", err
+	}
+	if *backend != "" {
+		if provider != accounts.ProviderQwen {
+			return "", fmt.Errorf("--backend requires --provider qwen")
+		}
+		switch strings.ToLower(strings.TrimSpace(*backend)) {
+		case "token-plan":
+			provider = accounts.ProviderQwenToken
+		case "coding-plan":
+		default:
+			return "", fmt.Errorf("unsupported Qwen backend %q; use token-plan or coding-plan", *backend)
+		}
 	}
 	return provider, nil
 }
@@ -3022,7 +3035,7 @@ func usageProviderLabel(row srUsageRow) string {
 		return "Codex accounts"
 	case accounts.ProviderClaude:
 		return "Claude profiles"
-	case accounts.ProviderQwenToken:
+	case accounts.ProviderQwen, accounts.ProviderQwenToken, accounts.ProviderQwenOAuth, accounts.ProviderQwenAnthropic:
 		return "Qwen accounts"
 	default:
 		return providerDisplayName(usageProvider(row)) + " accounts"
@@ -3902,6 +3915,9 @@ func isAntigravityLegacyFamilyWindow(window accounts.UsageWindow, family string)
 }
 
 func usageGridPlan(row srUsageRow) string {
+	if usageProvider(row) == accounts.ProviderQwenOAuth {
+		return strings.TrimSpace("Qwen.ai " + row.planType)
+	}
 	if usageProvider(row) == accounts.ProviderQwenToken {
 		plan := strings.TrimSpace(row.planType)
 		if plan == "" || strings.HasPrefix(strings.ToLower(plan), "token plan") {

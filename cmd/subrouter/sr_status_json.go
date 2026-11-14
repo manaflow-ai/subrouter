@@ -51,6 +51,7 @@ type srStatusProviderJSON struct {
 }
 
 type srStatusAccountJSON struct {
+	Backend        string   `json:"backend,omitempty"`
 	ID             string   `json:"id"`
 	Label          string   `json:"label"`
 	Provider       string   `json:"provider"`
@@ -242,7 +243,8 @@ func srStatusAccountFromRow(row srUsageRow, now time.Time) srStatusAccountJSON {
 	return srStatusAccountJSON{
 		ID:             id,
 		Label:          displayUsageAccountName(row),
-		Provider:       string(usageProvider(row)),
+		Provider:       string(usageProvider(row).Family()),
+		Backend:        usageProvider(row).Backend(),
 		Plan:           srStatusPlan(row),
 		State:          srStatusAccountState(row),
 		SessionLeftPct: srStatusLeftPct(session),

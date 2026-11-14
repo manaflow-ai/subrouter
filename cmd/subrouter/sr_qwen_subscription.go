@@ -17,7 +17,8 @@ const qwenSubscriptionHelp = `Qwen.ai Plus/Pro subscriptions:
 
 Accounts are stored on the selected router. Login authorizes an independent
 OAuth grant without changing the plain Qwen CLI login. OpenAI-compatible
-clients use <router-url>/qwen-oauth/v1 with the router's proxy token.
+clients use <router-url>/qwen/v1 with the router's proxy token.
+Use /qwen-oauth/v1 to restrict requests to subscription accounts.
 Alibaba plan keys and sr qwen login remain separate.
 `
 

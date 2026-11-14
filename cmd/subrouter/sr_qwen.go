@@ -31,9 +31,12 @@ func (r srRunner) qwen(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
 		fmt.Fprint(r.out, `Qwen.ai Plus/Pro: sr qwen subscription login <label>
 
-Qwen Token Plan accounts use the standard provider account lifecycle:
-  sr add-key --provider qwen-token
+Qwen accounts use one routed pool with separate backend credentials:
+  sr add-key --provider qwen --backend token-plan
                            Add a Token Plan API-key account
+                           Alias: sr add-key --provider qwen-token
+  sr add-key --provider qwen --backend coding-plan
+                           Add a Coding Plan API-key account
   sr status                List accounts and show available plan/quota status
   sr remove <account>      Remove a Token Plan account
 
@@ -43,7 +46,7 @@ Qwen console commands attach plan and quota metadata to an existing account:
   sr qwen label <account> <email-or-label>
                            Set the saved sign-in label shown by sr status
   sr qwen [--account [account]] [-- qwen args...]
-                           Launch Qwen Code through the selected Token Plan pool
+                           Launch Qwen Code through the selected Qwen pool
                            Omit --account for failover; a pin has no account failover
   sr qwen proxy [qwen args...]
                            Backward-compatible explicit launcher alias
