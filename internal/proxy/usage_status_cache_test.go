@@ -123,7 +123,9 @@ func TestUsageStatusesFreshSharesConcurrentSweep(t *testing.T) {
 	go func() { first <- ref.UsageStatusesFresh(context.Background()) }()
 	<-transport.started
 	second := make(chan []AccountUsageStatus, 1)
-	go func() { second <- ref.UsageStatusesFresh(context.Background()) }()
+	joined := &usageSweepJoinedContext{Context: context.Background(), joined: make(chan struct{})}
+	go func() { second <- ref.UsageStatusesFresh(joined) }()
+	<-joined.joined
 	close(transport.release)
 	if got := <-first; len(got) != 1 {
 		t.Fatalf("first fresh sweep returned %d rows, want 1", len(got))
@@ -803,4 +805,16 @@ func TestInvalidatedUsageSweepCannotReviveLastGoodQuota(t *testing.T) {
 	if len(got) != 1 || len(got[0].Windows) != 0 {
 		t.Fatalf("new sweep inherited superseded credential's quota: %+v", got)
 	}
+}
+
+// Done is evaluated after the caller has joined the existing sweep.
+type usageSweepJoinedContext struct {
+	context.Context
+	once   sync.Once
+	joined chan struct{}
+}
+
+func (c *usageSweepJoinedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.joined) })
+	return c.Context.Done()
 }
