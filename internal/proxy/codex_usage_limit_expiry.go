@@ -154,6 +154,12 @@ func (s Server) markAccountExhaustedFromResponseBodyForAccount(account accounts.
 	if s.SchedulerRef == nil {
 		return
 	}
+	if account.Provider.Family() == accounts.ProviderQwen {
+		if until, ok := qwenQuotaExpiry(body, time.Now()); ok {
+			s.SchedulerRef.MarkExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, "", until)
+			return
+		}
+	}
 	if account.Provider == accounts.ProviderCodex && status != 401 && status != 403 {
 		if until, ok := codexUsageLimitExpiry(body, time.Now()); ok {
 			s.logCodexUsageLimitHoldout(account.ID, poolKey, body, until)

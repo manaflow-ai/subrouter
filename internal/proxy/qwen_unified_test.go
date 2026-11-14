@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,9 +17,10 @@ import (
 )
 
 func TestQwenUnifiedRouteFailover(t *testing.T) {
-	for _, failure := range []int{429, 401, 404, 502, 503, 504} {
+	for _, failure := range []int{402, 429, 401, 404, 502, 503, 504} {
 		t.Run(http.StatusText(failure), func(t *testing.T) {
 			var oauthCalls, tokenCalls atomic.Int32
+			reset := time.Now().Add(7 * 24 * time.Hour).Truncate(time.Second)
 			oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				oauthCalls.Add(1)
 				if r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer oauth-key" {
@@ -26,7 +28,9 @@ func TestQwenUnifiedRouteFailover(t *testing.T) {
 				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(failure)
-				if failure == 404 {
+				if failure == 402 {
+					fmt.Fprintf(w, `{"error":{"type":"billing_error","code":"insufficient_quota","message":"insufficient credits: top up and retry","quota":{"member_type":"pro","reset_at":%d}}}`, reset.Unix())
+				} else if failure == 404 {
 					io.WriteString(w, `{"error":{"code":"model_not_found","message":"Model unavailable"}}`)
 				} else {
 					io.WriteString(w, `{"error":{"message":"quota or credential rejected"}}`)
@@ -66,7 +70,13 @@ func TestQwenUnifiedRouteFailover(t *testing.T) {
 				t.Fatalf("assignment=%+v, found=%v", assignment, ok)
 			}
 			scheduler := s.SchedulerRef.Get()
-			if (failure == 401 || failure == 429) && !scheduler.Exhausted(accounts.ProviderQwenOAuth, rows[0].ID) {
+			if failure == 402 {
+				until, blocked := s.SchedulerRef.BlockedUntilFor(accounts.ProviderQwenOAuth, rows[0].ID, "", time.Now())
+				if !blocked || !until.Equal(reset) {
+					t.Fatalf("quota reset lost: until=%v blocked=%v want=%v", until, blocked, reset)
+				}
+			}
+			if (failure == 401 || failure == 402 || failure == 429) && !scheduler.Exhausted(accounts.ProviderQwenOAuth, rows[0].ID) {
 				t.Fatal("failure was not charged to subscription backend")
 			}
 			if scheduler.Exhausted(accounts.ProviderQwenToken, rows[1].ID) {
@@ -162,6 +172,7 @@ func TestQwenUnifiedDoesNotReplayClientErrorsOrPartialStreams(t *testing.T) {
 		status            int
 		contentType, body string
 	}{
+		{"unclassified billing", 402, "application/json", `{"error":{"code":"payment_method_required"}}`},
 		{"parameters", 400, "application/json", `{"error":{"code":"invalid_parameter","message":"invalid temperature"}}`},
 		{"context", 400, "application/json", `{"error":{"code":"context_length_exceeded"}}`},
 		{"partial stream", 200, "text/event-stream", "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"error\":{\"code\":\"insufficient_quota\"}}\n\n"},

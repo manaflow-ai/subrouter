@@ -8756,7 +8756,7 @@ func (s Server) captureResponseBodyForRequest(response *http.Response, clientCtx
 			if inspectCredentialFailure && credentialUnauthorizedJSON(body) {
 				s.markAccountExhaustedCredentialForAccount(account)
 			}
-			if inspectUsageLimit && usageLimitJSON(body) {
+			if inspectUsageLimit && (usageLimitJSON(body) || (provider.Family() == accounts.ProviderQwen && qwenQuotaFailureJSON(body))) {
 				// Use the response's headers so a header-derived reset expiry set
 				// above is recomputed identically, not overwritten with the short
 				// default TTL. A Codex body that names its own reset or a
@@ -11002,6 +11002,9 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 	case accounts.ProviderQwen, accounts.ProviderQwenOAuth, accounts.ProviderQwenToken:
 		if response.StatusCode == http.StatusBadGateway || response.StatusCode == http.StatusServiceUnavailable || response.StatusCode == http.StatusGatewayTimeout {
 			return true, false, false, nil
+		}
+		if quota, err := responseQwenQuotaFailure(response); err != nil || quota {
+			return quota, quota, false, err
 		}
 	case accounts.ProviderDeepSeek:
 		// DeepSeek documents 402 as exhausted balance and 429 as a transient
