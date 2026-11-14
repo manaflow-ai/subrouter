@@ -141,7 +141,7 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 		input.Provider = string(keyedProvider)
 	}
 	if provider != accounts.ProviderCodex && provider != accounts.ProviderClaude &&
-		provider != accounts.ProviderQwenToken && provider != accounts.ProviderQwenAnthropic {
+		provider.Family() != accounts.ProviderQwen {
 		http.Error(w, "unsupported credential lease provider", http.StatusBadRequest)
 		return
 	}
@@ -203,7 +203,7 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 			return
 		}
 		lease := tenantCredentialLease{
-			accountID: account.ID, provider: schedulerAccountProvider(provider), authMode: account.AuthMode,
+			accountID: account.ID, provider: schedulerAccountProvider(account.Provider), authMode: account.AuthMode,
 			credentialIdentity: account.CredentialIdentity(),
 			agentType:          tenantCredentialLeaseAgentType(input, provider),
 			sessionID:          input.SessionID,
@@ -240,7 +240,7 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 		"teamId": t.ID,
 		"lease": map[string]any{
 			"leaseId": leaseID, "accountId": account.ID,
-			"provider": provider, "authMode": account.AuthMode,
+			"provider": account.Provider, "authMode": account.AuthMode,
 			"token": account.Token, "providerAccountId": account.AccountID,
 			"label": account.Label, "email": account.Email,
 			"credentialGeneration": generation,
@@ -419,7 +419,7 @@ func pickTenantCredentialLeaseAccount(
 	model := tenantCredentialLeasePoolModel(provider, input.Model, baseScheduler)
 	scheduler := baseScheduler.ForModel(model)
 	if server.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(server.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(server.Sessions, candidates...))
 	}
 	// Forced, sticky, and preferred routing never grant permission to reuse a
 	// cooled credential. Filtering must happen first; if every candidate is
@@ -519,6 +519,9 @@ func tenantCredentialLeaseAgentType(
 	if agentType := session.NormalizeAgentType(input.AgentType); agentType != "" {
 		return agentType
 	}
+	if input.Provider == string(accounts.ProviderQwen) {
+		return string(accounts.ProviderQwen)
+	}
 	return string(schedulerAccountProvider(provider))
 }
 
@@ -573,6 +576,7 @@ func normalizeTenantCredentialLeaseReport(
 		// Hosted reports carry no provider headers, so require an HTTP error before
 		// honoring this untrusted signal and constrain it to the issued model pool.
 		validStatus = report.StatusCode == http.StatusTooManyRequests ||
+			(lease.provider.Family() == accounts.ProviderQwen && report.StatusCode == http.StatusPaymentRequired) ||
 			(lease.provider == accounts.ProviderClaude &&
 				report.StatusCode >= http.StatusBadRequest &&
 				report.StatusCode != http.StatusUnauthorized)

@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -50,5 +53,33 @@ func TestQwenBackendEnrollmentAndNativePins(t *testing.T) {
 		if err != nil || !strings.HasSuffix(id, ":"+selector) {
 			t.Fatalf("selector=%s id=%s err=%v", selector, id, err)
 		}
+	}
+}
+
+func TestQwenBackendEnrollmentUsesSelectedServer(t *testing.T) {
+	var uploads int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer import-key" {
+			t.Error("import did not use protected credential")
+		}
+		if r.Method == http.MethodGet {
+			io.WriteString(w, `{"ok":true,"providers":["qwen-token"]}`)
+			return
+		}
+		var body serverAccountImportRequest
+		if json.NewDecoder(r.Body).Decode(&body) != nil || body.Provider != accounts.ProviderQwenToken || body.Codex == nil || body.Codex.Email != "qwen-token:work" {
+			t.Error("wrong backend enrollment")
+		}
+		uploads++
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+	var out bytes.Buffer
+	runner := srRunner{client: server.Client(), in: strings.NewReader("work\nplan-secret\n"), out: &out, errOut: &out}
+	if err := runner.addKeyToServer(t.Context(), srServerConfig{Name: "test", URL: server.URL, AccountImportToken: "import-key"}, []string{"--provider", "qwen", "--backend", "token-plan"}); err != nil {
+		t.Fatal(err)
+	}
+	if uploads != 1 || strings.Contains(out.String(), "plan-secret") {
+		t.Fatal("enrollment missing or credential displayed")
 	}
 }

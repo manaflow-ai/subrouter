@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 )
@@ -219,19 +220,71 @@ func TestQwenUnifiedLeaseBindsActualBackend(t *testing.T) {
 				mode = accounts.AuthModeOAuth
 				id = "qwen-subscription:member"
 			}
-			s := Server{Accounts: []accounts.Account{{ID: id, Provider: provider, AuthMode: mode, Token: "selected-key"}}, Sessions: newSessionStore(t), Scheduler: selectacct.NewScheduler(nil), sessionLeases: newSessionLeaseStore(), AdminToken: "service-admin-token", QwenOAuthUpstream: mustParseURL(t, upstream.URL+"/v1"), QwenTokenUpstream: mustParseURL(t, upstream.URL+"/v1"), MaxBodyBytes: 4096}
+			s := Server{Accounts: []accounts.Account{{ID: id, Provider: provider, AuthMode: mode, Token: "selected-key"}}, Sessions: newSessionStore(t), Scheduler: selectacct.NewScheduler(nil), sessionLeases: newSessionLeaseStore(), AdminToken: "service-admin-token", RequireSessionLease: true, QwenOAuthUpstream: mustParseURL(t, upstream.URL+"/v1"), QwenTokenUpstream: mustParseURL(t, upstream.URL+"/v1"), MaxBodyBytes: 4096}
 			handler := s.Handler()
-			lease, token := issueSessionLease(t, handler, "qwen", "qwen3.8-max")
+			lease, _ := issueSessionLease(t, handler, "qwen", "qwen3.8-max")
+			token := lease.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"]
 			if lease.Assignment.Provider != "qwen" || lease.Assignment.AccountID != id {
 				t.Fatalf("wrong lease assignment: %+v", lease.Assignment)
 			}
 			req := httptest.NewRequest("POST", "/qwen/chat/completions", strings.NewReader(`{"model":"qwen3.8-max","messages":[]}`))
 			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
 			rec := httptest.NewRecorder()
 			handler.ServeHTTP(rec, req)
 			if rec.Code != 200 || calls.Load() != 1 {
 				t.Fatalf("bound lease HTTP=%d calls=%d body=%s", rec.Code, calls.Load(), rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestQwenUnifiedBrokerLeaseSelectsAndReportsBackend(t *testing.T) {
+	oauth := accounts.Account{ID: "qwen-subscription:member", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth, Token: "member-token"}
+	plan := accounts.Account{ID: "qwen-token:plan", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "plan-key"}
+	server := tenantLeaseTestServer(oauth, plan)
+	server.Sessions = newSessionStore(t)
+	store := newTenantCredentialLeaseStore()
+	client := tenantLeaseTestBrokerClient(t, server, store)
+	input := broker.LeaseRequest{Provider: accounts.ProviderQwen, SessionID: "family-broker", Model: "qwen3.8-max"}
+	first, err := client.Lease(t.Context(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Account.Provider != oauth.Provider || first.Account.ID != oauth.ID {
+		t.Fatalf("first lease did not preserve subscription backend: %+v", first.Account)
+	}
+	if err := client.Report(t.Context(), first.ID, broker.LeaseReport{Outcome: broker.LeaseRateLimited, StatusCode: 402, CooldownScope: broker.LeaseCooldownAccount, RetryAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := client.Lease(t.Context(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Account.Provider != plan.Provider || second.Account.ID != plan.ID {
+		t.Fatalf("reported subscription did not yield to plan backend: %+v", second.Account)
+	}
+}
+
+func TestQwenUnifiedSessionCountsUseBackendIdentity(t *testing.T) {
+	store := newSessionStore(t)
+	pool := []accounts.Account{{ID: "member", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth}, {ID: "plan", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey}, {ID: "member", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}}
+	for _, id := range []string{"member", "plan"} {
+		if _, err := store.Put("qwen", "session-"+id, id, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assigned := SchedulerSessionCounts(store, pool...)
+	active := SchedulerActiveSessionCounts(store, pool...)
+	for _, acct := range pool[:2] {
+		key := selectacct.ScoreKey(acct.Provider, acct.ID)
+		if assigned[key] != 1 || active[key] != 1 {
+			t.Fatalf("backend %s counts assigned=%d active=%d", acct.Provider, assigned[key], active[key])
+		}
+	}
+	server := Server{Accounts: pool, Sessions: store}
+	status := server.withSessionCounts([]AccountUsageStatus{{AccountStatus: AccountStatus{ID: "member", Provider: accounts.ProviderQwenOAuth}}, {AccountStatus: AccountStatus{ID: "plan", Provider: accounts.ProviderQwenToken}}})
+	if status[0].AssignedSessions != 1 || !status[0].Active || status[1].AssignedSessions != 1 {
+		t.Fatalf("status omitted unified sessions: %+v", status)
 	}
 }

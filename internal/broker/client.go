@@ -555,7 +555,7 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 	// A lease is cached and its token sent to the requested provider's
 	// upstream, so a misrouted credential (for example a Claude token for a
 	// Codex request) must never be accepted.
-	if lease.Account.Provider != input.Provider {
+	if lease.Account.Provider != input.Provider && !(input.Provider == account.ProviderQwen && lease.Account.Provider.Family() == account.ProviderQwen && lease.Account.Provider != account.ProviderQwenAnthropic) {
 		return Lease{}, errors.New(
 			"cmux.com returned a credential for a different provider",
 		)
@@ -743,7 +743,7 @@ func parseLease(raw leaseWire) (Lease, error) {
 	}
 	provider := account.Provider(raw.Provider)
 	if provider != account.ProviderCodex && provider != account.ProviderClaude &&
-		provider != account.ProviderQwenToken && provider != account.ProviderQwenAnthropic {
+		provider.Family() != account.ProviderQwen {
 		return Lease{}, errors.New("cmux.com returned an invalid lease provider")
 	}
 	authMode := account.AuthMode(raw.AuthMode)

@@ -40,11 +40,12 @@ func usageFailoverReason(credentialFailure, modelUnsupported bool) selectacct.Fa
 }
 
 func (s Server) placementStats(r *http.Request) selectacct.PlacementStatsSnapshot {
+	pool := s.accountListContext(r.Context())
 	var counts map[string]int
 	if s.Sessions != nil {
-		counts = SchedulerSessionCounts(s.Sessions)
+		counts = SchedulerSessionCounts(s.Sessions, pool...)
 	}
-	return s.SchedulerRef.PlacementStats(counts, SchedulerAccounts(s.accountListContext(r.Context())))
+	return s.SchedulerRef.PlacementStats(counts, SchedulerAccounts(pool))
 }
 
 func (s Server) handlePlacementStats(w http.ResponseWriter, r *http.Request) {

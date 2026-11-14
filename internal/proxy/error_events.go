@@ -605,20 +605,20 @@ func (s Server) accountPoolSnapshot(ctx context.Context, provider accounts.Provi
 	scheduler := s.scheduler()
 	active := map[string]int{}
 	if s.Sessions != nil {
-		active = SchedulerActiveSessionCounts(s.Sessions)
+		active = SchedulerActiveSessionCounts(s.Sessions, candidates...)
 		scheduler = scheduler.WithSessionCounts(active)
 	}
-	scoreProvider := schedulerAccountProvider(provider)
 	inflight := map[string]int{}
 	if s.SchedulerRef != nil {
 		inflight = s.SchedulerRef.InflightCounts()
 	}
 	sessions := map[string]int{}
 	if s.Sessions != nil {
-		sessions = SchedulerSessionCounts(s.Sessions)
+		sessions = SchedulerSessionCounts(s.Sessions, candidates...)
 	}
 	now := time.Now()
 	for _, account := range candidates {
+		scoreProvider := schedulerAccountProvider(account.Provider)
 		score, known := scheduler.KnownScore(scoreProvider, account.ID)
 		key := selectacct.ScoreKey(scoreProvider, account.ID)
 		tier := scheduler.SelectionTier(account)

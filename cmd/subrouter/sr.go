@@ -1954,7 +1954,15 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	sessionsPath := strings.TrimSpace(os.Getenv("SUBROUTER_SESSIONS"))
 	if sessionsPath != "" {
 		if sessionStore, sessionErr := session.NewStore(sessionsPath); sessionErr == nil {
-			counts := proxy.SchedulerSessionCounts(sessionStore)
+			pool := make([]accounts.Account, 0, len(rows))
+			for _, row := range rows {
+				id := row.accountID
+				if id == "" {
+					id = row.email
+				}
+				pool = append(pool, accounts.Account{ID: id, Provider: usageProvider(row)})
+			}
+			counts := proxy.SchedulerSessionCounts(sessionStore, pool...)
 			for i := range rows {
 				if rows[i].authMode == accounts.AuthModeAPIKey ||
 					((rows[i].provider == accounts.ProviderKimi || rows[i].provider == accounts.ProviderQwenOAuth || rows[i].provider == accounts.ProviderGrok) && rows[i].authMode == accounts.AuthModeOAuth) {
