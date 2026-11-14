@@ -156,7 +156,7 @@ func (s Server) markAccountExhaustedFromResponseBodyForAccount(account accounts.
 	}
 	if account.Provider.Family() == accounts.ProviderQwen {
 		if until, ok := qwenQuotaExpiry(body, time.Now()); ok {
-			s.SchedulerRef.MarkExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, "", until)
+			s.markAccountExhaustedCredentialUntilForAccount(account, until)
 			return
 		}
 	}

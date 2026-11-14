@@ -8036,6 +8036,10 @@ func (s Server) markAccountExhaustedCredential(provider accounts.Provider, accou
 }
 
 func (s Server) markAccountExhaustedCredentialForAccount(account accounts.Account) {
+	s.markAccountExhaustedCredentialUntilForAccount(account, time.Now().Add(credentialExhaustionTTL))
+}
+
+func (s Server) markAccountExhaustedCredentialUntilForAccount(account accounts.Account, until time.Time) {
 	if s.SchedulerRef == nil {
 		return
 	}
@@ -8043,7 +8047,7 @@ func (s Server) markAccountExhaustedCredentialForAccount(account accounts.Accoun
 	// generation to advance, so retain the historical TTL-backed behavior.
 	if s.AccountRef == nil {
 		s.SchedulerRef.MarkExhaustedUntil(
-			schedulerAccountProvider(account.Provider), account.ID, "", time.Now().Add(credentialExhaustionTTL),
+			schedulerAccountProvider(account.Provider), account.ID, "", until,
 		)
 		return
 	}
@@ -8060,7 +8064,7 @@ func (s Server) markAccountExhaustedCredentialForAccount(account accounts.Accoun
 		return
 	}
 	s.SchedulerRef.MarkCredentialExhaustedForSnapshot(
-		schedulerAccountProvider(account.Provider), account.ID, account.CredentialIdentity(), time.Now().Add(credentialExhaustionTTL),
+		schedulerAccountProvider(account.Provider), account.ID, account.CredentialIdentity(), until,
 		generation, credentialRevision, SchedulerAccounts(loaded),
 	)
 }

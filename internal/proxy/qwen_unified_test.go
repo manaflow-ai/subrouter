@@ -288,3 +288,23 @@ func TestQwenUnifiedSessionCountsUseBackendIdentity(t *testing.T) {
 		t.Fatalf("status omitted unified sessions: %+v", status)
 	}
 }
+
+func TestQwenQuotaResponseCannotBlockReplacedCredential(t *testing.T) {
+	old := accounts.Account{ID: "qwen-token:plan", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "old-key"}
+	current := old
+	current.Token = "replacement-key"
+	ref := &AccountRef{accounts: []accounts.Account{current}, accountGeneration: 2, credentialRevision: 2}
+	scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	scheduler.SyncAccountCredentials(2, 2, SchedulerAccounts([]accounts.Account{current}))
+	server := Server{AccountRef: ref, SchedulerRef: scheduler}
+	reset := time.Now().Add(7 * 24 * time.Hour).Truncate(time.Second)
+	body := []byte(fmt.Sprintf(`{"error":{"code":"insufficient_quota","quota":{"reset_at":%d}}}`, reset.Unix()))
+	server.markAccountExhaustedFromResponseBodyForAccount(old, "", 402, nil, body)
+	if _, blocked := scheduler.BlockedUntilFor(current.Provider, current.ID, "", time.Now()); blocked {
+		t.Fatal("late old credential response blocked the replacement")
+	}
+	server.markAccountExhaustedFromResponseBodyForAccount(current, "", 402, nil, body)
+	if until, blocked := scheduler.BlockedUntilFor(current.Provider, current.ID, "", time.Now()); !blocked || !until.Equal(reset) {
+		t.Fatal("current quota evidence lost its reset", until, blocked)
+	}
+}

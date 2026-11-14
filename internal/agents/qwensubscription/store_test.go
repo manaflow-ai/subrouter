@@ -251,3 +251,39 @@ func TestQwenSubscriptionImportRejectsMismatchedRefreshIdentity(t *testing.T) {
 		t.Fatal("access token from one owner and refresh token from another were accepted")
 	}
 }
+
+func TestQwenMembershipRepairsRejectedAccessBeforeDemotion(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	acct, err := store.SaveManagedCredential("work", testCredential())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exchanges atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			exchanges.Add(1)
+			io.WriteString(w, `{"access_token":"repaired-access","refresh_token":"repaired-refresh","expires_in":3600}`)
+			return
+		}
+		if r.Header.Get("Authorization") == "Bearer old-access" {
+			w.WriteHeader(401)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer repaired-access" {
+			t.Error("userinfo used the wrong repaired grant")
+		}
+		io.WriteString(w, `{"sub":"qwen-user","email":"verified@example.test","member_type":"pro"}`)
+	}))
+	defer server.Close()
+	oldConfig, oldInfo := oauthConfig, userInfoURL
+	t.Cleanup(func() { oauthConfig, userInfoURL = oldConfig, oldInfo })
+	oauthConfig.TokenURL, userInfoURL = server.URL+"/token", server.URL+"/userinfo"
+	email, plan, windows, err := store.FetchUsageIdentity(t.Context(), server.Client(), acct)
+	if err != nil || email != "verified@example.test" || plan != "pro" || len(windows) != 0 || exchanges.Load() != 1 {
+		t.Fatalf("membership was not repaired: email=%s plan=%s exchanges=%d err=%v", email, plan, exchanges.Load(), err)
+	}
+	saved, ok, err := store.read("work")
+	if err != nil || !ok || saved.RefreshToken != "repaired-refresh" || saved.VerificationPending {
+		t.Fatal("repaired membership grant was not durable")
+	}
+}

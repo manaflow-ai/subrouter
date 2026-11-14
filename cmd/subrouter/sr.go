@@ -3167,7 +3167,7 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 	qwenLongWindow := map[string]bool{}
 	for i := range rows {
 		row := &rows[i]
-		if usageProvider(*row) != accounts.ProviderQwenToken {
+		if usageProvider(*row).Family() != accounts.ProviderQwen {
 			continue
 		}
 		group := usageProviderLabel(*row)
@@ -3182,7 +3182,7 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 		}
 	}
 	for i := range rows {
-		if usageProvider(rows[i]) == accounts.ProviderQwenToken {
+		if usageProvider(rows[i]).Family() == accounts.ProviderQwen {
 			group := usageProviderLabel(rows[i])
 			rows[i].showShortWindow = qwenShortWindow[group]
 			rows[i].showLongWindow = qwenLongWindow[group]
@@ -3510,7 +3510,7 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 			usageGridColumn{Key: "5h", Title: "5h", Width: 12},
 			usageGridColumn{Key: "Weekly", Title: "Weekly", Width: 12},
 		)
-	} else if provider == accounts.ProviderQwenToken && row.authMode == accounts.AuthModeAPIKey {
+	} else if provider.Family() == accounts.ProviderQwen {
 		// Token Plan names are longer than the generic API-key plan labels, while
 		// their Use text is compact. Reserve enough space to show Lite, Standard,
 		// and Pro without truncating the vendor-owned plan identity.

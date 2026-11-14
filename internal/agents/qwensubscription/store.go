@@ -303,6 +303,12 @@ func (s Store) AuthorizeManaged(ctx context.Context, client *http.Client, label 
 	return AttestCredential(ctx, client, credential)
 }
 
+type userinfoHTTPError struct{ Status int }
+
+func (e userinfoHTTPError) Error() string {
+	return fmt.Sprintf("Qwen subscription userinfo returned HTTP %d", e.Status)
+}
+
 // AttestCredential binds an imported grant to Qwen's authenticated userinfo,
 // rather than trusting identity or membership fields supplied by the client.
 func AttestCredential(ctx context.Context, client *http.Client, credential CredentialInfo) (CredentialInfo, error) {
@@ -326,7 +332,7 @@ func AttestCredential(ctx context.Context, client *http.Client, credential Crede
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return CredentialInfo{}, fmt.Errorf("Qwen subscription userinfo returned HTTP %d", res.StatusCode)
+		return CredentialInfo{}, userinfoHTTPError{Status: res.StatusCode}
 	}
 	var profile struct {
 		Subject    string `json:"sub"`
@@ -491,6 +497,22 @@ func (s Store) FetchUsageIdentity(ctx context.Context, client *http.Client, acct
 	}
 	credential.AccessToken = acct.Token
 	verified, err := AttestCredential(ctx, client, credential)
+	var rejected userinfoHTTPError
+	if errors.As(err, &rejected) && rejected.Status == http.StatusUnauthorized {
+		repaired, refreshErr := s.RefreshRejectedAccount(ctx, client, acct)
+		if refreshErr != nil {
+			return "", "", nil, fmt.Errorf("%w (rejected-token recovery failed: %v)", err, refreshErr)
+		}
+		latest, exists, readErr := s.read(strings.TrimPrefix(acct.ID, idPrefix))
+		if readErr != nil {
+			return "", "", nil, readErr
+		}
+		if !exists || latest.VerificationPending || latest.AccessToken != repaired.Token {
+			return "", "", nil, errors.New("Qwen subscription changed during membership recovery")
+		}
+		// RefreshRejectedAccount already verified and durably saved this grant.
+		verified, credential, err = latest, latest, nil
+	}
 	if err != nil {
 		return "", "", nil, err
 	}

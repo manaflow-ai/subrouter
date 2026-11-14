@@ -83,3 +83,16 @@ func TestQwenBackendEnrollmentUsesSelectedServer(t *testing.T) {
 		t.Fatal("enrollment missing or credential displayed")
 	}
 }
+
+func TestQwenSharedTableKeepsPlanQuotaColumns(t *testing.T) {
+	t.Setenv("COLUMNS", "200")
+	reset := time.Now().Add(time.Hour)
+	rows := []srUsageRow{{email: "member", provider: accounts.ProviderQwenOAuth, authMode: accounts.AuthModeOAuth, planType: "pro"}, {email: "plan", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, planType: "Pro", quotaUsageKnown: true, windows: []accounts.UsageWindow{{Name: "5h", UsedPercent: 25, LimitWindowSeconds: 18000, ResetAt: reset}, {Name: "weekly", UsedPercent: 50, LimitWindowSeconds: 604800, ResetAt: reset}}}}
+	var out bytes.Buffer
+	displayUsageRows(&out, rows, false)
+	for _, value := range []string{"5h", "7d", "75%", "50%"} {
+		if !strings.Contains(out.String(), value) {
+			t.Fatalf("shared table hid %q:\n%s", value, out.String())
+		}
+	}
+}
