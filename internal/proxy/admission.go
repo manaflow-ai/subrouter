@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 const (
@@ -683,6 +684,42 @@ func (a *admissionControl) paused(key admissionKey, now time.Time) bool {
 	defer a.mu.Unlock()
 	bucket := a.buckets[key]
 	return bucket != nil && bucket.pausedTil.After(now)
+}
+
+// reconcileClaudeUsage clears only model-pool pauses contradicted by a fresh,
+// positive usage score. Admission pauses are request-time evidence from
+// Anthropic; usage refreshes are the authoritative recovery signal after a
+// credential reset or quota reset. Stale, zero, or account-only scores do not
+// clear a pause, so a genuine upstream rejection remains fail-closed.
+func (a *admissionControl) reconcileClaudeUsage(scores []selectacct.Score, now time.Time) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, score := range scores {
+		if score.Provider != accounts.ProviderClaude || !score.Fresh || score.AccountID == "" {
+			continue
+		}
+		for model, modelScore := range score.ModelScores {
+			if modelScore.Headroom <= 0 || modelScore.WeeklyCooked() {
+				continue
+			}
+			// Scheduler model keys are normalized (claudeopus), while admission
+			// buckets retain the canonical pool name (claude-opus). Match through
+			// ModelKey so a fresh score can clear the actual bucket.
+			for key, bucket := range a.buckets {
+				if key.provider != accounts.ProviderClaude || key.account != score.AccountID ||
+					selectacct.ModelKey(key.model) != model || !bucket.pausedTil.After(now) {
+					continue
+				}
+				bucket.pausedTil = time.Time{}
+				bucket.recoverSlowly = false
+				close(bucket.changed)
+				bucket.changed = make(chan struct{})
+			}
+		}
+	}
 }
 
 func (l *admissionLease) release() {

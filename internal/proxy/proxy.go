@@ -9891,6 +9891,9 @@ func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []a
 		}
 		return
 	}
+	if s.admission != nil {
+		s.admission.reconcileClaudeUsage(scores, time.Now())
+	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))

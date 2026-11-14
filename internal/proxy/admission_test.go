@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 func testAdmissionControl(limit, queueCap int) *admissionControl {
@@ -95,6 +96,49 @@ func TestAdmissionPauseUsesClaudeQuotaReset(t *testing.T) {
 	got, err := time.Parse(time.RFC3339, paused)
 	if err != nil || got.Before(now.Add(90*time.Second)) {
 		t.Fatalf("paused until %q, parse error=%v", paused, err)
+	}
+}
+
+func TestAdmissionClaudeUsageReconcilesExactModelPause(t *testing.T) {
+	control := testAdmissionControl(1, 2)
+	key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus")
+	control.pause(key, time.Now().Add(time.Hour))
+	control.reconcileClaudeUsage([]selectacct.Score{{
+		AccountID: "account-a", Provider: accounts.ProviderClaude, Fresh: true,
+		ModelScores: map[string]selectacct.Score{
+			"claudeopus": {Headroom: 0.97, WeeklyHeadroom: 0.97, WeeklyHeadroomKnown: true},
+		},
+	}}, time.Now())
+	lease, err := control.acquire(context.Background(), key)
+	if err != nil {
+		t.Fatalf("fresh positive Opus usage did not clear pause: %v", err)
+	}
+	lease.release()
+}
+
+func TestAdmissionClaudeUsageDoesNotClearStaleOrOtherModelPause(t *testing.T) {
+	control := testAdmissionControl(1, 2)
+	opus := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus")
+	control.pause(opus, time.Now().Add(time.Hour))
+	control.reconcileClaudeUsage([]selectacct.Score{{
+		AccountID: "account-a", Provider: accounts.ProviderClaude,
+		// A stale score and a fresh Sonnet score must not clear Opus.
+		ModelScores: map[string]selectacct.Score{
+			"claudeopus":    {Headroom: 0.97, WeeklyHeadroom: 0.97, WeeklyHeadroomKnown: true},
+			"claude-sonnet": {Headroom: 0.97, WeeklyHeadroom: 0.97, WeeklyHeadroomKnown: true},
+		},
+	}}, time.Now())
+	if _, err := control.acquire(context.Background(), opus); !errors.Is(err, errAdmissionPaused) {
+		t.Fatalf("stale/other-model score cleared Opus pause: %v", err)
+	}
+	control.reconcileClaudeUsage([]selectacct.Score{{
+		AccountID: "account-a", Provider: accounts.ProviderClaude, Fresh: true,
+		ModelScores: map[string]selectacct.Score{
+			"claudeopus": {Headroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true},
+		},
+	}}, time.Now())
+	if _, err := control.acquire(context.Background(), opus); !errors.Is(err, errAdmissionPaused) {
+		t.Fatalf("zero fresh Opus score cleared genuine pause: %v", err)
 	}
 }
 
