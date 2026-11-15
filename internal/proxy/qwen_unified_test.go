@@ -308,3 +308,70 @@ func TestQwenQuotaResponseCannotBlockReplacedCredential(t *testing.T) {
 		t.Fatal("current quota evidence lost its reset", until, blocked)
 	}
 }
+
+func TestQwenSubscriptionQuotaHoldSurvivesRoutineCredentialRotation(t *testing.T) {
+	account := accounts.Account{ID: "qwen-subscription:member", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth, AccountID: "membership", Token: "access", CredentialVersion: "grant"}
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{account}, nil)
+	scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	server := Server{AccountRef: ref, SchedulerRef: scheduler}
+	server.accountListSnapshotContext(t.Context())
+	reset := time.Now().Add(7 * 24 * time.Hour).Truncate(time.Second)
+	body := []byte(fmt.Sprintf(`{"error":{"code":"insufficient_quota","quota":{"reset_at":%d}}}`, reset.Unix()))
+	server.markAccountExhaustedFromResponseBodyForAccount(account, "qwen3.8-max", 402, nil, body)
+	rotated := account
+	rotated.Token, rotated.CredentialVersion = "rotated-access", "rotated-grant"
+	ref.replace(rotated)
+	loaded, generation, revision := ref.CredentialSnapshot()
+	if !scheduler.SyncAccountCredentials(generation, revision, SchedulerAccounts(loaded)) {
+		t.Fatal("routine rotation was not synchronized")
+	}
+	if until, blocked := scheduler.BlockedUntilFor(account.Provider, account.ID, "", time.Now()); !blocked || !until.Equal(reset) {
+		t.Fatalf("routine rotation lost quota hold: blocked=%t until=%v", blocked, until)
+	}
+	// A stale or membership-only score cannot prove that paid quota recovered.
+	scheduler.Set(selectacct.NewScheduler([]selectacct.Score{{AccountID: account.ID, Provider: account.Provider, Headroom: 1, ShortHeadroom: 1}}))
+	if _, blocked := scheduler.BlockedUntilFor(account.Provider, account.ID, "", time.Now()); !blocked {
+		t.Fatal("unmeasured membership score cleared quota hold")
+	}
+	// Re-enrolling the label for a different membership must not inherit its hold.
+	replacement := rotated
+	replacement.Token, replacement.CredentialVersion, replacement.AccountID = "replacement-access", "replacement-grant", "different-membership"
+	ref.replace(replacement)
+	loaded, generation, revision = ref.CredentialSnapshot()
+	scheduler.SyncAccountCredentials(generation, revision, SchedulerAccounts(loaded))
+	if _, blocked := scheduler.BlockedUntilFor(account.Provider, account.ID, "", time.Now()); blocked {
+		t.Fatal("replacement membership inherited the previous membership's quota hold")
+	}
+	// Restore current quota evidence so a measured recovery can supersede it.
+	server.markAccountExhaustedFromResponseBodyForAccount(replacement, "", 402, nil, body)
+	scheduler.Set(selectacct.NewScheduler([]selectacct.Score{{AccountID: account.ID, Provider: account.Provider, Headroom: 1, ShortHeadroom: 1, Fresh: true}}))
+	if _, blocked := scheduler.BlockedUntilFor(account.Provider, account.ID, "", time.Now()); blocked {
+		t.Fatal("fresh quota recovery did not clear quota hold")
+	}
+	// After a replacement, an old in-flight response must not create a new hold.
+	server.markAccountExhaustedFromResponseBodyForAccount(account, "", 402, nil, body)
+	if _, blocked := scheduler.BlockedUntilFor(account.Provider, account.ID, "", time.Now()); blocked {
+		t.Fatal("late old credential response blocked the replacement")
+	}
+}
+
+func TestQwenSubscriptionQuotaWithoutSubjectStaysCredentialScoped(t *testing.T) {
+	account := accounts.Account{ID: "qwen-subscription:unknown", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth, Token: "access"}
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{account}, nil)
+	scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	server := Server{AccountRef: ref, SchedulerRef: scheduler}
+	server.accountListSnapshotContext(t.Context())
+	reset := time.Now().Add(7 * 24 * time.Hour).Truncate(time.Second)
+	body := []byte(fmt.Sprintf(`{"error":{"code":"insufficient_quota","quota":{"reset_at":%d}}}`, reset.Unix()))
+	server.markAccountExhaustedFromResponseBodyForAccount(account, "", 402, nil, body)
+	if until, blocked := scheduler.BlockedUntilFor(account.Provider, account.ID, "", time.Now()); !blocked || !until.Equal(reset) {
+		t.Fatal("missing subject lost the credential's quota evidence", until, blocked)
+	}
+	account.Token = "different-access"
+	ref.replace(account)
+	loaded, generation, revision := ref.CredentialSnapshot()
+	scheduler.SyncAccountCredentials(generation, revision, SchedulerAccounts(loaded))
+	if _, blocked := scheduler.BlockedUntilFor(account.Provider, account.ID, "", time.Now()); blocked {
+		t.Fatal("missing subject created an unbound durable label hold")
+	}
+}

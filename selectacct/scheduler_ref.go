@@ -26,6 +26,10 @@ type SchedulerRef struct {
 	// until the next SUCCESSFUL usage refresh, which under load can fail for
 	// hours, leaving real quota unroutable while clients got 429s.
 	exhaustedUntil map[string]time.Time
+	// membershipQuota binds a quota mark to a stable subscription subject.
+	// Rotating its OAuth token preserves the mark; re-enrolling the label for
+	// another subject must not inherit the old membership's quota.
+	membershipQuota map[string]string
 	// weeklyExhaustedUntil is the subset of marks whose upstream response
 	// proved the weekly window cooked (7d status rejected). Status views and
 	// WeeklyCooked read it.
@@ -566,6 +570,7 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 			}
 		}
 		delete(r.exhaustedUntil, key)
+		delete(r.membershipQuota, key)
 		delete(r.exhaustedMarkSeq, key)
 	}
 	for key, until := range r.weeklyExhaustedUntil {
@@ -748,6 +753,7 @@ func (r *SchedulerRef) AdvanceAccountGenerationWithAccounts(generation, credenti
 // present are intentionally left untouched so a stale or missing usage refresh
 // cannot make a recently rejected account eligible again.
 func (r *SchedulerRef) pruneExhaustedMarksForAccountsLocked(accounts []account.Account) {
+	r.pruneMembershipQuotaLocked(accounts)
 	present := make(map[string]struct{}, len(accounts))
 	for _, candidate := range accounts {
 		present[ScoreKey(candidate.Provider, candidate.ID)] = struct{}{}
@@ -786,10 +792,29 @@ func (r *SchedulerRef) pruneExhaustedMarksForAccountsLocked(accounts []account.A
 	}
 }
 
+func (r *SchedulerRef) pruneMembershipQuotaLocked(accounts []account.Account) {
+	if len(r.membershipQuota) == 0 {
+		return
+	}
+	subjects := make(map[string]string, len(accounts))
+	for _, candidate := range accounts {
+		subjects[poolScopedExhaustionKey(candidate.Provider, candidate.ID, "")] = candidate.AccountID
+	}
+	for key, subject := range r.membershipQuota {
+		if subjects[key] != subject {
+			delete(r.exhaustedUntil, key)
+			delete(r.weeklyExhaustedUntil, key)
+			delete(r.exhaustedMarkSeq, key)
+			delete(r.recoveryProbeReady, key)
+			delete(r.membershipQuota, key)
+		}
+	}
+}
+
 // SyncAccountCredentials publishes token rotations that occur within an
 // account generation (for example, a successful OAuth refresh). It does not
 // invalidate score work; it only changes which credential-scoped exclusions
-// apply to the current snapshot.
+// apply to the current snapshot and drops quota marks for replaced memberships.
 func (r *SchedulerRef) SyncAccountCredentials(generation, credentialRevision uint64, accounts []account.Account) bool {
 	if r == nil {
 		return false
@@ -803,6 +828,7 @@ func (r *SchedulerRef) SyncAccountCredentials(generation, credentialRevision uin
 		return true
 	}
 	r.credentialRevision = credentialRevision
+	r.pruneMembershipQuotaLocked(accounts)
 	r.credentialFingerprints = make(map[string]string, len(accounts))
 	for _, candidate := range accounts {
 		r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
@@ -961,6 +987,7 @@ func (r *SchedulerRef) retainExhaustedExpiriesForScoreKeysLocked(scoreKeys map[s
 	now := time.Now()
 	dropMark := func(key string) {
 		delete(r.exhaustedUntil, key)
+		delete(r.membershipQuota, key)
 		delete(r.weeklyExhaustedUntil, key)
 		delete(r.exhaustedMarkSeq, key)
 	}
@@ -1050,6 +1077,7 @@ func (r *SchedulerRef) markExhaustedUntilLocked(provider account.Provider, accou
 		r.exhaustedUntil = make(map[string]time.Time)
 	}
 	key := poolScopedExhaustionKey(provider, accountID, poolKey)
+	delete(r.membershipQuota, key)
 	// A session-level rejection cannot shorten a weekly-cooked block the
 	// account is already known to be under.
 	if weekly := r.weeklyExhaustedUntil[key]; weekly.After(until) {
@@ -1063,6 +1091,21 @@ func (r *SchedulerRef) markExhaustedUntilLocked(provider account.Provider, accou
 	r.exhaustedMarkSeq[key] = r.markSeq
 	delete(r.recoveryProbeReady, key)
 	r.updatedAt = time.Now()
+}
+
+// MarkMembershipExhaustedUntil records account-wide quota for a known subject.
+// Callers validate the responding credential against their current snapshot.
+func (r *SchedulerRef) MarkMembershipExhaustedUntil(provider account.Provider, accountID, subject string, until time.Time) {
+	if r == nil || accountID == "" || subject == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.markExhaustedUntilLocked(provider, accountID, "", until)
+	if r.membershipQuota == nil {
+		r.membershipQuota = make(map[string]string)
+	}
+	r.membershipQuota[poolScopedExhaustionKey(provider, accountID, "")] = subject
 }
 
 // MarkWeeklyExhaustedUntil records an exhaustion mark whose upstream response
