@@ -165,7 +165,7 @@ func TestSRStatusJSONSchemaAgainstFixture(t *testing.T) {
 	if _, err := time.Parse(time.RFC3339, status.GeneratedAt); err != nil || !strings.HasSuffix(status.GeneratedAt, "Z") {
 		t.Fatalf("generated_at %q is not RFC3339 UTC: %v", status.GeneratedAt, err)
 	}
-	wantAccountKeys := []string{"extra_usage_usd", "id", "label", "plan", "provider", "session_left_pct", "session_reset_at", "state", "weekly_left_pct", "weekly_reset_at"}
+	wantAccountKeys := []string{"extra_usage_usd", "id", "label", "plan", "provider", "session_left_pct", "session_reset_at", "state", "weekly_left_pct", "weekly_reset_at", "windows"}
 	for providerName, provider := range raw["providers"].(map[string]any) {
 		providerObject := provider.(map[string]any)
 		if got := srStatusSortedKeys(providerObject); !slices.Equal(got, []string{"accounts", "summary"}) {

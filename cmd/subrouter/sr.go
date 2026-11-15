@@ -239,6 +239,7 @@ type srRunner struct {
 	out                         io.Writer
 	errOut                      io.Writer
 	client                      *http.Client
+	qwenConsoleAuthorize        func(context.Context, io.Writer) (agentqwen.ConsoleCredential, error)
 	cmd                         srCommandRunner
 	kimi                        srKimiUsageStore
 	grok                        srGrokStore
@@ -1748,6 +1749,8 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 					}
 					usage, usageErr := agentqwen.FetchUsage(ctx, r.client, accountID)
 					subscription, subscriptionErr := agentqwen.FetchSubscription(ctx, r.client, accountID)
+					extraCredits, extraErr := agentqwen.FetchExtraCreditsIn(ctx, r.client, agentqwen.DefaultConsoleRoot(), accountID)
+					rows[idx].credits = extraCredits
 					if subscriptionErr == nil {
 						rows[idx].planType = subscription.Plan
 						if rows[idx].accountIdentity == "" {
@@ -1760,17 +1763,15 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 						}
 					}
 					if usageErr == nil {
-						rows[idx].quotaUsageKnown = true
+						rows[idx].quotaUsageKnown = len(usage.Windows) > 0
+						if !rows[idx].quotaUsageKnown {
+							rows[idx].quotaStatus = "not reported"
+						}
 						rows[idx].usageFetchedAt = time.Now().UTC()
-						if usage.FiveHour != nil {
-							rows[idx].windows = append(rows[idx].windows, *usage.FiveHour)
-						}
-						if usage.Weekly != nil {
-							rows[idx].windows = append(rows[idx].windows, *usage.Weekly)
-						}
+						rows[idx].windows = append(rows[idx].windows, usage.Windows...)
 					}
-					if usageErr != nil || subscriptionErr != nil {
-						rows[idx].err = agentqwen.StatusError(accountID, usageErr, subscriptionErr)
+					if usageErr != nil || subscriptionErr != nil || extraErr != nil {
+						rows[idx].err = agentqwen.StatusError(accountID, usageErr, subscriptionErr, extraErr)
 						if errors.Is(rows[idx].err, agentqwen.ErrConsoleLoginRequired) {
 							rows[idx].quotaStatus = "login needed"
 						} else if usageErr != nil && subscriptionErr != nil {
@@ -2839,6 +2840,14 @@ func (r srRunner) ensureSwitchableForFreshUsage(ctx context.Context, account acc
 }
 
 func rankUsageRows(rows []srUsageRow) {
+	for i := range rows {
+		if usageProvider(rows[i]) == accounts.ProviderQwenToken && rows[i].credits != nil && rows[i].credits.HasCredits {
+			serving := agentqwen.ServingQuotaWindows(rows[i].windows, rows[i].credits)
+			rows[i].score = scoreFromWindows(rows[i].email, serving)
+			rows[i].cooked, rows[i].cookedReason = cookedFromWindows(serving)
+			rows[i].tempCooked, rows[i].tempCookedReason = tempCookedFromWindows(serving)
+		}
+	}
 	sort.SliceStable(rows, func(i, j int) bool {
 		a, b := rows[i], rows[j]
 		ao, bo := usageProviderOrder(a), usageProviderOrder(b)
@@ -3177,7 +3186,7 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 		if usageGridShortWindowCell(*row).Text != "" {
 			qwenShortWindow[group] = true
 		}
-		if usageGridWindowCell(row.windows, isLongQuotaWindow).Text != "" {
+		if usageGridWindowCell(row.windows, isClaudeWeeklyWindow).Text != "" {
 			qwenLongWindow[group] = true
 		}
 	}
@@ -3528,6 +3537,12 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 		if row.showLongWindow {
 			columns = append(columns, usageGridColumn{Key: "7d", Title: "7d", Width: 12})
 		}
+		if usageGridRowsHaveValue(rows, "Monthly") {
+			columns = append(columns, usageGridColumn{Key: "Monthly", Title: "Monthly", Width: 12})
+		}
+		if usageGridRowsHaveValue(rows, "Qwen extra Credits") {
+			columns = append(columns, usageGridColumn{Key: "Qwen extra Credits", Title: "Extra Cr", Width: 18})
+		}
 	} else if isKeyedProviderSection(provider) {
 		// API-key providers without a quota API use the same compact account,
 		// plan, routing-state, and use vocabulary as the subscription tables.
@@ -3676,31 +3691,33 @@ func widenUsageGridColumnForRows(columns []usageGridColumn, rows []srUsageRow, k
 
 func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 	return map[string]usageGridCell{
-		"#":               {Text: rowIndex, Style: ansiDim},
-		"Account":         {Text: displayUsageAccountName(row), Style: ansiBold + ansiWhite},
-		"Plan":            {Text: usageGridPlan(row), Style: ansiDim},
-		"Login":           {Text: row.accountIdentity, Style: ansiDim},
-		"State":           {Text: usageGridState(row), Style: usageGridStateColor(row)},
-		"Key ID":          {Text: row.keyFingerprint, Style: ansiDim},
-		"Sessions":        {Text: usageGridSessions(row), Style: ansiDim},
-		"Models":          {Text: usageGridModels(row), Style: ansiDim},
-		"Endpoints":       {Text: strings.Join(proxy.ProviderEndpoints(row.provider), " "), Style: ansiDim},
-		"Quota":           {Text: usageGridProviderQuota(row), Style: ansiDim},
-		"Pick":            {Text: compactPickReason(row), Style: usageGridPickColor(row)},
-		"5h":              usageGridProviderShortWindowCell(row),
-		"7d":              usageGridProviderLongWindowCell(row),
-		"Reset":           usageGridResetCell(row),
-		"Credits":         usageGridCreditsCell(row),
-		"Detail":          usageGridClaudeDetailCell(row),
-		"Session":         usageGridWindowCell(row.windows, isClaudeSessionWindow),
-		"Weekly":          usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
-		"Fable wk":        usageGridWindowCell(row.windows, isClaudeOAuthAppsWeeklyWindow),
-		"Opus wk":         usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
-		"Sonnet wk":       usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
-		"Extra":           usageGridClaudeExtraCell(row),
-		"Tier":            usageGridClaudeTierCell(row),
-		"Credit":          usageGridClaudeCreditCell(row),
-		"ExtraAutoReload": usageGridClaudeExtraAutoReloadCell(row),
+		"#":                  {Text: rowIndex, Style: ansiDim},
+		"Account":            {Text: displayUsageAccountName(row), Style: ansiBold + ansiWhite},
+		"Plan":               {Text: usageGridPlan(row), Style: ansiDim},
+		"Login":              {Text: row.accountIdentity, Style: ansiDim},
+		"State":              {Text: usageGridState(row), Style: usageGridStateColor(row)},
+		"Key ID":             {Text: row.keyFingerprint, Style: ansiDim},
+		"Sessions":           {Text: usageGridSessions(row), Style: ansiDim},
+		"Models":             {Text: usageGridModels(row), Style: ansiDim},
+		"Endpoints":          {Text: strings.Join(proxy.ProviderEndpoints(row.provider), " "), Style: ansiDim},
+		"Quota":              {Text: usageGridProviderQuota(row), Style: ansiDim},
+		"Pick":               {Text: compactPickReason(row), Style: usageGridPickColor(row)},
+		"5h":                 usageGridProviderShortWindowCell(row),
+		"7d":                 usageGridProviderLongWindowCell(row),
+		"Reset":              usageGridResetCell(row),
+		"Credits":            usageGridCreditsCell(row),
+		"Detail":             usageGridClaudeDetailCell(row),
+		"Session":            usageGridWindowCell(row.windows, isClaudeSessionWindow),
+		"Weekly":             usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
+		"Monthly":            usageGridWindowCell(row.windows, func(w accounts.UsageWindow) bool { return w.Name == "monthly" }),
+		"Qwen extra Credits": qwenExtraCreditsCell(row),
+		"Fable wk":           usageGridWindowCell(row.windows, isClaudeOAuthAppsWeeklyWindow),
+		"Opus wk":            usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
+		"Sonnet wk":          usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
+		"Extra":              usageGridClaudeExtraCell(row),
+		"Tier":               usageGridClaudeTierCell(row),
+		"Credit":             usageGridClaudeCreditCell(row),
+		"ExtraAutoReload":    usageGridClaudeExtraAutoReloadCell(row),
 		"AG Gemini 5h": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
 			return isAntigravityFamilyWindow(window, "gemini", false)
 		}),
@@ -3969,7 +3986,25 @@ func usageGridProviderShortWindowCell(row srUsageRow) usageGridCell {
 }
 
 func usageGridProviderLongWindowCell(row srUsageRow) usageGridCell {
+	if usageProvider(row).Family() == accounts.ProviderQwen {
+		return usageGridWindowCell(row.windows, accountWideWindow(isClaudeWeeklyWindow))
+	}
 	return usageGridWindowCell(row.windows, accountWideWindow(isLongQuotaWindow))
+}
+
+func qwenExtraCreditsCell(row srUsageRow) usageGridCell {
+	if usageProvider(row) != accounts.ProviderQwenToken || row.credits == nil || row.credits.Source != "token-plan-extra" {
+		return usageGridCell{}
+	}
+	remaining, err := strconv.ParseFloat(row.credits.Balance, 64)
+	if err != nil || !(remaining >= 0) {
+		return usageGridCell{}
+	}
+	text := strconv.FormatFloat(remaining, 'f', 2, 64)
+	if row.credits.Total != nil {
+		text += "/" + strconv.FormatFloat(*row.credits.Total, 'f', 0, 64)
+	}
+	return usageGridCell{Text: text, Style: ansiDim}
 }
 
 func usageGridResetCell(row srUsageRow) usageGridCell {
@@ -4381,6 +4416,9 @@ func compactPickReason(row srUsageRow) string {
 	}
 	if row.tempCooked {
 		return "temp cooked, cannot start"
+	}
+	if usageProvider(row) == accounts.ProviderQwenToken && len(agentqwen.ServingQuotaWindows(row.windows, row.credits)) < len(row.windows) {
+		return "on extra Credits"
 	}
 	if isKeyedProviderSection(usageProvider(row)) && row.quotaUsageKnown && len(row.windows) > 0 {
 		return fmt.Sprintf("%d%% left", int(row.score.Headroom*100+0.5))

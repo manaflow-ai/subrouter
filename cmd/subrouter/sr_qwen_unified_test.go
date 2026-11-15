@@ -96,3 +96,51 @@ func TestQwenSharedTableKeepsPlanQuotaColumns(t *testing.T) {
 		}
 	}
 }
+
+func TestQwenSharedTableSeparatesSubscriptionWeeklyAndTokenPlanMonthly(t *testing.T) {
+	t.Setenv("COLUMNS", "200")
+	rows := []srUsageRow{
+		{email: "member", provider: accounts.ProviderQwenOAuth, authMode: accounts.AuthModeOAuth, planType: "pro", quotaUsageKnown: true, windows: []accounts.UsageWindow{{Name: "weekly", UsedPercent: 80, LimitWindowSeconds: 604800}}},
+		{email: "plan", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, planType: "Pro", quotaUsageKnown: true, windows: []accounts.UsageWindow{{Name: "monthly", UsedPercent: 37.5}}},
+	}
+	var out bytes.Buffer
+	displayUsageRows(&out, rows, false)
+	for _, value := range []string{"7d", "Monthly", "20%", "62%"} {
+		if !strings.Contains(out.String(), value) {
+			t.Fatalf("shared table hid %q:\n%s", value, out.String())
+		}
+	}
+	status := buildSRStatusJSON(rows, "test", time.Now())
+	group := status.Providers["qwen"]
+	if len(group.Accounts) != 2 || len(group.Accounts[1].Windows) != 1 || group.Accounts[1].Windows[0].Name != "monthly" || group.Accounts[1].Windows[0].WindowSeconds != 0 || group.Accounts[1].Windows[0].UsedPercent != 37.5 {
+		t.Fatalf("monthly quota changed in status JSON: %+v", group)
+	}
+	if group.Accounts[1].WeeklyLeftPct != nil || group.Accounts[1].WeeklyResetAt != nil {
+		t.Fatal("monthly quota was also reported as weekly quota")
+	}
+}
+
+func TestQwenExtraCreditsKeepMonthlyExhaustedAccountUsable(t *testing.T) {
+	t.Setenv("COLUMNS", "200")
+	total := 20000.0
+	rows := []srUsageRow{{email: "plan", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey,
+		providerHealth: "auth ok", quotaUsageKnown: true, cooked: true,
+		windows: []accounts.UsageWindow{{Name: "monthly", UsedPercent: 100, ResetAt: time.Now().Add(time.Hour)}},
+		credits: &accounts.CreditsInfo{HasCredits: true, Balance: "12500.75", Total: &total, Unit: "Credits", Source: "token-plan-extra"}}}
+	rankUsageRows(rows)
+	if rows[0].cooked || !displayRecommendedForNewSession(rows[0]) {
+		t.Fatal("spendable extra Credits did not keep Token Plan usable")
+	}
+	var out bytes.Buffer
+	displayUsageRows(&out, rows, false)
+	for _, want := range []string{"Monthly", "0%", "Extra Cr", "12500.75/20000"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("missing %q:\n%s", want, out.String())
+		}
+	}
+	status := buildSRStatusJSON(rows, "test", time.Now())
+	account := status.Providers["qwen"].Accounts[0]
+	if account.Credits == nil || account.Credits.Balance != "12500.75" || account.Windows[0].UsedPercent != 100 {
+		t.Fatal("JSON lost the separate monthly and extra-pack pools")
+	}
+}

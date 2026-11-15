@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,12 +34,13 @@ const (
 
 var ErrConsoleLoginRequired = errors.New("Qwen Token Plan console login required")
 
-// UsageDetails is the pair of independent fixed-window quotas returned by the
-// Token Plan console. A nil window means Alibaba omitted that window; callers
-// must not infer either zero usage or unlimited quota from its absence.
+// UsageDetails contains the quota windows returned by the Token Plan console.
+// Omitted windows remain unknown rather than implying zero or unlimited usage.
 type UsageDetails struct {
 	FiveHour *accounts.UsageWindow
 	Weekly   *accounts.UsageWindow
+	Monthly  *accounts.UsageWindow
+	Windows  []accounts.UsageWindow
 }
 
 // SubscriptionDetails identifies the purchased Token Plan independently of
@@ -56,12 +60,7 @@ type consoleConfig struct {
 	ConsoleSwitchAgent *int64 `json:"console_switch_agent"`
 }
 
-type usagePayload struct {
-	Per5HourPercentage *float64 `json:"per5HourPercentage"`
-	Per5HourResetTime  *int64   `json:"per5HourResetTime"`
-	Per1WeekPercentage *float64 `json:"per1WeekPercentage"`
-	Per1WeekResetTime  *int64   `json:"per1WeekResetTime"`
-}
+type usagePayload struct{ Windows []tokenPlanWindow }
 
 // ConsoleConfigDir is the isolated Bailian CLI profile for one Subrouter
 // account. Keeping one directory per account avoids a global CLI profile
@@ -138,10 +137,19 @@ func FetchUsageIn(ctx context.Context, client *http.Client, root, accountID stri
 		return UsageDetails{}, err
 	}
 	now := time.Now()
-	return UsageDetails{
-		FiveHour: quotaWindow("5h", 5*time.Hour, payload.Per5HourPercentage, payload.Per5HourResetTime, now),
-		Weekly:   quotaWindow("7d", 7*24*time.Hour, payload.Per1WeekPercentage, payload.Per1WeekResetTime, now),
-	}, nil
+	windows := payload.usageWindows(now)
+	details := UsageDetails{Windows: windows}
+	for i := range windows {
+		switch windows[i].Name {
+		case "5h":
+			details.FiveHour = &windows[i]
+		case "7d":
+			details.Weekly = &windows[i]
+		case "monthly":
+			details.Monthly = &windows[i]
+		}
+	}
+	return details, nil
 }
 
 // FetchSubscription returns the vendor-owned Lite/Pro identity for a Token
@@ -357,14 +365,52 @@ func findUsagePayload(value any) (usagePayload, error) {
 			return usagePayload{}, fmt.Errorf("Qwen Token Plan console error: %s", code)
 		}
 		if hasUsageField(object) {
-			body, err := json.Marshal(object)
-			if err != nil {
-				return usagePayload{}, err
-			}
 			var payload usagePayload
-			if err := json.Unmarshal(body, &payload); err != nil {
-				return usagePayload{}, err
+			keys := make([]string, 0, len(object))
+			for key := range object {
+				keys = append(keys, key)
 			}
+			sort.Strings(keys)
+			byPrefix := map[string]*tokenPlanWindow{}
+			for _, field := range keys {
+				parts := tokenPlanWindowField.FindStringSubmatch(field)
+				if parts == nil {
+					continue
+				}
+				count, _ := strconv.Atoi(parts[1])
+				if count < 1 || count > 366 {
+					continue
+				}
+				value, ok := quotaNumber(object[field])
+				if !ok {
+					continue
+				}
+				prefix := "per" + parts[1] + parts[2]
+				window := byPrefix[prefix]
+				if window == nil {
+					window = &tokenPlanWindow{Count: count, Unit: parts[2]}
+					byPrefix[prefix] = window
+				}
+				if parts[3] == "Percentage" {
+					if value < 0 || value > 1 {
+						continue
+					}
+					v := value
+					window.Ratio = &v
+				} else if value > 0 && value < float64(math.MaxInt64) {
+					v := int64(value)
+					window.ResetMillis = &v
+				}
+			}
+			for _, window := range byPrefix {
+				payload.Windows = append(payload.Windows, *window)
+			}
+			sort.Slice(payload.Windows, func(i, j int) bool {
+				if payload.Windows[i].order() == payload.Windows[j].order() {
+					return payload.Windows[i].Unit < payload.Windows[j].Unit
+				}
+				return payload.Windows[i].order() < payload.Windows[j].order()
+			})
 			return payload, nil
 		}
 		queue = appendConsoleChildren(queue, object)
@@ -373,12 +419,79 @@ func findUsagePayload(value any) (usagePayload, error) {
 }
 
 func hasUsageField(object map[string]any) bool {
-	for _, key := range []string{"per5HourPercentage", "per5HourResetTime", "per1WeekPercentage", "per1WeekResetTime"} {
-		if _, ok := object[key]; ok {
+	for key := range object {
+		if tokenPlanWindowField.MatchString(key) {
 			return true
 		}
 	}
 	return false
+}
+
+var tokenPlanWindowField = regexp.MustCompile(`^per(\d+)(Hour|Day|Week|Month)(Percentage|ResetTime)$`)
+
+type tokenPlanWindow struct {
+	Count       int
+	Unit        string
+	Ratio       *float64
+	ResetMillis *int64
+}
+
+func quotaNumber(value any) (float64, bool) {
+	var number float64
+	switch v := value.(type) {
+	case float64:
+		number = v
+	case string:
+		var err error
+		number, err = strconv.ParseFloat(v, 64)
+		if err != nil {
+			return 0, false
+		}
+	default:
+		return 0, false
+	}
+	return number, !math.IsNaN(number) && !math.IsInf(number, 0)
+}
+
+func (w tokenPlanWindow) order() int {
+	switch w.Unit {
+	case "Hour":
+		return w.Count
+	case "Day":
+		return w.Count * 24
+	case "Week":
+		return w.Count * 168
+	default:
+		return w.Count * 24 * 31
+	}
+}
+
+func (p usagePayload) usageWindows(now time.Time) []accounts.UsageWindow {
+	var windows []accounts.UsageWindow
+	for _, w := range p.Windows {
+		name := strconv.Itoa(w.Count)
+		duration := time.Duration(0)
+		switch w.Unit {
+		case "Hour":
+			name += "h"
+			duration = time.Duration(w.Count) * time.Hour
+		case "Day":
+			name += "d"
+			duration = time.Duration(w.Count) * 24 * time.Hour
+		case "Week":
+			name = strconv.Itoa(w.Count*7) + "d"
+			duration = time.Duration(w.Count) * 7 * 24 * time.Hour
+		case "Month":
+			name += "-month"
+			if w.Count == 1 {
+				name = "monthly"
+			}
+		}
+		if window := quotaWindow(name, duration, w.Ratio, w.ResetMillis, now); window != nil {
+			windows = append(windows, *window)
+		}
+	}
+	return windows
 }
 
 func findSubscriptionDetails(value any) (SubscriptionDetails, error) {

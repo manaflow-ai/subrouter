@@ -2438,23 +2438,6 @@ func TestStatusHelpCoversEveryConfiguredProvider(t *testing.T) {
 	}
 }
 
-func TestRemoteQwenKeyFingerprintRequiresSelectedAccount(t *testing.T) {
-	statuses := []remoteServerUsageStatus{
-		{ID: "qwen-token:other", KeyFingerprint: "key:1111111111"},
-		{ID: "qwen-token:work", KeyFingerprint: "key:2222222222"},
-	}
-	got, err := remoteQwenKeyFingerprint(statuses, "qwen-token:work")
-	if err != nil || got != "key:2222222222" {
-		t.Fatalf("fingerprint = %q err=%v", got, err)
-	}
-	if _, err := remoteQwenKeyFingerprint(statuses, "qwen-token:missing"); err == nil {
-		t.Fatal("missing selected remote Qwen account was accepted")
-	}
-	if _, err := remoteQwenKeyFingerprint([]remoteServerUsageStatus{{ID: "qwen-token:work"}}, "qwen-token:work"); err == nil {
-		t.Fatal("empty remote Qwen fingerprint was accepted")
-	}
-}
-
 func TestRemoteQwenConsoleRootIsTenantScopedWithoutExposingTenantKey(t *testing.T) {
 	serverA := srServerConfig{Name: "shared", URL: "https://router.example", TenantKey: "srt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 	serverB := srServerConfig{Name: "shared", URL: "https://router.example", TenantKey: "srt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
@@ -2515,15 +2498,10 @@ func TestSRQwenLoginPreparesBrowserAuthAndStoresIdentity(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	command := &qwenLoginCommandRunner{}
 	var out bytes.Buffer
-	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: command}
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out, qwenConsoleAuthorize: qwenTestConsoleAuthorize}
 	if err := runner.run(context.Background(), []string{"qwen", "login", "--console-account", "person@example.com", "qwen-token:work"}); err != nil {
 		t.Fatal(err)
-	}
-	wantArgs := []string{"auth", "login", "--console", "--console-site", "international"}
-	if command.name != "bl" || !slices.Equal(command.args, wantArgs) {
-		t.Fatalf("Bailian command = %q %v", command.name, command.args)
 	}
 	if got := agentqwen.ConsoleAccount("qwen-token:work"); got != "person@example.com" {
 		t.Fatalf("console account = %q", got)
@@ -2546,8 +2524,7 @@ func TestSRQwenReauthPreservesSavedConsoleIdentity(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	command := &qwenLoginCommandRunner{}
-	runner := srRunner{in: strings.NewReader(""), out: io.Discard, errOut: io.Discard, cmd: command}
+	runner := srRunner{in: strings.NewReader(""), out: io.Discard, errOut: io.Discard, qwenConsoleAuthorize: qwenTestConsoleAuthorize}
 	stored := accounts.StoredCodexAccount{
 		Email: accountID, Provider: accounts.ProviderQwenToken,
 		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
@@ -2570,8 +2547,7 @@ func TestSRQwenLoginPreservesCompletedAuthorizationWhenDurableSaveFails(t *testi
 	if err := os.WriteFile(root, []byte("not a directory"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	command := &qwenLoginCommandRunner{}
-	runner := srRunner{in: strings.NewReader(""), out: io.Discard, errOut: io.Discard, cmd: command}
+	runner := srRunner{in: strings.NewReader(""), out: io.Discard, errOut: io.Discard, qwenConsoleAuthorize: qwenTestConsoleAuthorize}
 	stored := accounts.StoredCodexAccount{
 		Email: "qwen-token:work", Provider: accounts.ProviderQwenToken,
 		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
@@ -2580,7 +2556,7 @@ func TestSRQwenLoginPreservesCompletedAuthorizationWhenDurableSaveFails(t *testi
 	if err == nil || !strings.Contains(err.Error(), "authorization preserved at") {
 		t.Fatalf("login error = %v, want preserved-authorization location", err)
 	}
-	stageRoot := filepath.Dir(command.configDir)
+	stageRoot := strings.SplitN(strings.SplitN(err.Error(), "authorization preserved at ", 2)[1], ")", 2)[0]
 	t.Cleanup(func() { _ = os.RemoveAll(stageRoot) })
 	credential, exportErr := agentqwen.ExportConsoleCredentialIn(stageRoot, stored.Email)
 	if exportErr != nil {
@@ -2736,9 +2712,8 @@ func TestSRQwenLoginTargetsSelectedRemoteAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("SUBROUTER_CODEX_SERVER", "test")
-	command := &qwenLoginCommandRunner{}
 	var out bytes.Buffer
-	runner := srRunner{store: store, in: strings.NewReader("sk-sp-remote-test\n"), out: &out, errOut: &out, client: server.Client(), cmd: command}
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out, client: server.Client(), qwenConsoleAuthorize: qwenTestConsoleAuthorize}
 	if err := runner.run(context.Background(), []string{"qwen", "login", "--console-account", "person@example.com", accountID}); err != nil {
 		t.Fatal(err)
 	}
@@ -2747,44 +2722,8 @@ func TestSRQwenLoginTargetsSelectedRemoteAccount(t *testing.T) {
 	}
 }
 
-type qwenLoginCommandRunner struct {
-	name      string
-	args      []string
-	configDir string
-}
-
-func (r *qwenLoginCommandRunner) Run(ctx context.Context, name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-	return r.RunWithEnv(ctx, name, args, nil, stdin, stdout, stderr)
-}
-
-func (r *qwenLoginCommandRunner) RunWithEnv(_ context.Context, name string, args, env []string, _ io.Reader, _, _ io.Writer) error {
-	r.name = name
-	r.args = append([]string(nil), args...)
-	var configDir string
-	for _, value := range env {
-		if strings.HasPrefix(value, "BAILIAN_CONFIG_DIR=") {
-			configDir = strings.TrimPrefix(value, "BAILIAN_CONFIG_DIR=")
-		}
-	}
-	r.configDir = configDir
-	body, err := os.ReadFile(filepath.Join(configDir, "config.json"))
-	if err != nil {
-		return err
-	}
-	var config map[string]any
-	if err := json.Unmarshal(body, &config); err != nil {
-		return err
-	}
-	config["access_token"] = "console-secret"
-	body, err = json.Marshal(config)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(configDir, "config.json"), body, 0o600)
-}
-
-func (r *qwenLoginCommandRunner) Output(context.Context, string, []string) ([]byte, error) {
-	return nil, nil
+func qwenTestConsoleAuthorize(context.Context, io.Writer) (agentqwen.ConsoleCredential, error) {
+	return agentqwen.ConsoleCredential{AccessToken: "console-secret", ConsoleRegion: "ap-southeast-1", ConsoleSite: "international"}, nil
 }
 
 func TestSRTraceShowsOAuthBreadcrumbs(t *testing.T) {

@@ -907,13 +907,15 @@ For each Qwen Token Plan account, authorize the Alibaba console once:
 sr qwen login --console-account you@example.com qwen-token:large-plan
 ```
 
-Subrouter supplies the selected key to Bailian CLI, opens the international
-Alibaba browser flow, and stores the resulting console credential in an
-account-isolated profile. The optional sign-in label becomes the account name
+Subrouter opens Alibaba's official console authorization page in your default
+browser and receives the localhost callback directly. No Alibaba CLI is required.
+This authorization grants console account access beyond quota reads. Subrouter
+stores it in an account-isolated profile, separately from the model API key.
+The optional sign-in label becomes the account name
 because Alibaba's console API exposes a stable billing instance ID but not the
 login email. If two keys share that label, their saved labels are appended to
 keep the rows distinct. Browser approval is the only manual step. Afterwards
-`sr status` reports the vendor-owned Lite/Pro plan and every rolling-window
+`sr status` reports the vendor-owned plan and every quota-window
 percentage and reset time Alibaba actually returns. A window omitted by Alibaba
 is omitted from the table rather than displayed as empty or inferred. `auth ok` means
 the vendor accepted that key for its authenticated model-list endpoint; it does

@@ -1270,7 +1270,11 @@ func withWeeklyCooked(statuses []AccountUsageStatus) []AccountUsageStatus {
 	out := append([]AccountUsageStatus(nil), statuses...)
 	for i := range out {
 		out[i].Windows = accounts.ResetsAsOf(out[i].Windows, now)
-		window, cooked := accounts.WeeklyCookedWindow(out[i].Windows)
+		servingWindows := out[i].Windows
+		if out[i].Provider == accounts.ProviderQwenToken {
+			servingWindows = agentqwen.ServingQuotaWindows(servingWindows, out[i].Credits)
+		}
+		window, cooked := accounts.WeeklyCookedWindow(servingWindows)
 		out[i].WeeklyCooked = cooked
 		out[i].WeeklyCookedWindow = ""
 		if cooked {
@@ -2131,6 +2135,8 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 		}
 		usage, usageErr := agentqwen.FetchUsageIn(ctx, r.client, r.qwenRoot(), stored.Email)
 		subscription, subscriptionErr := agentqwen.FetchSubscriptionIn(ctx, r.client, r.qwenRoot(), stored.Email)
+		extraCredits, extraErr := agentqwen.FetchExtraCreditsIn(ctx, r.client, r.qwenRoot(), stored.Email)
+		status.Credits = extraCredits
 		if subscriptionErr == nil {
 			status.PlanType = subscription.Plan
 			if status.AccountIdentity == "" {
@@ -2143,18 +2149,16 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 			}
 		}
 		if usageErr == nil {
-			status.QuotaUsageKnown = true
-			if usage.FiveHour != nil {
-				status.Windows = append(status.Windows, *usage.FiveHour)
-			}
-			if usage.Weekly != nil {
-				status.Windows = append(status.Windows, *usage.Weekly)
+			status.QuotaUsageKnown = len(usage.Windows) > 0
+			status.Windows = append(status.Windows, usage.Windows...)
+			if !status.QuotaUsageKnown {
+				status.QuotaStatus = "not reported"
 			}
 			status.UsageFresh = true
 			status.UsageFetchedAt = time.Now().UTC()
 		}
-		if usageErr != nil || subscriptionErr != nil {
-			combinedErr := agentqwen.StatusError(stored.Email, usageErr, subscriptionErr)
+		if usageErr != nil || subscriptionErr != nil || extraErr != nil {
+			combinedErr := agentqwen.StatusError(stored.Email, usageErr, subscriptionErr, extraErr)
 			status.Error = combinedErr.Error()
 			if errors.Is(combinedErr, agentqwen.ErrConsoleLoginRequired) {
 				status.QuotaStatus = "login needed"
