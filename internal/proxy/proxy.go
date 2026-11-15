@@ -6356,6 +6356,12 @@ func (s Server) proxyHandler() http.Handler {
 			if routed, ok := routedResponseAccount(response); ok {
 				responseAccount = routed
 			}
+			if responseAccount.Provider == accounts.ProviderQwenToken && r.Method == http.MethodGet &&
+				(proxyRequest.URL.Path == "/models" || proxyRequest.URL.Path == "/v1/models") {
+				if err := addQwenTokenCatalogAlias(response); err != nil {
+					return fmt.Errorf("read Qwen model catalog: %w", err)
+				}
+			}
 			if requestProvider == accounts.ProviderClaude && s.AccountRef != nil &&
 				response.StatusCode >= 200 && response.StatusCode < 300 &&
 				!claudeResponseRejected(response.Header) {
