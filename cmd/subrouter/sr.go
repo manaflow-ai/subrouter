@@ -1834,7 +1834,15 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		row := srUsageRow{email: acct.ID, displayAccount: acct.Label, provider: accounts.ProviderQwenOAuth, authMode: accounts.AuthModeOAuth, planType: "subscription", score: selectacct.Score{AccountID: acct.ID, Headroom: 1, ShortHeadroom: 1}}
 		refreshed, err := r.refreshStatusOAuthAccount(ctx, acct, qwenStore)
 		if err == nil {
-			row.planType, _, err = qwenStore.FetchUsage(ctx, r.client, refreshed)
+			usageStore := qwenStore
+			// A rejected userinfo token can rotate the grant after the initial
+			// refresh. Publish that repair under the shared account transaction.
+			usageStore.RefreshTransaction = func(ctx context.Context, refresh func() error) error {
+				return proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+					return true, refresh()
+				})
+			}
+			row.planType, _, err = usageStore.FetchUsage(ctx, r.client, refreshed)
 		}
 		row.err = err
 		row.authChecked = true

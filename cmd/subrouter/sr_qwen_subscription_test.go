@@ -2,20 +2,137 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"github.com/manaflow-ai/subrouter/internal/agents/qwensubscription"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 )
+
+func TestStandaloneQwenStatusRecoverySerializesCredentialMutations(t *testing.T) {
+	for _, remove := range []bool{false, true} {
+		t.Run(map[bool]string{true: "remove", false: "relogin"}[remove], func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", filepath.Join(root, "home"))
+			t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+			store := qwensubscription.Store{}
+			credential := qwensubscription.CredentialInfo{AccessToken: "old-access", RefreshToken: "old-refresh", Subject: "member", MemberType: "pro", ExpiresAt: time.Now().Add(time.Hour)}
+			if _, err := store.SaveManagedCredential("work", credential); err != nil {
+				t.Fatal(err)
+			}
+			codexStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+			mutate := func() (bool, error) {
+				if remove {
+					_, changed, err := store.RemoveManagedAccount("work")
+					return changed, err
+				}
+				credential.AccessToken, credential.RefreshToken = "replacement-access", "replacement-refresh"
+				_, err := store.SaveManagedCredential("work", credential)
+				return err == nil, err
+			}
+			var rotations atomic.Int32
+			client := &http.Client{Transport: srRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				response := func(status int, body string) (*http.Response, error) {
+					return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+				}
+				if r.URL.Path == "/api/oauth/token" {
+					rotations.Add(1)
+					if _, err := os.Stat(filepath.Join(codexStore.StoreDir(), ".account-generation")); err != nil {
+						t.Error("status recovery started before publishing its mutation", err)
+					}
+					ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+					defer cancel()
+					if err := proxy.PublishAccountDiskMutation(ctx, codexStore.StoreDir(), mutate); !errors.Is(err, context.DeadlineExceeded) {
+						t.Errorf("credential mutation entered during status token exchange: %v", err)
+					}
+					return response(200, `{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}`)
+				}
+				if r.URL.Path != "/api/oauth/userinfo" {
+					t.Errorf("unexpected request path %s", r.URL.Path)
+				}
+				if r.Header.Get("Authorization") == "Bearer old-access" {
+					return response(401, `{}`)
+				}
+				return response(200, `{"sub":"member","email":"member@example.test","member_type":"pro"}`)
+			})}
+			rows, err := (srRunner{store: codexStore, client: client}).fetchUsageRows(t.Context())
+			if err != nil || rotations.Load() != 1 {
+				t.Fatalf("status recovery failed: rotations=%d err=%v", rotations.Load(), err)
+			}
+			for _, row := range rows {
+				if row.provider == accounts.ProviderQwenOAuth && row.err != nil {
+					t.Fatal("membership repair failed", row.err)
+				}
+			}
+			if err := proxy.PublishAccountDiskMutation(t.Context(), codexStore.StoreDir(), mutate); err != nil {
+				t.Fatal(err)
+			}
+			listed, err := store.ListAccounts(t.Context())
+			if err != nil || (remove && len(listed) != 0) || (!remove && (len(listed) != 1 || listed[0].Token != "replacement-access")) {
+				t.Fatalf("completed mutation was undone: accounts=%d err=%v", len(listed), err)
+			}
+		})
+	}
+}
+
+func TestStandaloneQwenStatusPublishesOnlyRecoveryIncludingPendingGrant(t *testing.T) {
+	for _, rejected := range []bool{false, true} {
+		t.Run(map[bool]string{true: "verification failed after rotation", false: "fresh membership"}[rejected], func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", filepath.Join(root, "home"))
+			t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+			store := qwensubscription.Store{}
+			if _, err := store.SaveManagedCredential("work", qwensubscription.CredentialInfo{AccessToken: "old-access", RefreshToken: "old-refresh", Subject: "member", MemberType: "pro", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+				t.Fatal(err)
+			}
+			var rotations atomic.Int32
+			client := &http.Client{Transport: srRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				status, body := 200, `{"sub":"member","email":"member@example.test","member_type":"pro"}`
+				if r.URL.Path == "/api/oauth/token" {
+					rotations.Add(1)
+					body = `{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}`
+				} else if rejected {
+					if r.Header.Get("Authorization") == "Bearer old-access" {
+						status = 401
+					} else {
+						status = 503
+					}
+					body = `{}`
+				}
+				return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+			})}
+			codexStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+			if _, err := (srRunner{store: codexStore, client: client}).fetchUsageRows(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			_, publishedErr := os.Stat(filepath.Join(codexStore.StoreDir(), ".account-generation"))
+			listed, err := store.ListAccounts(t.Context())
+			if err != nil || len(listed) != 1 {
+				t.Fatalf("inventory after status: accounts=%d err=%v", len(listed), err)
+			}
+			if rejected {
+				if publishedErr != nil || rotations.Load() != 1 || listed[0].Token != "" {
+					t.Fatalf("pending grant was not published and quarantined: marker=%v rotations=%d", publishedErr, rotations.Load())
+				}
+			} else if !os.IsNotExist(publishedErr) || rotations.Load() != 0 || listed[0].Token != "old-access" {
+				t.Fatalf("fresh status mutated credentials: marker=%v rotations=%d", publishedErr, rotations.Load())
+			}
+		})
+	}
+}
 
 func TestQwenSubscriptionCommandsDispatchInTeamAndHostedModes(t *testing.T) {
 	key, err := tenant.DeriveKey([]byte("0123456789abcdef0123456789abcdef"), "project", "team")

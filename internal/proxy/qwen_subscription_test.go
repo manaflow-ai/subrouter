@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -88,6 +89,42 @@ func TestQwenSubscriptionRepairRechecksEnrollmentBeforePublishing(t *testing.T) 
 }
 
 type qwenUserinfoTransport struct{}
+
+func TestQwenSubscriptionServerStatusRecoveryUsesAccountTransaction(t *testing.T) {
+	store := qwensubscription.Store{Dir: t.TempDir()}
+	if _, err := store.SaveManagedCredential("work", qwensubscription.CredentialInfo{AccessToken: "subscription-access", RefreshToken: "subscription-refresh", Subject: "verified-qwen-owner", MemberType: "pro", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	var rotations atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/api/oauth/token" {
+			rotations.Add(1)
+			ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+			defer cancel()
+			if err := PublishAccountDiskMutation(ctx, codexStore.StoreDir(), func() (bool, error) {
+				_, changed, err := store.RemoveManagedAccount("work")
+				return changed, err
+			}); !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("server status repair did not hold the account transaction: %v", err)
+			}
+		}
+		if r.URL.Path == "/api/oauth/userinfo" && r.Header.Get("Authorization") == "Bearer subscription-access" {
+			return &http.Response{StatusCode: 401, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+		}
+		return (qwenUserinfoTransport{}).RoundTrip(r)
+	})}
+	ref, err := OpenAccountRefWithSources(t.Context(), codexStore, agentclaude.Store{Dir: t.TempDir()}, client, []OAuthAccountSource{store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	statuses := ref.UsageStatuses(ctx)
+	if ctx.Err() != nil || rotations.Load() != 1 || len(statuses) != 1 || !statuses[0].AuthValid || statuses[0].Error != "" {
+		t.Fatalf("server status repair failed or nested its transaction: rotations=%d rows=%+v err=%v", rotations.Load(), statuses, ctx.Err())
+	}
+}
 
 func TestQwenSubscriptionFailedRepairPreservesFailoverBudget(t *testing.T) {
 	store := qwensubscription.Store{Dir: t.TempDir()}
