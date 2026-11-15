@@ -146,7 +146,13 @@ func parseConsoleCallback(r *http.Request, query url.Values) (ConsoleCredential,
 				}
 			} else {
 				var object map[string]any
-				if json.Unmarshal(body, &object) == nil && object != nil {
+				decoder := json.NewDecoder(strings.NewReader(string(body)))
+				decoder.UseNumber()
+				if decoder.Decode(&object) == nil && object != nil {
+					var trailing any
+					if decoder.Decode(&trailing) != io.EOF {
+						return ConsoleCredential{}, errors.New("invalid console callback JSON")
+					}
 					if data, ok := object["data"].(map[string]any); ok {
 						object = data
 					}
@@ -154,6 +160,9 @@ func parseConsoleCallback(r *http.Request, query url.Values) (ConsoleCredential,
 						fields[key] = value
 					}
 				} else {
+					if mediaType == "application/json" || mediaType == "text/json" || strings.HasPrefix(strings.TrimSpace(string(body)), "{") {
+						return ConsoleCredential{}, errors.New("invalid console callback JSON")
+					}
 					form, err := url.ParseQuery(string(body))
 					if err != nil {
 						return ConsoleCredential{}, err
@@ -188,8 +197,24 @@ func parseConsoleCallback(r *http.Request, query url.Values) (ConsoleCredential,
 	if credential.ConsoleSite != defaultSite || credential.ConsoleRegion != defaultRegion {
 		return ConsoleCredential{}, errors.New("unexpected console region or site")
 	}
-	if value := field("console_switch_agent", "consoleSwitchAgent"); value != "" {
-		agent, err := strconv.ParseInt(value, 10, 64)
+	var selector string
+	for _, name := range []string{"console_switch_agent", "consoleSwitchAgent"} {
+		switch value := fields[name].(type) {
+		case nil:
+			continue
+		case string:
+			selector = strings.TrimSpace(value)
+		case json.Number:
+			selector = value.String()
+		default:
+			return ConsoleCredential{}, errors.New("invalid console account selector")
+		}
+		if selector != "" {
+			break
+		}
+	}
+	if selector != "" {
+		agent, err := strconv.ParseInt(selector, 10, 64)
 		if err != nil || agent < 0 {
 			return ConsoleCredential{}, errors.New("invalid console account selector")
 		}

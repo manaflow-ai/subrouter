@@ -7,7 +7,9 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -173,4 +175,35 @@ func consoleTestCallbackURL(t *testing.T, authorizationURL string) string {
 		t.Fatalf("invalid localhost callback: %v", err)
 	}
 	return callback
+}
+
+func TestConsoleCallbackPreservesNumericAccountSelectors(t *testing.T) {
+	for _, field := range []string{"console_switch_agent", "consoleSwitchAgent"} {
+		for _, number := range []string{"0", "123", "9007199254740993", "9223372036854775807"} {
+			body := `{"access_token":"console-secret","` + field + `":` + number + `}`
+			r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/callback", strings.NewReader(body))
+			r.Header.Set("Content-Type", "application/json")
+			credential, err := parseConsoleCallback(r, nil)
+			if err != nil || credential.ConsoleSwitchAgent == nil || strconv.FormatInt(*credential.ConsoleSwitchAgent, 10) != number {
+				t.Fatalf("numeric selector %s was dropped or rounded: err=%v", number, err)
+			}
+		}
+	}
+}
+
+func TestConsoleCallbackRejectsInvalidNumericSelectorsAndTrailingJSON(t *testing.T) {
+	for _, value := range []string{"-1", "1.5", "1e3", "9223372036854775808", "true", "{}", "[]"} {
+		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/callback", strings.NewReader(`{"access_token":"console-secret","console_switch_agent":`+value+`}`))
+		r.Header.Set("Content-Type", "application/json")
+		if _, err := parseConsoleCallback(r, nil); err == nil {
+			t.Fatalf("invalid selector %s silently selected the default account", value)
+		}
+	}
+	for _, body := range []string{`{"console_switch_agent":123} {}`, `{"console_switch_agent":123} garbage`, `{"console_switch_agent":`} {
+		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/callback", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		if _, err := parseConsoleCallback(r, url.Values{"access_token": {"console-secret"}}); err == nil {
+			t.Fatal("malformed JSON used the query token and completed authorization")
+		}
+	}
 }
