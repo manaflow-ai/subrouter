@@ -375,3 +375,42 @@ func TestQwenSubscriptionQuotaWithoutSubjectStaysCredentialScoped(t *testing.T) 
 		t.Fatal("missing subject created an unbound durable label hold")
 	}
 }
+
+func TestQwenExhaustedExplicitRouteReportsPoolStatusAndUnifiedUsesTokenPlan(t *testing.T) {
+	var oauthCalls, tokenCalls atomic.Int32
+	oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		oauthCalls.Add(1)
+		w.WriteHeader(http.StatusPaymentRequired)
+	}))
+	defer oauth.Close()
+	token := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenCalls.Add(1)
+		io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer token.Close()
+	rows := []accounts.Account{{ID: "qwen-subscription:member", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth, Token: "oauth-key"}, {ID: "qwen-token:plan", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "plan-key"}}
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	s := Server{Accounts: rows, Sessions: sessions, SchedulerRef: scheduler, QwenOAuthUpstream: mustParseURL(t, oauth.URL+"/v1"), QwenTokenUpstream: mustParseURL(t, token.URL+"/v1"), MaxBodyBytes: 4096}
+	handler := s.Handler()
+	scheduler.MarkExhaustedUntil(accounts.ProviderQwenOAuth, rows[0].ID, "", time.Now().Add(time.Hour))
+	for _, path := range []string{"/qwen-oauth/v1/chat/completions", "/qwen/v1/chat/completions"} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"qwen4.0-max-preview","messages":[],"stream":true}`))
+		req.Header.Set("X-Subrouter-Session", path)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if path == "/qwen-oauth/v1/chat/completions" {
+			if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" || !strings.Contains(rec.Body.String(), "retry after") {
+				t.Fatalf("known quota exhaustion became a transport error: HTTP %d headers=%v body=%s", rec.Code, rec.Header(), rec.Body.String())
+			}
+		} else if rec.Code != http.StatusOK {
+			t.Fatalf("healthy pooled Token Plan was unavailable: HTTP %d %s", rec.Code, rec.Body.String())
+		}
+	}
+	if oauthCalls.Load() != 0 || tokenCalls.Load() != 1 {
+		t.Fatalf("quota-held subscription retried or backend route leaked: OAuth=%d Token=%d", oauthCalls.Load(), tokenCalls.Load())
+	}
+}

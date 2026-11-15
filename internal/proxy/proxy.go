@@ -11570,6 +11570,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 					next, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
 				}
 				if pickErr != nil {
+					var exhausted *poolExhaustedError
+					if t.provider.Family() == accounts.ProviderQwen && errors.As(pickErr, &exhausted) {
+						return poolExhaustedResponse(pickErr, attemptReq), nil
+					}
 					return nil, pickErr
 				}
 				nextReq, replayErr := a.replay(replayReq, &next)
@@ -13131,6 +13135,18 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 			if len(candidates) == 0 {
 				if lastErr != nil {
 					return accounts.Account{}, nil, lastErr
+				}
+				if provider.Family() == accounts.ProviderQwen && s.SchedulerRef != nil {
+					allBlocked := true
+					for _, candidate := range allCandidates {
+						if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(schedulerAccountProvider(candidate.Provider), candidate.ID, poolModel, time.Now()); !blocked {
+							allBlocked = false
+							break
+						}
+					}
+					if allBlocked {
+						return accounts.Account{}, nil, s.poolExhaustedError(provider, allCandidates, poolModel)
+					}
 				}
 				return accounts.Account{}, nil, fmt.Errorf("no untried %s accounts available", provider)
 			}
