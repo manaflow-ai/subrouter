@@ -156,20 +156,24 @@ func (s Server) markAccountExhaustedFromResponseBodyForAccount(account accounts.
 	}
 	if account.Provider.Family() == accounts.ProviderQwen {
 		if until, ok := qwenQuotaExpiry(body, time.Now()); ok {
-			if account.Provider == accounts.ProviderQwenOAuth && account.AccountID != "" && s.AccountRef != nil {
+			if account.Provider == accounts.ProviderQwenOAuth && s.AccountRef != nil {
 				// Quota belongs to the membership, not its rotating OAuth token.
 				// Validate and mark under the snapshot lock so a late response
 				// cannot quarantine an enrollment that has already been replaced.
 				s.AccountRef.mu.RLock()
-				defer s.AccountRef.mu.RUnlock()
 				for _, current := range s.AccountRef.accounts {
-					if current.ID == account.ID && current.Provider == account.Provider && current.AccountID == account.AccountID && current.CredentialIdentity() == account.CredentialIdentity() {
+					if current.ID == account.ID && current.Provider == account.Provider && current.AccountID != "" &&
+						(account.AccountID == "" || current.AccountID == account.AccountID) && current.CredentialIdentity() == account.CredentialIdentity() {
 						s.SchedulerRef.AdvanceAccountGenerationWithAccounts(s.AccountRef.accountGeneration, s.AccountRef.credentialRevision, SchedulerAccounts(s.AccountRef.accounts))
 						s.SchedulerRef.MarkMembershipExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, current.AccountID, until)
-						break
+						s.AccountRef.mu.RUnlock()
+						return
 					}
 				}
-				return
+				s.AccountRef.mu.RUnlock()
+				if account.AccountID != "" {
+					return
+				}
 			}
 			s.markAccountExhaustedCredentialUntilForAccount(account, until)
 			return
