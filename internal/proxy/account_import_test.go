@@ -623,6 +623,9 @@ func TestAccountImportSupportsEveryAPIKeyProvider(t *testing.T) {
 		{provider: accounts.ProviderClaude, email: "claude:anthropic", key: "anthropic-test"},
 	}
 	for _, entry := range builtinKeyedProviders {
+		if entry.OAuthOnly {
+			continue
+		}
 		name := string(entry.Provider)
 		providers = append(providers, struct {
 			provider accounts.Provider

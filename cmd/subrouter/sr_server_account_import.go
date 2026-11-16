@@ -20,16 +20,18 @@ import (
 	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
+	"github.com/manaflow-ai/subrouter/internal/agents/qwensubscription"
 )
 
 const serverAccountImportPath = "/_subrouter/account-import"
 
 type serverAccountImportRequest struct {
-	Provider    accounts.Provider               `json:"provider"`
-	Codex       *accounts.StoredCodexAccount    `json:"codex,omitempty"`
-	Claude      *serverClaudeAccountImport      `json:"claude,omitempty"`
-	Kimi        *serverKimiAccountImport        `json:"kimi,omitempty"`
-	Antigravity *serverAntigravityAccountImport `json:"antigravity,omitempty"`
+	Provider         accounts.Provider               `json:"provider"`
+	Codex            *accounts.StoredCodexAccount    `json:"codex,omitempty"`
+	Claude           *serverClaudeAccountImport      `json:"claude,omitempty"`
+	Kimi             *serverKimiAccountImport        `json:"kimi,omitempty"`
+	QwenSubscription *serverQwenSubscriptionImport   `json:"qwen_subscription,omitempty"`
+	Antigravity      *serverAntigravityAccountImport `json:"antigravity,omitempty"`
 }
 
 type serverAntigravityAccountImport struct {
@@ -41,6 +43,12 @@ type serverAntigravityAccountImport struct {
 type serverClaudeAccountImport struct {
 	Name       string                     `json:"name"`
 	Credential agentclaude.CredentialInfo `json:"credential"`
+}
+
+type serverQwenSubscriptionImport struct {
+	Label      string                          `json:"label"`
+	Credential qwensubscription.CredentialInfo `json:"credential,omitempty"`
+	Remove     bool                            `json:"remove,omitempty"`
 }
 
 type serverKimiAccountImport struct {

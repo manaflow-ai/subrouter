@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,24 +10,27 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
 	"github.com/manaflow-ai/subrouter/internal/broker"
-	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
 
 func (r srRunner) qwen(ctx context.Context, args []string) error {
+	if len(args) > 0 && args[0] == "subscription" {
+		return r.qwenSubscription(ctx, args[1:], nil)
+	}
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
-		fmt.Fprint(r.out, `Qwen Token Plan accounts use the standard provider account lifecycle:
-  sr add-key --provider qwen-token
+		fmt.Fprint(r.out, `Qwen.ai Plus/Pro: sr qwen subscription login <label>
+
+Qwen accounts use one routed pool with separate backend credentials:
+  sr add-key --provider qwen --backend token-plan
                            Add a Token Plan API-key account
+                           Alias: sr add-key --provider qwen-token
+  sr add-key --provider qwen --backend coding-plan
+                           Add a Coding Plan API-key account
   sr status                List accounts and show available plan/quota status
   sr remove <account>      Remove a Token Plan account
 
@@ -38,7 +40,7 @@ Qwen console commands attach plan and quota metadata to an existing account:
   sr qwen label <account> <email-or-label>
                            Set the saved sign-in label shown by sr status
   sr qwen [--account [account]] [-- qwen args...]
-                           Launch Qwen Code through the selected Token Plan pool
+                           Launch Qwen Code through the selected Qwen pool
                            Omit --account for failover; a pin has no account failover
   sr qwen proxy [qwen args...]
                            Backward-compatible explicit launcher alias
@@ -117,6 +119,9 @@ func (r srRunner) qwenLogin(ctx context.Context, selector, consoleAccount string
 }
 
 func (r srRunner) qwenRemote(ctx context.Context, server srServerConfig, args []string) error {
+	if len(args) > 0 && args[0] == "subscription" {
+		return r.qwenSubscription(ctx, args[1:], &server)
+	}
 	if len(args) == 3 && args[0] == "label" {
 		remoteAccounts, err := r.fetchServerAccounts(ctx, server)
 		if err != nil {
@@ -147,54 +152,11 @@ func (r srRunner) qwenRemote(ctx context.Context, server srServerConfig, args []
 	if err != nil {
 		return err
 	}
-	usageStatuses, available, err := r.fetchServerUsageStatuses(ctx, server)
-	if err != nil {
-		return err
-	}
-	if !available {
-		return fmt.Errorf("remote server cannot expose the selected Qwen key fingerprint; update Subrouter on %s before authorizing quota", server.Name)
-	}
-	expectedFingerprint, err := remoteQwenKeyFingerprint(usageStatuses, accountID)
-	if err != nil {
-		return err
-	}
-	reader := bufio.NewReader(r.in)
-	key, err := promptSecret(r.out, reader, r.in, "Qwen Token Plan API key for this remote account (used only for authorization): ")
-	if err != nil {
-		return err
-	}
-	if !strings.HasPrefix(strings.TrimSpace(key), "sk-sp-") {
-		return fmt.Errorf("Qwen Token Plan API key must start with sk-sp-")
-	}
-	if actual := accounts.APIKeyFingerprint(key); actual != expectedFingerprint {
-		return fmt.Errorf("Qwen Token Plan API key does not match remote account %s", accountID)
-	}
-	stored := accounts.StoredCodexAccount{
-		Email:    accountID,
-		Provider: accounts.ProviderQwenToken,
-		Auth: accounts.CodexAuthFile{
-			AuthMode:     "apikey",
-			OpenAIAPIKey: strings.TrimSpace(key),
-		},
-	}
+	stored := accounts.StoredCodexAccount{Email: accountID, Provider: accounts.ProviderQwenToken}
 	root := qwenRemoteConsoleRoot(server)
 	return r.qwenLoginStored(ctx, root, stored, consoleAccount, func(ctx context.Context, accountID string) error {
 		return r.syncQwenConsoleToServer(ctx, root, server, accountID)
 	})
-}
-
-func remoteQwenKeyFingerprint(statuses []remoteServerUsageStatus, accountID string) (string, error) {
-	for _, status := range statuses {
-		if status.ID != accountID {
-			continue
-		}
-		fingerprint := strings.TrimSpace(status.KeyFingerprint)
-		if fingerprint == "" {
-			return "", fmt.Errorf("remote Qwen account %s does not expose a key fingerprint; update the remote Subrouter before authorizing quota", accountID)
-		}
-		return fingerprint, nil
-	}
-	return "", fmt.Errorf("remote Qwen account %s is missing from usage status", accountID)
 }
 
 func matchRemoteQwenAccount(all []remoteServerAccount, selector string) (string, error) {
@@ -218,6 +180,17 @@ func matchRemoteQwenAccount(all []remoteServerAccount, selector string) (string,
 }
 
 func (r srRunner) cloudQwen(ctx context.Context, args []string) error {
+	if len(args) > 0 && args[0] == "subscription" {
+		config, _, _, err := loadCloudClient(true)
+		if err != nil {
+			return err
+		}
+		if !config.HostedTenantReady() {
+			return fmt.Errorf("Qwen subscriptions require a hosted tenant endpoint; run 'sr login' to refresh this machine's team configuration")
+		}
+		server := srServerConfig{Name: "cmux", URL: strings.TrimRight(config.HostedURL, "/"), TenantKey: config.TenantKey}
+		return r.qwenSubscription(ctx, args[1:], &server)
+	}
 	if len(args) == 3 && args[0] == "label" {
 		config, _, client, err := loadCloudClient(true)
 		if err != nil {
@@ -266,27 +239,7 @@ func (r srRunner) cloudQwen(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	lease, err := client.Lease(ctx, broker.LeaseRequest{
-		Provider:         accounts.ProviderQwenToken,
-		RequiredAuthMode: accounts.AuthModeAPIKey,
-		AgentType:        "qwen-console-setup",
-		SessionID:        "qwen-console:" + accountID,
-		PreferAccountID:  accountID,
-	})
-	if err != nil {
-		return fmt.Errorf("lease Qwen Token Plan key for console authorization: %w", err)
-	}
-	if lease.Account.ID != accountID {
-		return fmt.Errorf("requested Qwen Token Plan account %q but the hosted pool leased %q", accountID, lease.Account.ID)
-	}
-	stored := accounts.StoredCodexAccount{
-		Email:    accountID,
-		Provider: accounts.ProviderQwenToken,
-		Auth: accounts.CodexAuthFile{
-			AuthMode:     "apikey",
-			OpenAIAPIKey: lease.Account.Token,
-		},
-	}
+	stored := accounts.StoredCodexAccount{Email: accountID, Provider: accounts.ProviderQwenToken}
 	root := qwenHostedConsoleRoot(config)
 	return r.qwenLoginStored(ctx, root, stored, consoleAccount, func(ctx context.Context, accountID string) error {
 		credential, err := agentqwen.ExportConsoleCredentialIn(root, accountID)
@@ -348,37 +301,15 @@ func (r srRunner) qwenLoginStored(ctx context.Context, root string, stored accou
 			_ = os.RemoveAll(stageRoot)
 		}
 	}()
-	if err := agentqwen.PrepareConsoleLoginIn(stageRoot, stored.Email, stored.Auth.OpenAIAPIKey, proxy.ProviderDefaultUpstream(accounts.ProviderQwenToken)); err != nil {
-		return err
-	}
-
-	fmt.Fprintf(r.out, "Opening Alibaba authorization for %s. Approve it in the browser; Subrouter will keep the resulting console credential isolated to this account.\n", displayUsageAccountName(srUsageRow{email: stored.Email, provider: stored.ProviderOrDefault(), authMode: accounts.AuthModeAPIKey}))
-	env := []string{"BAILIAN_CONFIG_DIR=" + agentqwen.ConsoleConfigDirIn(stageRoot, stored.Email)}
-	browserCleanup := func() {}
-	if r.cmd == nil {
-		if browserEnv, cleanup, browserErr := qwenBrowserEnv(); browserErr != nil {
-			return browserErr
-		} else if browserEnv != "" {
-			env = append(env, browserEnv)
-			browserCleanup = cleanup
-			fmt.Fprintln(r.out, "Warning: opening this authorization in Google Chrome because Safari does not reliably complete Alibaba's localhost callback.")
+	authorize := r.qwenConsoleAuthorize
+	if authorize == nil {
+		authorize = func(ctx context.Context, out io.Writer) (agentqwen.ConsoleCredential, error) {
+			return agentqwen.AuthorizeConsole(ctx, out, openBrowser)
 		}
 	}
-	defer browserCleanup()
-	err = r.commandRunner().RunWithEnv(ctx, "bl", []string{"auth", "login", "--console", "--console-site", "international"}, env, r.in, r.out, r.errOut)
+	credential, err := authorize(ctx, r.out)
 	if err != nil {
-		baseErr := fmt.Errorf("Alibaba console authorization failed: %w", err)
-		if errors.Is(err, exec.ErrNotFound) || strings.Contains(err.Error(), "executable file not found") {
-			baseErr = fmt.Errorf("Bailian CLI is required; install it with: npm install -g bailian-cli")
-		}
-		return removeQwenLoginStage(stageRoot, &stageRemoved, baseErr)
-	}
-	if err := agentqwen.FinishConsoleLoginIn(stageRoot, stored.Email); err != nil {
-		return removeQwenLoginStage(stageRoot, &stageRemoved, err)
-	}
-	credential, err := agentqwen.ExportConsoleCredentialIn(stageRoot, stored.Email)
-	if err != nil {
-		return removeQwenLoginStage(stageRoot, &stageRemoved, err)
+		return removeQwenLoginStage(stageRoot, &stageRemoved, fmt.Errorf("Alibaba console authorization failed: %w", err))
 	}
 	credential.Account = consoleAccount
 	if err := agentqwen.SaveConsoleCredentialIn(stageRoot, stored.Email, credential); err != nil {
@@ -476,44 +407,4 @@ func (r srRunner) syncQwenConsoleToServer(ctx context.Context, root string, serv
 	}
 	fmt.Fprintf(r.out, "Synced Qwen quota authorization to server: %s\n", server.Name)
 	return nil
-}
-
-// Bailian CLI hardcodes macOS's `open` command. Require a Chrome-family browser:
-// Safari did not reliably return its console callback to the CLI's localhost
-// listener during live Token Plan setup. Failing here prevents Bailian from
-// silently falling back to the system default and stranding the authorization.
-func qwenBrowserEnv() (string, func(), error) {
-	if runtime.GOOS != "darwin" {
-		return "", func() {}, nil
-	}
-	openPath, err := exec.LookPath("open")
-	if err != nil {
-		return "", func() {}, fmt.Errorf("Qwen console authorization requires macOS's open command to launch Google Chrome: %w", err)
-	}
-	bundleID := preferredQwenChromeBundle(func(candidate string) bool {
-		return exec.Command(openPath, "-Rb", candidate).Run() == nil
-	})
-	if bundleID == "" {
-		return "", func() {}, fmt.Errorf("Qwen console authorization on macOS requires Google Chrome, Chrome Beta, or Chrome Canary because Safari does not reliably complete Alibaba's localhost callback; install Chrome and retry")
-	}
-	dir, err := os.MkdirTemp("", "subrouter-qwen-browser-")
-	if err != nil {
-		return "", func() {}, fmt.Errorf("prepare Qwen browser launcher: %w", err)
-	}
-	launcher := filepath.Join(dir, "open")
-	contents := []byte("#!/bin/sh\nexec " + strconv.Quote(openPath) + " -b " + strconv.Quote(bundleID) + " -- \"$@\"\n")
-	if err := os.WriteFile(launcher, contents, 0o700); err != nil {
-		_ = os.RemoveAll(dir)
-		return "", func() {}, fmt.Errorf("prepare Qwen browser launcher: %w", err)
-	}
-	return "PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), func() { _ = os.RemoveAll(dir) }, nil
-}
-
-func preferredQwenChromeBundle(available func(string) bool) string {
-	for _, candidate := range []string{"com.google.Chrome", "com.google.Chrome.beta", "com.google.Chrome.canary"} {
-		if available(candidate) {
-			return candidate
-		}
-	}
-	return ""
 }

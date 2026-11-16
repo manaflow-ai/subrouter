@@ -33,7 +33,8 @@ const (
 
 	ProviderGrok = account.ProviderGrok
 
-	ProviderQwen = account.ProviderQwen
+	ProviderQwen      = account.ProviderQwen
+	ProviderQwenOAuth = account.ProviderQwenOAuth
 
 	ProviderQwenToken = account.ProviderQwenToken
 

@@ -220,8 +220,8 @@ func TestQwenUsageStatusPreservesQuotaWhenPlanLookupFails(t *testing.T) {
 			break
 		}
 	}
-	if status == nil || !status.QuotaUsageKnown || len(status.Windows) != 0 {
-		t.Fatalf("successful empty quota response restored stale windows: %+v", status)
+	if status == nil || status.QuotaUsageKnown || len(status.Windows) != 0 {
+		t.Fatalf("empty quota response must remain unknown and clear stale windows: %+v", status)
 	}
 }
 

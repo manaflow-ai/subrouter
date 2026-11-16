@@ -40,6 +40,7 @@ import (
 	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
+	"github.com/manaflow-ai/subrouter/internal/agents/qwensubscription"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/buildversion"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
@@ -107,6 +108,7 @@ type Server struct {
 	// OAuth) terminates; API-key accounts keep GrokUpstream.
 	GrokSubscriptionUpstream *url.URL
 	QwenUpstream             *url.URL
+	QwenOAuthUpstream        *url.URL
 	QwenTokenUpstream        *url.URL
 	QwenAnthropicUpstream    *url.URL
 	// AntigravityUpstream fronts Google's cloudcode-pa endpoint, which the
@@ -585,6 +587,44 @@ func (r *AccountRef) kimiStore() agentkimi.Store {
 	return agentkimi.ServingStore()
 }
 
+func (r *AccountRef) qwenSubscriptionStore() (qwensubscription.Store, bool) {
+	if r != nil {
+		for _, source := range r.oauthSources {
+			if store, ok := source.(qwensubscription.Store); ok {
+				return store, true
+			}
+		}
+	}
+	return qwensubscription.Store{}, false
+}
+
+// publishQwenSubscriptionAccount re-reads the grant under the removal transaction so
+// a completed refresh cannot resurrect a removed or replaced enrollment.
+func (r *AccountRef) publishQwenSubscriptionAccount(ctx context.Context, refreshed accounts.Account) (current accounts.Account, err error) {
+	// An unchanged credential needs no publication and must not wait behind
+	// another account's network refresh while holding the transaction.
+	if cached := r.credentialSnapshot(refreshed.Provider, refreshed.ID); refreshed.Token != "" && cached.CredentialIdentity() == refreshed.CredentialIdentity() {
+		return refreshed, nil
+	}
+	store, ok := r.qwenSubscriptionStore()
+	if !ok {
+		return current, errors.New("Qwen subscription store is not configured")
+	}
+	err = withAccountDiskTransaction(ctx, r.store, func() error {
+		var readErr error
+		current, _, readErr = store.AccountRefreshState(refreshed, time.Now())
+		if readErr != nil {
+			return readErr
+		}
+		if current.Token == "" {
+			return errors.New("Qwen subscription is awaiting identity verification")
+		}
+		r.replace(current)
+		return nil
+	})
+	return current, err
+}
+
 func (r *AccountRef) antigravityStore() (*agentantigravity.Store, bool) {
 	if r != nil {
 		for _, source := range r.oauthSources {
@@ -626,7 +666,8 @@ type OAuthAccountSource interface {
 // OAuthUsageSource is an OAuth provider whose subscription service publishes
 // quota windows. Keeping this optional means credential-only providers still
 // participate in routing without pretending that an unavailable quota API
-// exists.
+// exists. A successful response with no windows may carry membership metadata,
+// but supplies no quota recovery evidence.
 type OAuthUsageSource interface {
 	OAuthAccountSource
 	FetchUsage(ctx context.Context, client *http.Client, account accounts.Account) (planType string, windows []accounts.UsageWindow, err error)
@@ -1229,7 +1270,11 @@ func withWeeklyCooked(statuses []AccountUsageStatus) []AccountUsageStatus {
 	out := append([]AccountUsageStatus(nil), statuses...)
 	for i := range out {
 		out[i].Windows = accounts.ResetsAsOf(out[i].Windows, now)
-		window, cooked := accounts.WeeklyCookedWindow(out[i].Windows)
+		servingWindows := out[i].Windows
+		if out[i].Provider == accounts.ProviderQwenToken {
+			servingWindows = agentqwen.ServingQuotaWindows(servingWindows, out[i].Credits)
+		}
+		window, cooked := accounts.WeeklyCookedWindow(servingWindows)
 		out[i].WeeklyCooked = cooked
 		out[i].WeeklyCookedWindow = ""
 		if cooked {
@@ -1304,6 +1349,9 @@ func OpenAccountRefWithSources(ctx context.Context, store accounts.CodexStore, c
 	}
 	for i, source := range configuredSources {
 		switch store := source.(type) {
+		case qwensubscription.Store:
+			store.RefreshTransaction = refreshTransaction
+			configuredSources[i] = store
 		case *agentantigravity.Store:
 			if store != nil {
 				store.ForServing()
@@ -1525,6 +1573,9 @@ func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (acc
 		refreshed, err := source.RefreshAccount(ctx, r.client, account)
 		if err != nil {
 			return account, err
+		}
+		if account.Provider == accounts.ProviderQwenOAuth {
+			return r.publishQwenSubscriptionAccount(ctx, refreshed)
 		}
 		r.replace(refreshed)
 		return refreshed, nil
@@ -2084,6 +2135,8 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 		}
 		usage, usageErr := agentqwen.FetchUsageIn(ctx, r.client, r.qwenRoot(), stored.Email)
 		subscription, subscriptionErr := agentqwen.FetchSubscriptionIn(ctx, r.client, r.qwenRoot(), stored.Email)
+		extraCredits, extraErr := agentqwen.FetchExtraCreditsIn(ctx, r.client, r.qwenRoot(), stored.Email)
+		status.Credits = extraCredits
 		if subscriptionErr == nil {
 			status.PlanType = subscription.Plan
 			if status.AccountIdentity == "" {
@@ -2096,18 +2149,16 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 			}
 		}
 		if usageErr == nil {
-			status.QuotaUsageKnown = true
-			if usage.FiveHour != nil {
-				status.Windows = append(status.Windows, *usage.FiveHour)
-			}
-			if usage.Weekly != nil {
-				status.Windows = append(status.Windows, *usage.Weekly)
+			status.QuotaUsageKnown = len(usage.Windows) > 0
+			status.Windows = append(status.Windows, usage.Windows...)
+			if !status.QuotaUsageKnown {
+				status.QuotaStatus = "not reported"
 			}
 			status.UsageFresh = true
 			status.UsageFetchedAt = time.Now().UTC()
 		}
-		if usageErr != nil || subscriptionErr != nil {
-			combinedErr := agentqwen.StatusError(stored.Email, usageErr, subscriptionErr)
+		if usageErr != nil || subscriptionErr != nil || extraErr != nil {
+			combinedErr := agentqwen.StatusError(stored.Email, usageErr, subscriptionErr, extraErr)
 			status.Error = combinedErr.Error()
 			if errors.Is(combinedErr, agentqwen.ErrConsoleLoginRequired) {
 				status.QuotaStatus = "login needed"
@@ -2518,13 +2569,18 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 						return
 					}
 					refreshed, refreshErr := source.RefreshAccount(sweepCtx, r.client, sourceAccount)
+					if refreshErr == nil && sourceAccount.Provider == accounts.ProviderQwenOAuth {
+						refreshed, refreshErr = r.publishQwenSubscriptionAccount(sweepCtx, refreshed)
+					}
 					if refreshErr != nil {
 						status.Error = refreshErr.Error()
 						batch[accountIndex] = status
 						return
 					}
 					status.AuthValid = true
-					r.replace(refreshed)
+					if sourceAccount.Provider != accounts.ProviderQwenOAuth {
+						r.replace(refreshed)
+					}
 					if !hasUsage {
 						status.PlanType = "subscription"
 						batch[accountIndex] = status
@@ -3422,12 +3478,16 @@ func (s Server) withSessionCounts(statuses []AccountUsageStatus) []AccountUsageS
 	if s.Sessions == nil {
 		return statuses
 	}
-	counts := SchedulerSessionCounts(s.Sessions)
+	pool := make([]accounts.Account, 0, len(statuses))
+	for _, status := range statuses {
+		pool = append(pool, accounts.Account{ID: status.ID, Provider: status.Provider})
+	}
+	counts := SchedulerSessionCounts(s.Sessions, pool...)
 	out := append([]AccountUsageStatus(nil), statuses...)
 	for i := range out {
 		out[i].AssignedSessions = counts[selectacct.ScoreKey(accountProviderFor(out[i].Provider), out[i].ID)]
 		out[i].SessionsKnown = true
-		if out[i].Provider == accounts.ProviderKimi || out[i].Provider == accounts.ProviderAntigravity ||
+		if out[i].Provider == accounts.ProviderKimi || out[i].Provider == accounts.ProviderQwenOAuth || out[i].Provider == accounts.ProviderAntigravity ||
 			(out[i].Provider == accounts.ProviderGrok && out[i].AuthMode == accounts.AuthModeOAuth) {
 			out[i].Active = out[i].AssignedSessions > 0
 		}
@@ -3608,7 +3668,7 @@ func (s Server) updateSchedulerFromUsageStatusesAtScoreRevision(
 	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions, allAccounts...))
 	}
 	s.SchedulerRef.SetForAccountGenerationAtScoreRevision(scheduler, accountGeneration, scoreRevision)
 }
@@ -3699,11 +3759,12 @@ const (
 )
 
 type accountImportRequest struct {
-	Provider    accounts.Provider            `json:"provider"`
-	Codex       *accounts.StoredCodexAccount `json:"codex,omitempty"`
-	Claude      *claudeAccountImport         `json:"claude,omitempty"`
-	Kimi        *kimiAccountImport           `json:"kimi,omitempty"`
-	Antigravity *antigravityAccountImport    `json:"antigravity,omitempty"`
+	Provider         accounts.Provider              `json:"provider"`
+	Codex            *accounts.StoredCodexAccount   `json:"codex,omitempty"`
+	Claude           *claudeAccountImport           `json:"claude,omitempty"`
+	Kimi             *kimiAccountImport             `json:"kimi,omitempty"`
+	QwenSubscription *qwenSubscriptionAccountImport `json:"qwen_subscription,omitempty"`
+	Antigravity      *antigravityAccountImport      `json:"antigravity,omitempty"`
 }
 
 type antigravityAccountImport struct {
@@ -3715,6 +3776,12 @@ type antigravityAccountImport struct {
 type claudeAccountImport struct {
 	Name       string                     `json:"name"`
 	Credential agentclaude.CredentialInfo `json:"credential"`
+}
+
+type qwenSubscriptionAccountImport struct {
+	Label      string                          `json:"label"`
+	Credential qwensubscription.CredentialInfo `json:"credential,omitempty"`
+	Remove     bool                            `json:"remove,omitempty"`
 }
 
 type kimiAccountImport struct {
@@ -3731,6 +3798,15 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		providers := append([]string{"codex", "claude"}, keyedProviderNames()...)
+		if _, configured := s.AccountRef.qwenSubscriptionStore(); !configured {
+			filtered := providers[:0]
+			for _, provider := range providers {
+				if provider != string(accounts.ProviderQwenOAuth) {
+					filtered = append(filtered, provider)
+				}
+			}
+			providers = filtered
+		}
 		if _, configured := s.AccountRef.antigravityStore(); configured {
 			providers = append(providers, string(accounts.ProviderAntigravity))
 		}
@@ -3918,7 +3994,49 @@ func rejectTrailingJSON(decoder *json.Decoder) error {
 
 func (s Server) installImportedAccount(ctx context.Context, input accountImportRequest) (accountID string, err error) {
 	return s.installAccountMutation(ctx, func() (string, func() error, error) {
+		if input.QwenSubscription != nil && (input.Provider != accounts.ProviderQwenOAuth || input.Kimi != nil || input.Claude != nil || input.Codex != nil || input.Antigravity != nil) {
+			return "", nil, invalidAccountImport("exactly one matching account payload is required")
+		}
 		switch {
+		case input.Provider == accounts.ProviderQwenOAuth && input.QwenSubscription != nil:
+			request := input.QwenSubscription
+			if request.Remove && (request.Credential.AccessToken != "" || request.Credential.RefreshToken != "") {
+				return "", nil, invalidAccountImport("Qwen removal must not include a credential")
+			}
+			id, err := qwensubscription.ManagedAccountID(request.Label)
+			if err != nil {
+				return "", nil, invalidAccountImport("Qwen subscription label is invalid")
+			}
+			store, configured := s.AccountRef.qwenSubscriptionStore()
+			if !configured {
+				return "", nil, invalidAccountImport("Qwen subscription import is not configured")
+			}
+			exists, err := store.ManagedAccountExists(request.Label)
+			if err != nil {
+				return "", nil, err
+			}
+			if request.Remove {
+				if !exists {
+					return "", nil, invalidAccountImport("Qwen subscription was not found")
+				}
+				return id, func() error { _, _, err := store.RemoveManagedAccount(request.Label); return err }, nil
+			}
+			if !exists {
+				if err := s.ensureNewOAuthSourceAccountImportCapacity(ctx, accounts.ProviderQwenOAuth, id); err != nil {
+					return "", nil, err
+				}
+			}
+			credential, err := qwensubscription.AttestCredential(ctx, s.AccountRef.client, request.Credential)
+			if err != nil {
+				return "", nil, invalidAccountImport("Qwen subscription credential could not be verified by the server")
+			}
+			if err := store.CheckImportCredential(request.Label, credential); err != nil {
+				return "", nil, invalidAccountImport("Qwen membership is already enrolled or the credential is invalid")
+			}
+			return id, func() error {
+				_, err := store.ImportVerifiedCredential(ctx, s.AccountRef.client, request.Label, credential)
+				return err
+			}, nil
 		case input.Provider == accounts.ProviderAntigravity && input.Antigravity != nil:
 			if input.Codex != nil || input.Claude != nil || input.Kimi != nil {
 				return "", nil, invalidAccountImport("exactly one matching account payload is required")
@@ -4289,6 +4407,9 @@ func validateStoredAccountImport(provider accounts.Provider, account accounts.St
 }
 
 func validateStoredAccountImportOrigin(provider accounts.Provider, account accounts.StoredCodexAccount, requireTrustedOrigin bool) (accounts.StoredCodexAccount, error) {
+	if entry, ok := keyedProviderFor(provider); ok && entry.OAuthOnly {
+		return accounts.StoredCodexAccount{}, invalidAccountImport("provider requires subscription OAuth")
+	}
 	account.Email = strings.TrimSpace(account.Email)
 	if account.Email == "" || strings.HasPrefix(account.Email, ".") || len(account.Email) > 320 || strings.ContainsAny(account.Email, "/\\") || containsTerminalControl(account.Email) {
 		return account, invalidAccountImport("account identifier is invalid")
@@ -4486,7 +4607,7 @@ func (s Server) finishAccountReload(ctx context.Context, loaded []accounts.Accou
 	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions, loaded...))
 	}
 	if !s.SchedulerRef.SetForAccountGenerationAtScoreRevision(scheduler, accountGeneration, scoreRevision) {
 		if s.Logger != nil {
@@ -5139,9 +5260,22 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 				}
 				return
 			}
-			if !fresh {
-				// Stale last-known-good windows are not a confident signal. Keep
-				// the seeded score rather than risk demoting a healthy account.
+			if fresh && len(windows) == 0 && refreshed.Provider == accounts.ProviderQwenOAuth {
+				scoreMu.Lock()
+				key := selectacct.ScoreKey(schedulerAccountProvider(refreshed.Provider), refreshed.ID)
+				if idx, ok := scoreByID[key]; ok && scores[idx].Headroom == 0 {
+					// Qwen has no quota measurements. Its base zero records an
+					// auth failure, so verified membership restores the neutral
+					// rank without Fresh quota evidence that could erase a 429 hold.
+					scores[idx] = selectacct.NewScheduler(nil).ScoreFor(schedulerAccountProvider(refreshed.Provider), refreshed.ID)
+					scored++
+				}
+				scoreMu.Unlock()
+				return
+			}
+			if !fresh || len(windows) == 0 {
+				// Stale observations and membership-only probes do not measure
+				// quota recovery. Preserve the seed and its exhaustion overlay.
 				return
 			}
 			scoreMu.Lock()
@@ -6074,7 +6208,7 @@ func (s Server) proxyHandler() http.Handler {
 				path:      r.URL.Path,
 				poolModel: retryPoolModel,
 				account: accounts.Account{
-					ID: account.ID, Provider: requestProvider, CredentialVersion: account.CredentialIdentity(),
+					ID: account.ID, Provider: account.Provider, AuthMode: account.AuthMode, CredentialVersion: account.CredentialIdentity(),
 				},
 				// One retry budget per client request, shared by every layer. It
 				// is required even without a fallback: otherwise each outer POST
@@ -6161,6 +6295,9 @@ func (s Server) proxyHandler() http.Handler {
 				}
 			}
 			transport = layers.build(transport, attempt)
+			if !noRetry && account.Provider == accounts.ProviderQwenOAuth && !installUsageFailover && s.CredentialBroker == nil {
+				transport = qwenSubscriptionRepairTransport{base: transport, server: &s, account: account, attempt: attempt}
+			}
 			if autonomousRetry && (requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude) {
 				transport = autonomousAgentRetryTransport{
 					base: transport, server: &s, logger: s.Logger, provider: requestProvider,
@@ -6183,9 +6320,12 @@ func (s Server) proxyHandler() http.Handler {
 					session:   sessionID,
 					path:      r.URL.Path,
 					poolModel: requestPoolModel,
-					account:   accounts.Account{ID: account.ID, Provider: requestProvider},
+					account:   accounts.Account{ID: account.ID, Provider: account.Provider},
 				},
 			}
+		}
+		if !noRetry && account.Provider == accounts.ProviderQwenOAuth && r.Method == http.MethodGet && s.CredentialBroker == nil {
+			transport = qwenSubscriptionRepairTransport{base: transport, server: &s, account: account}
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
@@ -6215,6 +6355,12 @@ func (s Server) proxyHandler() http.Handler {
 			responseAccount := account
 			if routed, ok := routedResponseAccount(response); ok {
 				responseAccount = routed
+			}
+			if responseAccount.Provider == accounts.ProviderQwenToken && r.Method == http.MethodGet &&
+				(proxyRequest.URL.Path == "/models" || proxyRequest.URL.Path == "/v1/models") {
+				if err := addQwenTokenCatalogAlias(response); err != nil {
+					return fmt.Errorf("read Qwen model catalog: %w", err)
+				}
 			}
 			if requestProvider == accounts.ProviderClaude && s.AccountRef != nil &&
 				response.StatusCode >= 200 && response.StatusCode < 300 &&
@@ -6292,7 +6438,7 @@ func (s Server) proxyHandler() http.Handler {
 				placementReservation.Commit()
 				placementReservation = nil
 			} else {
-				s.SchedulerRef.NoteRouted(schedulerAccountProvider(requestProvider), account.ID)
+				s.SchedulerRef.NoteRouted(schedulerAccountProvider(account.Provider), account.ID)
 			}
 		}
 		if s.Logger != nil {
@@ -6462,6 +6608,9 @@ func credentialLeaseOutcome(
 ) broker.LeaseOutcome {
 	if statusCode == http.StatusUnauthorized {
 		return broker.LeaseUnauthorized
+	}
+	if provider.Family() == accounts.ProviderQwen && statusCode == http.StatusPaymentRequired {
+		return broker.LeaseRateLimited
 	}
 	if provider == accounts.ProviderClaude {
 		if claudeUnifiedStatus(header) == "rejected" ||
@@ -7897,6 +8046,10 @@ func (s Server) markAccountExhaustedCredential(provider accounts.Provider, accou
 }
 
 func (s Server) markAccountExhaustedCredentialForAccount(account accounts.Account) {
+	s.markAccountExhaustedCredentialUntilForAccount(account, time.Now().Add(credentialExhaustionTTL))
+}
+
+func (s Server) markAccountExhaustedCredentialUntilForAccount(account accounts.Account, until time.Time) {
 	if s.SchedulerRef == nil {
 		return
 	}
@@ -7904,7 +8057,7 @@ func (s Server) markAccountExhaustedCredentialForAccount(account accounts.Accoun
 	// generation to advance, so retain the historical TTL-backed behavior.
 	if s.AccountRef == nil {
 		s.SchedulerRef.MarkExhaustedUntil(
-			schedulerAccountProvider(account.Provider), account.ID, "", time.Now().Add(credentialExhaustionTTL),
+			schedulerAccountProvider(account.Provider), account.ID, "", until,
 		)
 		return
 	}
@@ -7921,7 +8074,7 @@ func (s Server) markAccountExhaustedCredentialForAccount(account accounts.Accoun
 		return
 	}
 	s.SchedulerRef.MarkCredentialExhaustedForSnapshot(
-		schedulerAccountProvider(account.Provider), account.ID, account.CredentialIdentity(), time.Now().Add(credentialExhaustionTTL),
+		schedulerAccountProvider(account.Provider), account.ID, account.CredentialIdentity(), until,
 		generation, credentialRevision, SchedulerAccounts(loaded),
 	)
 }
@@ -8624,7 +8777,7 @@ func (s Server) captureResponseBodyForRequest(response *http.Response, clientCtx
 			if inspectCredentialFailure && credentialUnauthorizedJSON(body) {
 				s.markAccountExhaustedCredentialForAccount(account)
 			}
-			if inspectUsageLimit && usageLimitJSON(body) {
+			if inspectUsageLimit && (usageLimitJSON(body) || (provider.Family() == accounts.ProviderQwen && qwenQuotaFailureJSON(body))) {
 				// Use the response's headers so a header-derived reset expiry set
 				// above is recomputed identically, not overwritten with the short
 				// default TTL. A Codex body that names its own reset or a
@@ -8971,7 +9124,11 @@ func (s Server) pathForUpstream(path string, account accounts.Account) string {
 		return path
 	}
 	if entry, ok := keyedProviderFor(account.Provider); ok {
-		path = stripProviderPathPrefix(path, entry.PathPrefix)
+		if account.Provider.Family() == accounts.ProviderQwen && firstPathSegment(path) == "qwen" {
+			path = stripProviderPathPrefix(path, "qwen")
+		} else {
+			path = stripProviderPathPrefix(path, entry.PathPrefix)
+		}
 		if entry.CollapseVersionSegment {
 			return collapseDuplicateVersionSegment(path, entry.Upstream(s, account.AuthMode))
 		}
@@ -9132,7 +9289,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	if poolModel != "" && s.Logger != nil && base.HasModelPool(poolModel) {
 		s.Logger.Debug("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
 	}
-	scheduler := base.ForModel(poolModel).WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+	scheduler := base.ForModel(poolModel).WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions, availableAccounts...))
 	// stickyScheduler decides whether a sticky session leaves its account.
 	// Capacity marks evict a session whose account keeps shedding, but a
 	// conversation too large for the overload failover to move keeps its
@@ -9893,7 +10050,7 @@ func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []a
 	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions, allAccounts...))
 	}
 	finished = true
 	if !s.SchedulerRef.FinishRefreshForAccountGeneration(scheduler, true, accountGeneration) {
@@ -10125,6 +10282,12 @@ func filterAccountsForProvider(all []accounts.Account, provider accounts.Provide
 	filtered := make([]accounts.Account, 0, len(all))
 	legacy := make([]accounts.Account, 0)
 	for _, account := range all {
+		if provider == accounts.ProviderQwen && account.Provider.Family() == accounts.ProviderQwen {
+			// Preserve the selected backend for credentials, quota and upstream.
+			account.Provider = accountProviderFor(account.Provider)
+			filtered = append(filtered, account)
+			continue
+		}
 		if account.Provider != "" && accountProviderFor(account.Provider) == credentialProvider {
 			account.Provider = provider
 			filtered = append(filtered, account)
@@ -10274,7 +10437,7 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	}
 	// Stale quota scores are retryable for Codex, but explicit account
 	// exclusions are authoritative and must never be bypassed by that policy.
-	if provider == accounts.ProviderCodex && s.SchedulerRef != nil {
+	if (provider == accounts.ProviderCodex || provider == accounts.ProviderQwen) && s.SchedulerRef != nil {
 		eligible := untried[:0]
 		for _, account := range untried {
 			_, allowed := s.SchedulerRef.RunIfAccountNotExplicitlyBlocked(
@@ -10294,7 +10457,7 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	}
 	scheduler := s.scheduler()
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions, candidates...))
 	}
 	account, err := pickRoutingAccount(scheduler, untried)
 	if err != nil {
@@ -10857,6 +11020,13 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 		}
 	}
 	switch t.provider {
+	case accounts.ProviderQwen, accounts.ProviderQwenOAuth, accounts.ProviderQwenToken:
+		if response.StatusCode == http.StatusBadGateway || response.StatusCode == http.StatusServiceUnavailable || response.StatusCode == http.StatusGatewayTimeout {
+			return true, false, false, nil
+		}
+		if quota, err := responseQwenQuotaFailure(response); err != nil || quota {
+			return quota, quota, false, err
+		}
 	case accounts.ProviderDeepSeek:
 		// DeepSeek documents 402 as exhausted balance and 429 as a transient
 		// request-rate limit. Both may use an alternate key for this replay, but
@@ -11261,6 +11431,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	a := t.attempt
 	attemptReq := req
 	accountID := t.account
+	accountProvider := t.provider
+	if selected := a.current(); selected.ID == accountID {
+		accountProvider = selected.Provider
+	}
 	accountCredential := t.accountCredential
 	tried := map[string]struct{}{}
 	if selected := a.current(); selected.ID != "" && selected.ID != accountID {
@@ -11271,6 +11445,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			tried[accountID] = struct{}{}
 		}
 		accountID = selected.ID
+		accountProvider = selected.Provider
 		accountCredential = selected.CredentialVersion
 	}
 	// Native AGY includes the project selected by the local CLI in every
@@ -11355,6 +11530,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	// request, which (unlike an overload reroute) justifies moving stickiness.
 	overloadRerouted, quotaFailedOver := false, false
 	failoverReason := accountMoveUsageLimit
+	var qwenAuthRetried map[string]bool
 	claudeExtraUsageRetried := false
 	// claudeThirdPartyKeyOnly: Anthropic refused this client on a
 	// subscription account (claude_third_party.go), so every later move of
@@ -11386,7 +11562,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// instead of repeating the denied upstream request.
 		if a.replayable() && t.server != nil && t.server.SchedulerRef != nil {
 			if _, blocked := t.server.SchedulerRef.ExplicitBlockedUntilFor(
-				schedulerAccountProvider(t.provider), accountID, t.poolModel, time.Now(),
+				schedulerAccountProvider(accountProvider), accountID, t.poolModel, time.Now(),
 			); blocked {
 				tried[accountID] = struct{}{}
 				var next accounts.Account
@@ -11400,6 +11576,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 					next, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
 				}
 				if pickErr != nil {
+					var exhausted *poolExhaustedError
+					if t.provider.Family() == accounts.ProviderQwen && errors.As(pickErr, &exhausted) {
+						return poolExhaustedResponse(pickErr, attemptReq), nil
+					}
 					return nil, pickErr
 				}
 				nextReq, replayErr := a.replay(replayReq, &next)
@@ -11407,6 +11587,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 					return nil, replayErr
 				}
 				accountID = next.ID
+				accountProvider = next.Provider
 				accountCredential = next.CredentialIdentity()
 				tried[accountID] = struct{}{}
 				attemptReq = nextReq
@@ -11430,6 +11611,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				return nil, replayErr
 			}
 			accountID = next.ID
+			accountProvider = next.Provider
 			accountCredential = next.CredentialIdentity()
 			tried[accountID] = struct{}{}
 			attemptReq = nextReq
@@ -11465,12 +11647,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 					spilledFrom = accountID
 				}
 				accountID = next.ID
+				accountProvider = next.Provider
 				accountCredential = next.CredentialIdentity()
 				tried[accountID] = struct{}{}
 				attemptReq = nextReq
 			}
 		}
-		addressed := accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential}
+		addressed := accounts.Account{ID: accountID, Provider: accountProvider, CredentialVersion: accountCredential}
 		response, err := a.send(base, attemptReq, addressed)
 		response = tagRoutedResponseAccount(response, addressed)
 		// The admission limiter turned this account away before any upstream
@@ -11523,6 +11706,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 						failoverReason = accountMoveCapacity
 					}
 					accountID = next.ID
+					accountProvider = next.Provider
 					accountCredential = next.CredentialIdentity()
 					tried[accountID] = struct{}{}
 					attemptReq = nextReq
@@ -11532,6 +11716,31 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		if err != nil || !a.replayable() || req.Context().Err() != nil {
 			return response, tagRoutedAttemptError(err, attemptReq, addressed)
+		}
+		if response != nil && response.StatusCode == http.StatusUnauthorized && accountProvider == accounts.ProviderQwenOAuth && t.server != nil && t.server.AccountRef != nil && !qwenAuthRetried[accountID] {
+			if qwenAuthRetried == nil {
+				qwenAuthRetried = make(map[string]bool)
+			}
+			qwenAuthRetried[accountID] = true
+			if store, ok := t.server.AccountRef.qwenSubscriptionStore(); ok {
+				rejected := accounts.Account{ID: accountID, Provider: accountProvider, AuthMode: accounts.AuthModeOAuth, CredentialVersion: accountCredential}
+				if repaired, refreshErr := store.RefreshRejectedAccount(req.Context(), t.server.AccountRef.client, rejected); refreshErr == nil && repaired.CredentialIdentity() != accountCredential {
+					repaired, publishErr := t.server.AccountRef.publishQwenSubscriptionAccount(req.Context(), repaired)
+					if publishErr == nil {
+						if nextReq, replayErr := a.replay(replayReq, &repaired); replayErr == nil && a.consume() {
+							_ = response.Body.Close()
+							accountCredential = repaired.CredentialIdentity()
+							addressed = repaired
+							attemptReq = nextReq
+							response, err = a.send(base, attemptReq, addressed)
+							response = tagRoutedResponseAccount(response, addressed)
+							if err != nil || req.Context().Err() != nil {
+								return response, tagRoutedAttemptError(err, attemptReq, addressed)
+							}
+						}
+					}
+				}
+			}
 		}
 		// Anthropic overload (529/5xx): retry the SAME account on a bounded,
 		// growing backoff (claudeOverloadHold). Overload is API-wide, not
@@ -11596,12 +11805,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 						overloadRerouted = true
 						failoverReason = accountMoveOverload
 						claudeHold.markRerouted()
-						t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(t.provider), accountID, selectacct.FailoverCapacity)
+						t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(accountProvider), accountID, selectacct.FailoverCapacity)
 						accountID = next.ID
+						accountProvider = next.Provider
 						accountCredential = next.CredentialIdentity()
 						tried[accountID] = struct{}{}
 						if t.server.SchedulerRef != nil {
-							t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
+							t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(accountProvider), accountID)
 						}
 						attemptReq = nextReq
 						continue
@@ -11718,6 +11928,8 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			modelUnsupported, inspectErr = responseCodexChatGPTModelUnsupported(response)
 		case accounts.ProviderKimi:
 			modelUnsupported, inspectErr = responseKimiModelCapabilityFailure(response)
+		case accounts.ProviderQwen, accounts.ProviderQwenOAuth, accounts.ProviderQwenToken:
+			modelUnsupported, inspectErr = responseQwenModelCapabilityFailure(response)
 		}
 		if inspectErr != nil {
 			if t.logger != nil {
@@ -11755,11 +11967,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 							}
 							markTrafficRetryPath(attemptReq.Context(), "claude_third_party_api_key")
 							accountID = next.ID
+							accountProvider = next.Provider
 							accountCredential = next.CredentialIdentity()
 							markTrafficAccount(attemptReq.Context(), accountID)
 							tried[accountID] = struct{}{}
 							if t.server.SchedulerRef != nil {
-								t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
+								t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(accountProvider), accountID)
 							}
 							quotaFailedOver = true
 							failoverReason = accountMoveCredential
@@ -11947,14 +12160,14 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.server.markClaudeCreditExhausted(accountID)
 		} else if t.server != nil && persistentAuthorizationDenial && !modelUnsupported {
 			t.server.markPersistentAuthorizationDenial(accounts.Account{
-				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
+				ID: accountID, Provider: accountProvider, CredentialVersion: accountCredential,
 			})
 		} else if t.server != nil && credentialFailure && !modelUnsupported {
 			// Bind auth rejection to the exact credential identity captured for
 			// this attempt. A concurrent key rotation must make this late response
 			// harmless rather than cooking the repaired account generation.
 			t.server.markAccountExhaustedCredentialForAccount(accounts.Account{
-				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
+				ID: accountID, Provider: accountProvider, CredentialVersion: accountCredential,
 			})
 		} else if t.server != nil && exhausted && !modelUnsupported {
 			// Use the response's own reset time so the mark self-expires when the
@@ -11962,7 +12175,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// carries resets_in_seconds or a workspace-level reason instead, so
 			// re-read the inspected prefix for the hold-out.
 			t.server.markAccountExhaustedFromResponseBodyForAccount(accounts.Account{
-				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
+				ID: accountID, Provider: accountProvider, CredentialVersion: accountCredential,
 			}, exhaustionPool, response.StatusCode, response.Header, peekResponseBodyPrefix(response))
 		}
 		if claudeTransient429 && claudeTransient429Rerouted {
@@ -12094,9 +12307,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			failoverReason = accountMoveModel
 		}
 		if t.server != nil {
-			t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(t.provider), previousAccount, usageFailoverReason(credentialFailure, modelUnsupported))
+			t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(accountProvider), previousAccount, usageFailoverReason(credentialFailure, modelUnsupported))
 		}
 		accountID = nextAccount.ID
+		accountProvider = nextAccount.Provider
 		accountCredential = nextAccount.CredentialIdentity()
 		markTrafficAccount(attemptReq.Context(), accountID)
 		claudeTransient429Retries = 0
@@ -12104,7 +12318,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if nextReservation != nil {
 			nextReservation.Commit()
 		} else if t.server != nil && t.server.SchedulerRef != nil {
-			t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
+			t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(accountProvider), accountID)
 		}
 		// replay rebuilt the upstream URL and auth for the replacement account.
 		attemptReq = nextReq
@@ -12131,7 +12345,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.logger.Warn("retrying replayable upstream request after usage limit", "agent", t.agent, "session", t.session, "previous_account", previousAccount, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts)
 		}
 	}
-	addressed := accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential}
+	addressed := accounts.Account{ID: accountID, Provider: accountProvider, CredentialVersion: accountCredential}
 	response, err := a.send(base, attemptReq, addressed)
 	return tagRoutedResponseAccount(response, addressed), err
 }
@@ -12786,7 +13000,7 @@ func isTerminalCredentialError(err error) bool {
 // selected account regardless of how that account's credential is represented.
 func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, model string, tried map[string]struct{}) (accounts.Account, error) {
 	if model != "" && s.SchedulerRef != nil {
-		s.SchedulerRef.MarkModelIncompatible(provider, accountID, model)
+		s.SchedulerRef.MarkModelIncompatible(s.selectedAccountProvider(ctx, provider, accountID), accountID, model)
 	}
 	if tried == nil {
 		tried = make(map[string]struct{}, 1)
@@ -12853,7 +13067,7 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 		quotaScheduler := s.scheduler()
 		scheduler := s.withCapacityMarks(quotaScheduler.ForModel(poolModel), provider, poolModel, codexServiceTierFromContext(ctx))
 		if s.Sessions != nil {
-			scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+			scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions, allCandidates...))
 		}
 		candidates := make([]accounts.Account, 0, len(allCandidates))
 		for _, account := range allCandidates {
@@ -12895,7 +13109,7 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 			// attempts on accounts the controller has explicitly held out after an
 			// authoritative 429/401; keep an unmarked account available for the
 			// bounded optimistic failover path.
-			if provider == accounts.ProviderClaude && s.SchedulerRef != nil {
+			if (provider == accounts.ProviderClaude || provider == accounts.ProviderQwen) && s.SchedulerRef != nil {
 				now := time.Now()
 				eligible := candidates[:0]
 				for _, candidate := range candidates {
@@ -12927,6 +13141,18 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 			if len(candidates) == 0 {
 				if lastErr != nil {
 					return accounts.Account{}, nil, lastErr
+				}
+				if provider.Family() == accounts.ProviderQwen && s.SchedulerRef != nil {
+					allBlocked := true
+					for _, candidate := range allCandidates {
+						if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(schedulerAccountProvider(candidate.Provider), candidate.ID, poolModel, time.Now()); !blocked {
+							allBlocked = false
+							break
+						}
+					}
+					if allBlocked {
+						return accounts.Account{}, nil, s.poolExhaustedError(provider, allCandidates, poolModel)
+					}
 				}
 				return accounts.Account{}, nil, fmt.Errorf("no untried %s accounts available", provider)
 			}

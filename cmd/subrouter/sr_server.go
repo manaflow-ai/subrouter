@@ -1230,17 +1230,7 @@ func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig,
 }
 
 func (r srRunner) addKeyToServer(ctx context.Context, server srServerConfig, args []string) error {
-	command := r.programOrSubrouter() + " add-key"
-	flags := flag.NewFlagSet(command, flag.ContinueOnError)
-	flags.SetOutput(r.errOut)
-	providerRaw := flags.String("provider", string(accounts.ProviderCodex), "API-key provider: "+proxy.APIKeyProviderList())
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
-	}
-	provider, err := parseAPIKeyProvider(*providerRaw)
+	provider, err := parseAddKeyProviderArgs(r.programOrSubrouter()+" add-key", r.errOut, args)
 	if err != nil {
 		return err
 	}

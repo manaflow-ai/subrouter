@@ -1692,11 +1692,11 @@ func TestBareQwenSessionLeaseUsesTokenPlanOnlyPool(t *testing.T) {
 	}.Handler()
 
 	lease, _ := issueSessionLease(t, handler, "", "qwen3-coder-plus")
-	if lease.Assignment.Provider != string(accounts.ProviderQwenToken) || lease.Assignment.AccountID != "qwen-token:only" {
+	if lease.Assignment.Provider != string(accounts.ProviderQwen) || lease.Assignment.AccountID != "qwen-token:only" {
 		t.Fatalf("assignment = %+v, want the available Token Plan account", lease.Assignment)
 	}
-	if lease.Pi.BaseURL != "http://subrouter:31415/qwen-token" || lease.Pi.API != "openai-completions" {
-		t.Fatalf("Pi config = %+v, want qwen-token OpenAI endpoint", lease.Pi)
+	if lease.Pi.BaseURL != "http://subrouter:31415/qwen" || lease.Pi.API != "openai-completions" {
+		t.Fatalf("Pi config = %+v, want unified Qwen OpenAI endpoint", lease.Pi)
 	}
 }
 

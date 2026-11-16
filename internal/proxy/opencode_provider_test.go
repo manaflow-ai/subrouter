@@ -571,16 +571,16 @@ func TestSessionLeaseInfersBareQwenFromAvailablePlanPool(t *testing.T) {
 		pool     []accounts.Account
 		want     accounts.Provider
 	}{
-		{name: "token plan only", pool: []accounts.Account{tokenPlan}, want: accounts.ProviderQwenToken},
-		{name: "shared anthropic view only", pool: []accounts.Account{sharedAnthropic}, want: accounts.ProviderQwenToken},
+		{name: "token plan only", pool: []accounts.Account{tokenPlan}, want: accounts.ProviderQwen},
+		{name: "shared anthropic view only", pool: []accounts.Account{sharedAnthropic}, want: accounts.ProviderQwen},
 		{name: "coding plan only", pool: []accounts.Account{codingPlan}, want: accounts.ProviderQwen},
-		{name: "both prefer coding plan", pool: []accounts.Account{tokenPlan, codingPlan}, want: accounts.ProviderQwen},
-		{name: "explicit coding plan is not redirected", provider: "qwen", pool: []accounts.Account{tokenPlan}, want: accounts.ProviderQwen},
+		{name: "both share Qwen family", pool: []accounts.Account{tokenPlan, codingPlan}, want: accounts.ProviderQwen},
+		{name: "explicit Qwen selects the family", provider: "qwen", pool: []accounts.Account{tokenPlan}, want: accounts.ProviderQwen},
 		{name: "explicit token plan is preserved", provider: "qwen-token", pool: []accounts.Account{codingPlan}, want: accounts.ProviderQwenToken},
 		{name: "explicit anthropic protocol is preserved", provider: "qwen-anthropic", pool: []accounts.Account{codingPlan, tokenPlan}, want: accounts.ProviderQwenAnthropic},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			provider, model, err := sessionLeaseProviderForAccounts(test.provider, "qwen3-coder-plus", test.pool)
+			provider, model, err := sessionLeaseProvider(test.provider, "qwen3-coder-plus")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -641,6 +641,9 @@ func TestHandlerRoutesQwenTokenPlanAlongsideCodingPlan(t *testing.T) {
 		"/qwen-token/v1/chat/completions": &tokenHits,
 	} {
 		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"qwen3.8-max"}`))
+		if strings.HasPrefix(path, "/qwen/") {
+			req.Header.Set("X-Subrouter-Account-ID", "qwen:coding")
+		}
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusNoContent {

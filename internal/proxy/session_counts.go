@@ -13,13 +13,21 @@ import (
 // and a Claude profile can legitimately share an email, so bare-ID counts
 // would make one provider's sessions damp placement for another. Agent types
 // such as pi still map to Codex because they use the Codex credential pool.
-func SchedulerSessionCounts(store *session.Store) map[string]int {
+func SchedulerSessionCounts(store *session.Store, pool ...account.Account) map[string]int {
 	counts := map[string]int{}
 	if store == nil {
 		return counts
 	}
 	for _, assignment := range store.All() {
 		provider := providerForStoredSession(assignment.AgentType)
+		if provider == account.ProviderQwen {
+			for _, candidate := range pool {
+				if candidate.ID == assignment.AccountID && candidate.Provider.Family() == account.ProviderQwen {
+					provider = accountProviderFor(candidate.Provider)
+					break
+				}
+			}
+		}
 		counts[selectacct.ScoreKey(provider, assignment.AccountID)]++
 	}
 	return counts
@@ -37,13 +45,21 @@ const placementActiveWindow = 30 * time.Minute
 // sessions that sent a request within placementActiveWindow. Routing passes
 // these to Scheduler.WithSessionCounts; status views that report how many
 // assignments an account holds keep SchedulerSessionCounts.
-func SchedulerActiveSessionCounts(store *session.Store) map[string]int {
+func SchedulerActiveSessionCounts(store *session.Store, pool ...account.Account) map[string]int {
 	counts := map[string]int{}
 	if store == nil {
 		return counts
 	}
 	for _, assignment := range store.ActiveSince(time.Now().Add(-placementActiveWindow)) {
 		provider := providerForStoredSession(assignment.AgentType)
+		if provider == account.ProviderQwen {
+			for _, candidate := range pool {
+				if candidate.ID == assignment.AccountID && candidate.Provider.Family() == account.ProviderQwen {
+					provider = accountProviderFor(candidate.Provider)
+					break
+				}
+			}
+		}
 		counts[selectacct.ScoreKey(provider, assignment.AccountID)]++
 	}
 	return counts

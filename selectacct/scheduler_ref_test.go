@@ -1,11 +1,54 @@
 package selectacct
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/account"
 )
+
+func TestMembershipQuotaTracksSubjectAcrossAccountSnapshots(t *testing.T) {
+	for _, advance := range []bool{false, true} {
+		for _, change := range []string{"rotation", "replacement", "missing subject", "removal"} {
+			t.Run(fmt.Sprintf("advance=%t/%s", advance, change), func(t *testing.T) {
+				original := account.Account{ID: "qwen-subscription:work", Provider: account.ProviderQwenOAuth, AccountID: "member", Token: "old"}
+				ref := NewSchedulerRef(NewScheduler(nil))
+				ref.AdvanceAccountGenerationWithAccounts(1, 1, []account.Account{original})
+				until := time.Now().Add(7 * 24 * time.Hour).Truncate(time.Second)
+				ref.MarkMembershipExhaustedUntil(original.Provider, original.ID, original.AccountID, until)
+				next := original
+				next.Token = "rotated"
+				snapshot := []account.Account{next}
+				switch change {
+				case "replacement":
+					snapshot[0].AccountID = "different member"
+				case "missing subject":
+					snapshot[0].AccountID = ""
+				case "removal":
+					snapshot = nil
+				}
+				if advance {
+					ref.AdvanceAccountGenerationWithAccounts(2, 2, snapshot)
+				} else if !ref.SyncAccountCredentials(1, 2, snapshot) {
+					t.Fatal("credential snapshot rejected")
+				}
+				got, blocked := ref.BlockedUntilFor(original.Provider, original.ID, "", time.Now())
+				if blocked != (change == "rotation") || (blocked && !got.Equal(until)) {
+					t.Fatalf("quota after %s: blocked=%t until=%v", change, blocked, got)
+				}
+				if change == "removal" && len(ref.membershipQuota) != 0 {
+					t.Fatal("removed account retained membership metadata")
+				}
+			})
+		}
+	}
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.MarkMembershipExhaustedUntil(account.ProviderQwenOAuth, "unbound", "", time.Now().Add(time.Hour))
+	if _, blocked := ref.BlockedUntilFor(account.ProviderQwenOAuth, "unbound", "", time.Now()); blocked {
+		t.Fatal("missing subject created an unbound quota hold")
+	}
+}
 
 // finishBegunRefresh completes the refresh a test began with
 // BeginRefreshIfStale, at the account generation that refresh began with.

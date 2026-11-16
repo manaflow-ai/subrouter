@@ -132,6 +132,9 @@ func TestValidateCredentialUpstreamsIncludesAntigravityOAuth(t *testing.T) {
 func TestAPIKeyProviderListNamesEveryProvider(t *testing.T) {
 	list := APIKeyProviderList()
 	for _, want := range append([]string{"codex", "claude"}, keyedProviderNames()...) {
+		if entry, ok := keyedProviderFor(accounts.Provider(want)); ok && entry.OAuthOnly {
+			continue
+		}
 		if !strings.Contains(list, want) {
 			t.Fatalf("provider list %q omits %q", list, want)
 		}

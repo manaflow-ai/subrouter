@@ -52,6 +52,8 @@ func srStatusFixtureServer(t *testing.T, fixturePaths ...string) *httptest.Serve
 // credential storage points at a team router.
 func runSRStatusAgainstFixture(t *testing.T, args []string, fixturePaths ...string) (string, error) {
 	t.Helper()
+	// Status fixtures must not start a detached updater in their temporary home.
+	t.Setenv(autoUpdateDisableEnv, "1")
 	if os.Getenv("COLUMNS") == "" {
 		t.Setenv("COLUMNS", "200")
 	}

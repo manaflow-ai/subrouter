@@ -1,0 +1,416 @@
+package proxy
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
+)
+
+func TestQwenUnifiedRouteFailover(t *testing.T) {
+	for _, failure := range []int{402, 429, 401, 404, 502, 503, 504} {
+		t.Run(http.StatusText(failure), func(t *testing.T) {
+			var oauthCalls, tokenCalls atomic.Int32
+			reset := time.Now().Add(7 * 24 * time.Hour).Truncate(time.Second)
+			oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				oauthCalls.Add(1)
+				if r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer oauth-key" {
+					t.Errorf("wrong subscription target: %s", r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(failure)
+				if failure == 402 {
+					fmt.Fprintf(w, `{"error":{"type":"billing_error","code":"insufficient_quota","message":"insufficient credits: top up and retry","quota":{"member_type":"pro","reset_at":%d}}}`, reset.Unix())
+				} else if failure == 404 {
+					io.WriteString(w, `{"error":{"code":"model_not_found","message":"Model unavailable"}}`)
+				} else {
+					io.WriteString(w, `{"error":{"message":"quota or credential rejected"}}`)
+				}
+			}))
+			defer oauth.Close()
+			token := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				tokenCalls.Add(1)
+				if r.URL.Path != "/compatible-mode/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer plan-key" {
+					t.Errorf("wrong Token Plan target: %s", r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				io.WriteString(w, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`)
+			}))
+			defer token.Close()
+			sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			rows := []accounts.Account{{ID: "qwen-subscription:member", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth, Token: "oauth-key"}, {ID: "qwen-token:plan", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "plan-key"}}
+			s := Server{Accounts: rows, Sessions: sessions, SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)), QwenOAuthUpstream: mustParseURL(t, oauth.URL+"/v1"), QwenTokenUpstream: mustParseURL(t, token.URL+"/compatible-mode/v1"), MaxBodyBytes: 4096}
+			handler := s.Handler()
+			for range 2 {
+				req := httptest.NewRequest("POST", "/qwen/v1/chat/completions", strings.NewReader(`{"model":"qwen3.8-max","messages":[]}`))
+				req.Header.Set("X-Subrouter-Session", "sticky")
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, req)
+				if rec.Code != 200 || !strings.Contains(rec.Body.String(), "ok") {
+					t.Fatalf("HTTP %d: %s", rec.Code, rec.Body.String())
+				}
+			}
+			if oauthCalls.Load() != 1 || tokenCalls.Load() != 2 {
+				t.Fatalf("attempts OAuth=%d Token=%d; want 1/2 with subscription first and sticky fallback", oauthCalls.Load(), tokenCalls.Load())
+			}
+			assignment, ok := sessions.Get("qwen", "sticky")
+			if !ok || assignment.AccountID != rows[1].ID {
+				t.Fatalf("assignment=%+v, found=%v", assignment, ok)
+			}
+			scheduler := s.SchedulerRef.Get()
+			if failure == 402 {
+				until, blocked := s.SchedulerRef.BlockedUntilFor(accounts.ProviderQwenOAuth, rows[0].ID, "", time.Now())
+				if !blocked || !until.Equal(reset) {
+					t.Fatalf("quota reset lost: until=%v blocked=%v want=%v", until, blocked, reset)
+				}
+			}
+			if (failure == 401 || failure == 402 || failure == 429) && !scheduler.Exhausted(accounts.ProviderQwenOAuth, rows[0].ID) {
+				t.Fatal("failure was not charged to subscription backend")
+			}
+			if scheduler.Exhausted(accounts.ProviderQwenToken, rows[1].ID) {
+				t.Fatal("healthy plan inherited subscription exhaustion")
+			}
+		})
+	}
+}
+
+func TestQwenUnifiedPinAndExplicitRoutes(t *testing.T) {
+	var oauthCalls, tokenCalls atomic.Int32
+	oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { oauthCalls.Add(1); w.WriteHeader(429) }))
+	defer oauth.Close()
+	token := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenCalls.Add(1)
+		io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer token.Close()
+	rows := []accounts.Account{{ID: "qwen-subscription:member", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth, Token: "oauth-key"}, {ID: "qwen-token:plan", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "plan-key"}}
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := Server{Accounts: rows, Sessions: sessions, QwenOAuthUpstream: mustParseURL(t, oauth.URL+"/v1"), QwenTokenUpstream: mustParseURL(t, token.URL+"/v1"), MaxBodyBytes: 4096}
+	for _, tt := range []struct {
+		path, pin string
+		want      int
+	}{{"/qwen/v1/chat/completions", rows[0].ID, 429}, {"/qwen-oauth/v1/chat/completions", "", 429}, {"/qwen-token/v1/chat/completions", "", 200}} {
+		req := httptest.NewRequest("POST", tt.path, strings.NewReader(`{"model":"qwen3.8-max","messages":[]}`))
+		if tt.pin != "" {
+			req.Header.Set("X-Subrouter-Account-ID", tt.pin)
+		}
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != tt.want {
+			t.Fatalf("%s pinned %q: HTTP %d, want %d", tt.path, tt.pin, rec.Code, tt.want)
+		}
+	}
+	if tokenCalls.Load() != 1 {
+		t.Fatal("pinned or explicit subscription request leaked to Token Plan")
+	}
+}
+
+func TestQwenUnifiedStreamAndUsageAttribution(t *testing.T) {
+	var oauthCalls, tokenCalls atomic.Int32
+	oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		oauthCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(429)
+		io.WriteString(w, `{"error":{"code":"insufficient_quota"}}`)
+	}))
+	defer oauth.Close()
+	token := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n")
+	}))
+	defer token.Close()
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := NewTokenUsageRecorder("", nil)
+	s := Server{Accounts: []accounts.Account{{ID: "qwen-subscription:member", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth, Token: "oauth-key"}, {ID: "qwen-token:plan", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "plan-key"}}, Sessions: sessions, TokenUsage: ledger, SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)), QwenOAuthUpstream: mustParseURL(t, oauth.URL+"/v1"), QwenTokenUpstream: mustParseURL(t, token.URL+"/v1"), MaxBodyBytes: 4096}
+	req := httptest.NewRequest("POST", "/qwen/v1/chat/completions", strings.NewReader(`{"model":"qwen3.8-max","stream":true,"messages":[]}`))
+	req.Header.Set("X-Subrouter-Session", "stream")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "[DONE]") || strings.Contains(rec.Body.String(), "insufficient_quota") {
+		t.Fatalf("bad stream: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+	rows, err := ledger.Rows(time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var outputs int64
+	for _, row := range rows {
+		if row.OutputTokens > 0 {
+			if row.Provider != "qwen-token" || row.AccountID != "qwen-token:plan" {
+				t.Fatalf("usage charged to wrong backend: %+v", row)
+			}
+			outputs += row.OutputTokens
+		}
+	}
+	if outputs != 3 || oauthCalls.Load() != 1 || tokenCalls.Load() != 1 {
+		t.Fatalf("output=%d calls=%d/%d", outputs, oauthCalls.Load(), tokenCalls.Load())
+	}
+}
+
+func TestQwenUnifiedDoesNotReplayClientErrorsOrPartialStreams(t *testing.T) {
+	for _, tt := range []struct {
+		name              string
+		status            int
+		contentType, body string
+	}{
+		{"unclassified billing", 402, "application/json", `{"error":{"code":"payment_method_required"}}`},
+		{"parameters", 400, "application/json", `{"error":{"code":"invalid_parameter","message":"invalid temperature"}}`},
+		{"context", 400, "application/json", `{"error":{"code":"context_length_exceeded"}}`},
+		{"partial stream", 200, "text/event-stream", "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"error\":{\"code\":\"insufficient_quota\"}}\n\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var fallback atomic.Int32
+			oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tt.contentType)
+				w.WriteHeader(tt.status)
+				io.WriteString(w, tt.body)
+			}))
+			defer oauth.Close()
+			token := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fallback.Add(1); w.WriteHeader(204) }))
+			defer token.Close()
+			sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := Server{Accounts: []accounts.Account{{ID: "qwen-subscription:member", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth, Token: "oauth-key"}, {ID: "qwen-token:plan", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "plan-key"}}, Sessions: sessions, QwenOAuthUpstream: mustParseURL(t, oauth.URL+"/v1"), QwenTokenUpstream: mustParseURL(t, token.URL+"/v1"), MaxBodyBytes: 4096}
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/qwen/v1/chat/completions", strings.NewReader(`{"model":"qwen3.8-max","messages":[]}`)))
+			if rec.Code != tt.status || rec.Body.String() != tt.body || fallback.Load() != 0 {
+				t.Fatalf("client response changed or replayed: HTTP %d, fallback=%d, body=%s", rec.Code, fallback.Load(), rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestQwenUnifiedLeaseBindsActualBackend(t *testing.T) {
+	for _, provider := range []accounts.Provider{accounts.ProviderQwenOAuth, accounts.ProviderQwenToken} {
+		t.Run(string(provider), func(t *testing.T) {
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer selected-key" {
+					t.Errorf("lease used wrong target %s", r.URL.Path)
+				}
+				io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+			}))
+			defer upstream.Close()
+			mode := accounts.AuthModeAPIKey
+			id := "qwen-token:plan"
+			if provider == accounts.ProviderQwenOAuth {
+				mode = accounts.AuthModeOAuth
+				id = "qwen-subscription:member"
+			}
+			s := Server{Accounts: []accounts.Account{{ID: id, Provider: provider, AuthMode: mode, Token: "selected-key"}}, Sessions: newSessionStore(t), Scheduler: selectacct.NewScheduler(nil), sessionLeases: newSessionLeaseStore(), AdminToken: "service-admin-token", RequireSessionLease: true, QwenOAuthUpstream: mustParseURL(t, upstream.URL+"/v1"), QwenTokenUpstream: mustParseURL(t, upstream.URL+"/v1"), MaxBodyBytes: 4096}
+			handler := s.Handler()
+			lease, _ := issueSessionLease(t, handler, "qwen", "qwen3.8-max")
+			token := lease.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"]
+			if lease.Assignment.Provider != "qwen" || lease.Assignment.AccountID != id {
+				t.Fatalf("wrong lease assignment: %+v", lease.Assignment)
+			}
+			req := httptest.NewRequest("POST", "/qwen/chat/completions", strings.NewReader(`{"model":"qwen3.8-max","messages":[]}`))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != 200 || calls.Load() != 1 {
+				t.Fatalf("bound lease HTTP=%d calls=%d body=%s", rec.Code, calls.Load(), rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestQwenUnifiedBrokerLeaseSelectsAndReportsBackend(t *testing.T) {
+	oauth := accounts.Account{ID: "qwen-subscription:member", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth, Token: "member-token"}
+	plan := accounts.Account{ID: "qwen-token:plan", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "plan-key"}
+	server := tenantLeaseTestServer(oauth, plan)
+	server.Sessions = newSessionStore(t)
+	store := newTenantCredentialLeaseStore()
+	client := tenantLeaseTestBrokerClient(t, server, store)
+	input := broker.LeaseRequest{Provider: accounts.ProviderQwen, SessionID: "family-broker", Model: "qwen3.8-max"}
+	first, err := client.Lease(t.Context(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Account.Provider != oauth.Provider || first.Account.ID != oauth.ID {
+		t.Fatalf("first lease did not preserve subscription backend: %+v", first.Account)
+	}
+	if err := client.Report(t.Context(), first.ID, broker.LeaseReport{Outcome: broker.LeaseRateLimited, StatusCode: 402, CooldownScope: broker.LeaseCooldownAccount, RetryAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := client.Lease(t.Context(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Account.Provider != plan.Provider || second.Account.ID != plan.ID {
+		t.Fatalf("reported subscription did not yield to plan backend: %+v", second.Account)
+	}
+}
+
+func TestQwenUnifiedSessionCountsUseBackendIdentity(t *testing.T) {
+	store := newSessionStore(t)
+	pool := []accounts.Account{{ID: "member", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth}, {ID: "plan", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey}, {ID: "member", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}}
+	for _, id := range []string{"member", "plan"} {
+		if _, err := store.Put("qwen", "session-"+id, id, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assigned := SchedulerSessionCounts(store, pool...)
+	active := SchedulerActiveSessionCounts(store, pool...)
+	for _, acct := range pool[:2] {
+		key := selectacct.ScoreKey(acct.Provider, acct.ID)
+		if assigned[key] != 1 || active[key] != 1 {
+			t.Fatalf("backend %s counts assigned=%d active=%d", acct.Provider, assigned[key], active[key])
+		}
+	}
+	server := Server{Accounts: pool, Sessions: store}
+	status := server.withSessionCounts([]AccountUsageStatus{{AccountStatus: AccountStatus{ID: "member", Provider: accounts.ProviderQwenOAuth}}, {AccountStatus: AccountStatus{ID: "plan", Provider: accounts.ProviderQwenToken}}})
+	if status[0].AssignedSessions != 1 || !status[0].Active || status[1].AssignedSessions != 1 {
+		t.Fatalf("status omitted unified sessions: %+v", status)
+	}
+}
+
+func TestQwenQuotaResponseCannotBlockReplacedCredential(t *testing.T) {
+	old := accounts.Account{ID: "qwen-token:plan", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "old-key"}
+	current := old
+	current.Token = "replacement-key"
+	ref := &AccountRef{accounts: []accounts.Account{current}, accountGeneration: 2, credentialRevision: 2}
+	scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	scheduler.SyncAccountCredentials(2, 2, SchedulerAccounts([]accounts.Account{current}))
+	server := Server{AccountRef: ref, SchedulerRef: scheduler}
+	reset := time.Now().Add(7 * 24 * time.Hour).Truncate(time.Second)
+	body := []byte(fmt.Sprintf(`{"error":{"code":"insufficient_quota","quota":{"reset_at":%d}}}`, reset.Unix()))
+	server.markAccountExhaustedFromResponseBodyForAccount(old, "", 402, nil, body)
+	if _, blocked := scheduler.BlockedUntilFor(current.Provider, current.ID, "", time.Now()); blocked {
+		t.Fatal("late old credential response blocked the replacement")
+	}
+	server.markAccountExhaustedFromResponseBodyForAccount(current, "", 402, nil, body)
+	if until, blocked := scheduler.BlockedUntilFor(current.Provider, current.ID, "", time.Now()); !blocked || !until.Equal(reset) {
+		t.Fatal("current quota evidence lost its reset", until, blocked)
+	}
+}
+
+func TestQwenSubscriptionQuotaHoldSurvivesRoutineCredentialRotation(t *testing.T) {
+	account := accounts.Account{ID: "qwen-subscription:member", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth, AccountID: "membership", Token: "access", CredentialVersion: "grant"}
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{account}, nil)
+	scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	server := Server{AccountRef: ref, SchedulerRef: scheduler}
+	server.accountListSnapshotContext(t.Context())
+	reset := time.Now().Add(7 * 24 * time.Hour).Truncate(time.Second)
+	body := []byte(fmt.Sprintf(`{"error":{"code":"insufficient_quota","quota":{"reset_at":%d}}}`, reset.Unix()))
+	server.markAccountExhaustedFromResponseBodyForAccount(account, "qwen3.8-max", 402, nil, body)
+	rotated := account
+	rotated.Token, rotated.CredentialVersion = "rotated-access", "rotated-grant"
+	ref.replace(rotated)
+	loaded, generation, revision := ref.CredentialSnapshot()
+	if !scheduler.SyncAccountCredentials(generation, revision, SchedulerAccounts(loaded)) {
+		t.Fatal("routine rotation was not synchronized")
+	}
+	if until, blocked := scheduler.BlockedUntilFor(account.Provider, account.ID, "", time.Now()); !blocked || !until.Equal(reset) {
+		t.Fatalf("routine rotation lost quota hold: blocked=%t until=%v", blocked, until)
+	}
+	// A stale or membership-only score cannot prove that paid quota recovered.
+	scheduler.Set(selectacct.NewScheduler([]selectacct.Score{{AccountID: account.ID, Provider: account.Provider, Headroom: 1, ShortHeadroom: 1}}))
+	if _, blocked := scheduler.BlockedUntilFor(account.Provider, account.ID, "", time.Now()); !blocked {
+		t.Fatal("unmeasured membership score cleared quota hold")
+	}
+	// Re-enrolling the label for a different membership must not inherit its hold.
+	replacement := rotated
+	replacement.Token, replacement.CredentialVersion, replacement.AccountID = "replacement-access", "replacement-grant", "different-membership"
+	ref.replace(replacement)
+	loaded, generation, revision = ref.CredentialSnapshot()
+	scheduler.SyncAccountCredentials(generation, revision, SchedulerAccounts(loaded))
+	if _, blocked := scheduler.BlockedUntilFor(account.Provider, account.ID, "", time.Now()); blocked {
+		t.Fatal("replacement membership inherited the previous membership's quota hold")
+	}
+	// Restore current quota evidence so a measured recovery can supersede it.
+	server.markAccountExhaustedFromResponseBodyForAccount(replacement, "", 402, nil, body)
+	scheduler.Set(selectacct.NewScheduler([]selectacct.Score{{AccountID: account.ID, Provider: account.Provider, Headroom: 1, ShortHeadroom: 1, Fresh: true}}))
+	if _, blocked := scheduler.BlockedUntilFor(account.Provider, account.ID, "", time.Now()); blocked {
+		t.Fatal("fresh quota recovery did not clear quota hold")
+	}
+	// After a replacement, an old in-flight response must not create a new hold.
+	server.markAccountExhaustedFromResponseBodyForAccount(account, "", 402, nil, body)
+	if _, blocked := scheduler.BlockedUntilFor(account.Provider, account.ID, "", time.Now()); blocked {
+		t.Fatal("late old credential response blocked the replacement")
+	}
+}
+
+func TestQwenSubscriptionQuotaWithoutSubjectStaysCredentialScoped(t *testing.T) {
+	account := accounts.Account{ID: "qwen-subscription:unknown", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth, Token: "access"}
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{account}, nil)
+	scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	server := Server{AccountRef: ref, SchedulerRef: scheduler}
+	server.accountListSnapshotContext(t.Context())
+	reset := time.Now().Add(7 * 24 * time.Hour).Truncate(time.Second)
+	body := []byte(fmt.Sprintf(`{"error":{"code":"insufficient_quota","quota":{"reset_at":%d}}}`, reset.Unix()))
+	server.markAccountExhaustedFromResponseBodyForAccount(account, "", 402, nil, body)
+	if until, blocked := scheduler.BlockedUntilFor(account.Provider, account.ID, "", time.Now()); !blocked || !until.Equal(reset) {
+		t.Fatal("missing subject lost the credential's quota evidence", until, blocked)
+	}
+	account.Token = "different-access"
+	ref.replace(account)
+	loaded, generation, revision := ref.CredentialSnapshot()
+	scheduler.SyncAccountCredentials(generation, revision, SchedulerAccounts(loaded))
+	if _, blocked := scheduler.BlockedUntilFor(account.Provider, account.ID, "", time.Now()); blocked {
+		t.Fatal("missing subject created an unbound durable label hold")
+	}
+}
+
+func TestQwenExhaustedExplicitRouteReportsPoolStatusAndUnifiedUsesTokenPlan(t *testing.T) {
+	var oauthCalls, tokenCalls atomic.Int32
+	oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		oauthCalls.Add(1)
+		w.WriteHeader(http.StatusPaymentRequired)
+	}))
+	defer oauth.Close()
+	token := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenCalls.Add(1)
+		io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer token.Close()
+	rows := []accounts.Account{{ID: "qwen-subscription:member", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth, Token: "oauth-key"}, {ID: "qwen-token:plan", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "plan-key"}}
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	s := Server{Accounts: rows, Sessions: sessions, SchedulerRef: scheduler, QwenOAuthUpstream: mustParseURL(t, oauth.URL+"/v1"), QwenTokenUpstream: mustParseURL(t, token.URL+"/v1"), MaxBodyBytes: 4096}
+	handler := s.Handler()
+	scheduler.MarkExhaustedUntil(accounts.ProviderQwenOAuth, rows[0].ID, "", time.Now().Add(time.Hour))
+	for _, path := range []string{"/qwen-oauth/v1/chat/completions", "/qwen/v1/chat/completions"} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"qwen4.0-max-preview","messages":[],"stream":true}`))
+		req.Header.Set("X-Subrouter-Session", path)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if path == "/qwen-oauth/v1/chat/completions" {
+			if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" || !strings.Contains(rec.Body.String(), "retry after") {
+				t.Fatalf("known quota exhaustion became a transport error: HTTP %d headers=%v body=%s", rec.Code, rec.Header(), rec.Body.String())
+			}
+		} else if rec.Code != http.StatusOK {
+			t.Fatalf("healthy pooled Token Plan was unavailable: HTTP %d %s", rec.Code, rec.Body.String())
+		}
+	}
+	if oauthCalls.Load() != 0 || tokenCalls.Load() != 1 {
+		t.Fatalf("quota-held subscription retried or backend route leaked: OAuth=%d Token=%d", oauthCalls.Load(), tokenCalls.Load())
+	}
+}

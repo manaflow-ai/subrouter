@@ -27,10 +27,13 @@ const (
 	// the device-code grant and reaches the CLI's chat-proxy endpoint.
 	ProviderGrok Provider = "grok"
 
-	// ProviderQwen routes to Alibaba Cloud Model Studio's Coding Plan, whose
-	// subscription is addressed with a plan-specific API key on a dedicated
-	// OpenAI-compatible endpoint.
+	// ProviderQwen is the client-facing Qwen family. In saved API-key records
+	// this legacy value identifies the Coding Plan backend; other Qwen values
+	// below retain their credential backend and explicit-route identities.
 	ProviderQwen Provider = "qwen"
+
+	// ProviderQwenOAuth is a Qwen.ai Plus/Pro subscription, separate from Alibaba plan keys.
+	ProviderQwenOAuth Provider = "qwen-oauth"
 
 	// ProviderQwenToken routes to Model Studio's Token Plan, which is a
 	// separate subscription from the Coding Plan with its own key and its own
