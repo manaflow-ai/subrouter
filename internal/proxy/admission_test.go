@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
@@ -140,6 +141,35 @@ func TestAdmissionClaudeUsageDoesNotClearStaleOrOtherModelPause(t *testing.T) {
 	if _, err := control.acquire(context.Background(), opus); !errors.Is(err, errAdmissionPaused) {
 		t.Fatalf("zero fresh Opus score cleared genuine pause: %v", err)
 	}
+}
+
+func TestUsageStatusRefreshReconcilesClaudeAdmissionPause(t *testing.T) {
+	control := testAdmissionControl(1, 2)
+	key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus")
+	control.pause(key, time.Now().Add(time.Hour))
+	server := Server{
+		Accounts: []accounts.Account{{
+			ID: "account-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth,
+		}},
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+			AccountID: "account-a", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
+		}})),
+		admission: control,
+	}
+	server.updateSchedulerFromUsageStatuses([]AccountUsageStatus{{
+		AccountStatus: AccountStatus{ID: "account-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		UsageFresh:    true,
+		Windows: []accounts.UsageWindow{
+			{Name: "5h", UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60},
+			{Name: "7d", UsedPercent: 40, LimitWindowSeconds: 7 * 24 * 60 * 60},
+			{Name: "opus-weekly", Feature: agentclaude.OpusFeature, UsedPercent: 20, LimitWindowSeconds: 7 * 24 * 60 * 60},
+		},
+	}})
+	lease, err := control.acquire(context.Background(), key)
+	if err != nil {
+		t.Fatalf("fresh usage-status refresh left Claude admission paused: %v", err)
+	}
+	lease.release()
 }
 
 func TestInflightAttemptTransportGatesResponseLifetime(t *testing.T) {

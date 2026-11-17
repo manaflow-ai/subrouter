@@ -3606,6 +3606,13 @@ func (s Server) updateSchedulerFromUsageStatusesAtScoreRevision(
 	if scored == 0 {
 		return
 	}
+	// A usage-status refresh is just as authoritative for Claude admission as
+	// the full score sweep below.  Without this hook, `sr status --refresh`
+	// could show fresh positive quota while the request-time admission bucket
+	// stayed paused until its old reset deadline.
+	if s.admission != nil {
+		s.admission.reconcileClaudeUsage(scores, time.Now())
+	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
