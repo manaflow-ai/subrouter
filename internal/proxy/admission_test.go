@@ -103,11 +103,13 @@ func TestAdmissionPauseUsesClaudeQuotaReset(t *testing.T) {
 func TestAdmissionClaudeUsageReconcilesExactModelPause(t *testing.T) {
 	control := testAdmissionControl(1, 2)
 	key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus")
-	control.pause(key, time.Now().Add(time.Hour))
+	pausedAt := time.Now()
+	control.pause(key, pausedAt.Add(time.Hour))
 	control.reconcileClaudeUsage([]selectacct.Score{{
 		AccountID: "account-a", Provider: accounts.ProviderClaude, Fresh: true,
+		UsageObservedAt: pausedAt.Add(time.Second),
 		ModelScores: map[string]selectacct.Score{
-			"claudeopus": {Headroom: 0.97, WeeklyHeadroom: 0.97, WeeklyHeadroomKnown: true},
+			"claudeopus": {Headroom: 0.97, WeeklyHeadroom: 0.97, WeeklyHeadroomKnown: true, ModelQuotaKnown: true},
 		},
 	}}, time.Now())
 	lease, err := control.acquire(context.Background(), key)
@@ -157,8 +159,9 @@ func TestUsageStatusRefreshReconcilesClaudeAdmissionPause(t *testing.T) {
 		admission: control,
 	}
 	server.updateSchedulerFromUsageStatuses([]AccountUsageStatus{{
-		AccountStatus: AccountStatus{ID: "account-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
-		UsageFresh:    true,
+		AccountStatus:  AccountStatus{ID: "account-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		UsageFresh:     true,
+		UsageFetchedAt: time.Now().Add(time.Minute),
 		Windows: []accounts.UsageWindow{
 			{Name: "5h", UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60},
 			{Name: "7d", UsedPercent: 40, LimitWindowSeconds: 7 * 24 * 60 * 60},

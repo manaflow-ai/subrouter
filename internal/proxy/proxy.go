@@ -2830,6 +2830,22 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 	score := selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)
 	score.Provider = provider
 	if provider == accounts.ProviderClaude {
+		for _, window := range windows {
+			if window.Feature == "" {
+				continue
+			}
+			// A null model bucket is represented as a synthetic zero window so
+			// routing can still consider an unused model. It is not provider
+			// evidence that can clear a request-time model pause.
+			if window.UsedPercent != 0 || window.ResetAfterSeconds != 0 || !window.ResetAt.IsZero() {
+				if modelScore, ok := score.ModelScores[selectacct.ModelKey(window.Feature)]; ok {
+					modelScore.ModelQuotaKnown = true
+					score.ModelScores[selectacct.ModelKey(window.Feature)] = modelScore
+				}
+			}
+		}
+	}
+	if provider == accounts.ProviderClaude {
 		if extra := extraUsageFromWindows(windows); extra != nil {
 			applyExtra := func(target *selectacct.Score) {
 				target.ClaudeExtraUsageEnabled = extra.IsEnabled
@@ -3599,6 +3615,7 @@ func (s Server) updateSchedulerFromUsageStatusesAtScoreRevision(
 		if idx, ok := scoreByID[selectacct.ScoreKey(statusProvider, status.ID)]; ok {
 			next := scoreFromUsageWindows(statusProvider, status.ID, status.Windows)
 			next.Fresh = true
+			next.UsageObservedAt = status.UsageFetchedAt
 			scores[idx] = next
 			scored++
 		}
@@ -3606,18 +3623,13 @@ func (s Server) updateSchedulerFromUsageStatusesAtScoreRevision(
 	if scored == 0 {
 		return
 	}
-	// A usage-status refresh is just as authoritative for Claude admission as
-	// the full score sweep below.  Without this hook, `sr status --refresh`
-	// could show fresh positive quota while the request-time admission bucket
-	// stayed paused until its old reset deadline.
-	if s.admission != nil {
-		s.admission.reconcileClaudeUsage(scores, time.Now())
-	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
 	}
-	s.SchedulerRef.SetForAccountGenerationAtScoreRevision(scheduler, accountGeneration, scoreRevision)
+	if s.SchedulerRef.SetForAccountGenerationAtScoreRevision(scheduler, accountGeneration, scoreRevision) && s.admission != nil {
+		s.admission.reconcileClaudeUsage(scores, time.Now())
+	}
 }
 
 func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) []AccountUsageStatus {
@@ -5124,14 +5136,18 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			}
 			var windows []accounts.UsageWindow
 			var fresh bool
+			var observedAt time.Time
 			if reverifyClaudeQuota {
 				windows, err = s.AccountRef.claudeFableProbe(sweepCtx, client, refreshed)
 				fresh = err == nil && fableProbeHasPrimaryWindows(windows)
+				if fresh {
+					observedAt = time.Now().UTC()
+				}
 				if err == nil && !fresh {
 					return
 				}
 			} else {
-				windows, fresh, err = s.fetchAccountUsageWindows(sweepCtx, client, refreshed)
+				windows, fresh, observedAt, err = s.fetchAccountUsageWindows(sweepCtx, client, refreshed)
 			}
 			if err != nil {
 				if s.Logger != nil {
@@ -5157,6 +5173,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			if idx, ok := scoreByID[selectacct.ScoreKey(scoreProvider, account.ID)]; ok {
 				next := scoreFromUsageWindows(scoreProvider, account.ID, windows)
 				next.Fresh = true
+				next.UsageObservedAt = observedAt
 				scores[idx] = next
 				scored++
 			}
@@ -5168,12 +5185,13 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 
 // fetchAccountUsageWindows returns an account's usage windows and whether they
 // are fresh (a recent successful fetch) versus a stale last-known-good fallback.
-func (s Server) fetchAccountUsageWindows(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, error) {
+func (s Server) fetchAccountUsageWindows(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, time.Time, error) {
 	if s.AccountRef != nil {
-		return s.AccountRef.FetchUsageWindowsCached(ctx, client, account)
+		windows, fresh, observedAt, _, err := s.AccountRef.FetchUsageWindowsCachedWithObservation(ctx, client, account)
+		return windows, fresh, observedAt, err
 	}
 	windows, err := fetchAccountUsageWindowsLive(ctx, client, account)
-	return windows, err == nil, err
+	return windows, err == nil, time.Now().UTC(), err
 }
 
 func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
@@ -9898,9 +9916,6 @@ func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []a
 		}
 		return
 	}
-	if s.admission != nil {
-		s.admission.reconcileClaudeUsage(scores, time.Now())
-	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
@@ -9911,6 +9926,9 @@ func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []a
 			s.Logger.Debug("usage score refresh discarded after account reload")
 		}
 		return
+	}
+	if s.admission != nil {
+		s.admission.reconcileClaudeUsage(scores, time.Now())
 	}
 	if s.AccountRef != nil {
 		// The score sweep already fetched these windows. Publish the same

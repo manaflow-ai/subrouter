@@ -165,9 +165,11 @@ const (
 )
 
 type admissionBucket struct {
-	active    int
-	waiters   []*admissionWaiter
-	pausedTil time.Time
+	active     int
+	waiters    []*admissionWaiter
+	pausedTil  time.Time
+	pausedAt   time.Time
+	quotaPause bool
 	// changed wakes waiters that queued before a pause was applied, so they
 	// arm an expiry timer even if every active stream closes during the pause.
 	changed chan struct{}
@@ -621,11 +623,14 @@ func (a *admissionControl) pauseWithRecovery(key admissionKey, until time.Time, 
 	if until.After(bucket.pausedTil) {
 		bucket.pausedTil = until
 		bucket.recoverSlowly = recoverSlowly
+		bucket.pausedAt = time.Now()
+		bucket.quotaPause = !recoverSlowly
 	} else if !recoverSlowly {
 		// A shorter transient hint cannot change an authoritative quota
 		// pause into transient recovery. A quota response still wins when
 		// its deadline is shorter than an existing transient pause.
 		bucket.recoverSlowly = false
+		bucket.quotaPause = true
 	}
 	// Requests already queued would otherwise sit out the whole pause. Turn
 	// them away like new attempts so their callers can fail over.
@@ -710,7 +715,9 @@ func (a *admissionControl) reconcileClaudeUsage(scores []selectacct.Score, now t
 			// ModelKey so a fresh score can clear the actual bucket.
 			for key, bucket := range a.buckets {
 				if key.provider != accounts.ProviderClaude || key.account != score.AccountID ||
-					selectacct.ModelKey(key.model) != model || !bucket.pausedTil.After(now) {
+					selectacct.ModelKey(key.model) != model || !bucket.pausedTil.After(now) ||
+					!bucket.quotaPause || score.UsageObservedAt.IsZero() ||
+					!score.UsageObservedAt.After(bucket.pausedAt) || !modelScore.ModelQuotaKnown {
 					continue
 				}
 				bucket.pausedTil = time.Time{}

@@ -50,6 +50,13 @@ type Score struct {
 	// uses it to tell "fresh evidence re-confirmed exhausted" apart from "old
 	// zero score dragged along".
 	Fresh bool
+	// UsageObservedAt is the provider observation time represented by this
+	// score. It prevents a cache hit that started before a newer request-time
+	// rejection from clearing that rejection.
+	UsageObservedAt time.Time
+	// ModelQuotaKnown distinguishes a model score backed by that model's own
+	// provider window from one derived only by duplicating account-wide windows.
+	ModelQuotaKnown bool
 	// ClaudeExtraUsage is kept outside Headroom: paid credits must never make an
 	// account look like ordinary subscription capacity. Proxy routing consults
 	// it only after every subscription account is exhausted.
