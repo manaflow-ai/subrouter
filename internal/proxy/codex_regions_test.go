@@ -604,10 +604,48 @@ func TestCodexRegionsNonAutonomousTurnServedFromNextRegion(t *testing.T) {
 	}
 }
 
-// A turn chained on previous_response_id cannot leave its connection, so a
-// non-autonomous client keeps the old behavior.
-func TestCodexRegionsNonAutonomousChainedTurnKeepsOldPath(t *testing.T) {
+// A session pinned to one account (X-Subrouter-Account-ID, the Ultrafast
+// pin) keeps that account but still rotates regions: the capacity failure is
+// served from the next region on the open socket, not closed 1012.
+func TestCodexRegionsForcedAccountTurnServedFromNextRegion(t *testing.T) {
 	local := newRegionPool(t, "local", always(true))
+	fra := newRegionPool(t, "fra", always(false))
+	rig := newRegionRig(t, local, fra)
+	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	header := http.Header{"X-Subrouter-Session": []string{"desktop-forced"}, "X-Subrouter-Account-Id": []string{"codex-account-0"}}
+	conn, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(proxy.URL, "http")+"/responses", header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = response.Body.Close()
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+	if code != 0 || !strings.Contains(turn, "served-from-fra") || strings.Contains(turn, "response.failed") {
+		t.Fatalf("turn=%q close=%d, want Frankfurt on the open socket", turn, code)
+	}
+	events := readCapacityEvents(t, rig.server.CodexCapacityEventsPath)
+	if countEvents(events, codexCapacityOutcomeAbsorbed, "") != 1 || countEvents(events, codexCapacityOutcomeClientVisible, "") != 0 {
+		t.Fatalf("events=%+v, want the turn absorbed", events)
+	}
+	for _, event := range events {
+		if event.Account != "" && event.Account != "codex-account-0" {
+			t.Fatalf("event %+v left the forced account", event)
+		}
+	}
+}
+
+// A turn chained on previous_response_id cannot leave its connection, so a
+// non-autonomous client's capacity failure is resent on that same socket
+// instead of the 1012 reconnect it used to get.
+func TestCodexRegionsNonAutonomousChainedTurnResendsOnSameSocket(t *testing.T) {
+	var localCreates atomic.Int32
+	local := newRegionPool(t, "local", func() bool { return localCreates.Add(1) == 1 })
 	fra := newRegionPool(t, "fra", always(false))
 	rig := newRegionRig(t, local, fra)
 	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
@@ -619,8 +657,30 @@ func TestCodexRegionsNonAutonomousChainedTurnKeepsOldPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	turn, code := readWebSocketUntilCloseOrTurn(t, conn)
-	if strings.Contains(turn, "served-from-fra") || fra.creates.Load() != 0 {
-		t.Fatalf("turn=%q close=%d fra=%d, want no move to Frankfurt", turn, code, fra.creates.Load())
+	if code != 0 || !strings.Contains(turn, "served-from-local") || strings.Contains(turn, "response.failed") {
+		t.Fatalf("turn=%q close=%d, want the resend served on the same socket", turn, code)
+	}
+	if local.creates.Load() != 2 || fra.creates.Load() != 0 {
+		t.Fatalf("local=%d fra=%d creates, want the failure and one resend on local", local.creates.Load(), fra.creates.Load())
+	}
+}
+
+// A chained turn whose region keeps refusing stops after the budget.
+func TestCodexRegionsNonAutonomousChainedTurnIsBounded(t *testing.T) {
+	local := newRegionPool(t, "local", always(true))
+	fra := newRegionPool(t, "fra", always(false))
+	rig := newRegionRig(t, local, fra)
+	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	conn := dialRegionWebSocket(t, proxy.URL, "desktop-chained-bounded", false)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_prev","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+	if local.creates.Load() != 1+codexWebSocketChainedResends || fra.creates.Load() != 0 {
+		t.Fatalf("local=%d fra=%d (turn=%q close=%d), want 1+%d on local only", local.creates.Load(), fra.creates.Load(), turn, code, codexWebSocketChainedResends)
 	}
 }
 
@@ -681,5 +741,381 @@ func TestCodexRegionsNonAutonomousUpstreamCloseIsNotRetried(t *testing.T) {
 	_, code := readWebSocketUntilCloseOrTurn(t, conn)
 	if code != websocket.ClosePolicyViolation || creates.Load() != 1 || fra.creates.Load() != 0 {
 		t.Fatalf("close=%d upstream creates=%d fra=%d, want the 1008 passed through with no retry", code, creates.Load(), fra.creates.Load())
+	}
+}
+
+// The upstream may evict previous_response_id when it fails a chained turn,
+// so the resend can come back previous_response_not_found. That must reach
+// the client as the 1012 reconnect it had before, never as a failed turn.
+func TestCodexRegionsChainedResendFailureBecomesReconnect(t *testing.T) {
+	for name, resendFailure := range map[string]string{
+		"evicted":       `{"type":"error","error":{"type":"invalid_request_error","code":"previous_response_not_found","message":"Previous response not found."}}`,
+		"token_expired": `{"type":"error","status":401,"error":{"type":"invalid_request_error","code":"token_expired","message":"Provided authentication token is expired."}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			var creates atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				for {
+					if _, _, err := conn.ReadMessage(); err != nil {
+						return
+					}
+					if creates.Add(1) == 1 {
+						_ = conn.WriteMessage(websocket.TextMessage, []byte(turnRetryCapacityFailure))
+						continue
+					}
+					_ = conn.WriteMessage(websocket.TextMessage, []byte(resendFailure))
+				}
+			}))
+			defer upstream.Close()
+			upstreamURL, _ := url.Parse(upstream.URL)
+			fra := newRegionPool(t, "fra", always(false))
+			rig := newRegionRig(t, &regionPool{name: "local", url: upstreamURL}, fra)
+			rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+			proxy := httptest.NewServer(rig.server.Handler())
+			defer proxy.Close()
+
+			conn := dialRegionWebSocket(t, proxy.URL, "desktop-resend-"+name, false)
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_prev","input":[]}`)); err != nil {
+				t.Fatal(err)
+			}
+			turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+			if code != websocket.CloseServiceRestart || strings.Contains(turn, `"error"`) {
+				t.Fatalf("turn=%q close=%d, want a 1012 and no error event", turn, code)
+			}
+			// One resend only: a failed resend never spends the rest of the
+			// budget on the same socket.
+			if creates.Load() != 2 {
+				t.Fatalf("upstream creates=%d, want the failure and one resend", creates.Load())
+			}
+		})
+	}
+}
+
+// A resent chained turn whose budget runs out on capacity failures ends in a
+// reconnect, not a failed turn, even when no reroute layer takes it.
+func TestCodexRegionsChainedResendBudgetEndsInReconnect(t *testing.T) {
+	local := newRegionPool(t, "local", always(true))
+	fra := newRegionPool(t, "fra", always(false))
+	rig := newRegionRig(t, local, fra)
+	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	conn := dialRegionWebSocket(t, proxy.URL, "desktop-chained-exhausted", false)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_prev","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+	if code != websocket.CloseServiceRestart || strings.Contains(turn, "response.failed") {
+		t.Fatalf("turn=%q close=%d, want a 1012 with no failure event", turn, code)
+	}
+}
+
+// historyPool is one region's backend that answers each response.create
+// with one output item (none for a generate:false prewarm) and a completed
+// response named after the region, and keeps every body it received. Like
+// the real upstream, a previous_response_id only resolves on the connection
+// that produced it.
+type historyPool struct {
+	*regionPool
+	failWith string
+	mu       sync.Mutex
+	bodies   []string
+}
+
+func newHistoryPool(t *testing.T, name string, fail func() bool) *historyPool {
+	t.Helper()
+	pool := &historyPool{regionPool: &regionPool{name: name, fail: fail}, failWith: turnRetryCapacityFailure}
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	pool.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		held := map[string]bool{}
+		for {
+			_, body, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			n := pool.creates.Add(1)
+			pool.mu.Lock()
+			pool.bodies = append(pool.bodies, string(body))
+			pool.mu.Unlock()
+			var create struct {
+				PreviousResponseID string `json:"previous_response_id"`
+				Generate           *bool  `json:"generate"`
+			}
+			_ = json.Unmarshal(body, &create)
+			if create.PreviousResponseID != "" && !held[create.PreviousResponseID] {
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"previous_response_not_found","message":"Previous response not found."}}`))
+				continue
+			}
+			if pool.fail() {
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(pool.failWith))
+				continue
+			}
+			id := fmt.Sprintf("%s_%d", name, n)
+			held["resp_"+id] = true
+			if create.Generate == nil || *create.Generate {
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_item.done","item":{"type":"message","id":"msg_`+id+`","role":"assistant","content":[{"type":"output_text","text":"served-from-`+name+`"}]}}`))
+			}
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_`+id+`"}}`))
+		}
+	}))
+	t.Cleanup(pool.server.Close)
+	pool.url, _ = url.Parse(pool.server.URL)
+	return pool
+}
+
+func (p *historyPool) lastBody() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.bodies) == 0 {
+		return ""
+	}
+	return p.bodies[len(p.bodies)-1]
+}
+
+func sendRegionTurn(t *testing.T, conn *websocket.Conn, create string) (string, int) {
+	t.Helper()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(create)); err != nil {
+		t.Fatal(err)
+	}
+	return readWebSocketUntilCloseOrTurn(t, conn)
+}
+
+// fullInputOf is the input items of a response.create, and whether it was
+// sent self-contained.
+func fullInputOf(t *testing.T, body string) ([]string, bool) {
+	t.Helper()
+	var sent struct {
+		PreviousResponseID *string           `json:"previous_response_id"`
+		Input              []json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal([]byte(body), &sent); err != nil {
+		t.Fatal(err)
+	}
+	items := make([]string, len(sent.Input))
+	for i, item := range sent.Input {
+		items[i] = string(item)
+	}
+	return items, sent.PreviousResponseID == nil
+}
+
+const (
+	userOne   = `{"type":"message","role":"user","content":"one"}`
+	userTwo   = `{"type":"message","role":"user","content":"two"}`
+	userThree = `{"type":"message","role":"user","content":"three"}`
+)
+
+func chainedCreate(previous, input string) string {
+	return `{"type":"response.create","model":"gpt-6-astra","instructions":"be brief","previous_response_id":"` + previous + `","input":[` + input + `]}`
+}
+
+// A turn chained on the connection's last response used to be resent only
+// on that connection, in the region that just refused it, and a second
+// refusal became a 1012 reconnect. The relay saw the whole conversation, so
+// it now sends the turn self-contained from the next region.
+func TestCodexRegionsChainedTurnRebuiltForNextRegion(t *testing.T) {
+	for _, autonomous := range []bool{false, true} {
+		t.Run(fmt.Sprintf("autonomous=%v", autonomous), func(t *testing.T) {
+			var localCreates atomic.Int32
+			local := newHistoryPool(t, "local", func() bool { return localCreates.Add(1) > 1 })
+			fra := newHistoryPool(t, "fra", always(false))
+			rig := newRegionRig(t, local.regionPool, fra.regionPool)
+			rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+			proxy := httptest.NewServer(rig.server.Handler())
+			defer proxy.Close()
+
+			conn := dialRegionWebSocket(t, proxy.URL, fmt.Sprintf("desktop-rebuild-%v", autonomous), autonomous)
+			if turn, code := sendRegionTurn(t, conn, `{"type":"response.create","model":"gpt-6-astra","instructions":"be brief","input":[`+userOne+`]}`); code != 0 || !strings.Contains(turn, "resp_local_1") {
+				t.Fatalf("first turn=%q close=%d, want it served from local", turn, code)
+			}
+			turn, code := sendRegionTurn(t, conn, chainedCreate("resp_local_1", userTwo))
+			if code != 0 || !strings.Contains(turn, "resp_fra_1") || strings.Contains(turn, "response.failed") {
+				t.Fatalf("chained turn=%q close=%d, want it served from Frankfurt on the open socket", turn, code)
+			}
+			items, selfContained := fullInputOf(t, fra.lastBody())
+			if !selfContained || !strings.Contains(fra.lastBody(), `"instructions":"be brief"`) || len(items) != 3 ||
+				!strings.Contains(items[0], `"one"`) || !strings.Contains(items[1], "msg_local_1") || !strings.Contains(items[2], `"two"`) {
+				t.Fatalf("Frankfurt got %s, want the full conversation without previous_response_id", fra.lastBody())
+			}
+			if local.creates.Load() != 2 {
+				t.Fatalf("local creates=%d, want the first turn and the refused chained turn only", local.creates.Load())
+			}
+			// The next turn chains on the Frankfurt response and goes out
+			// as is: the new connection holds it.
+			if turn, code := sendRegionTurn(t, conn, chainedCreate("resp_fra_1", userThree)); code != 0 || !strings.Contains(turn, "resp_fra_2") {
+				t.Fatalf("third turn=%q close=%d, want it served from Frankfurt", turn, code)
+			}
+			events := readCapacityEvents(t, rig.server.CodexCapacityEventsPath)
+			if countEvents(events, codexCapacityOutcomeClientVisible, "") != 0 {
+				t.Fatalf("events=%+v, want no client-visible failure", events)
+			}
+		})
+	}
+}
+
+// A prewarm (generate:false) leaves its input and no output on the
+// connection; the chained turn after it is rebuilt from that input.
+func TestCodexRegionsChainedTurnAfterPrewarmRebuilt(t *testing.T) {
+	var localCreates atomic.Int32
+	local := newHistoryPool(t, "local", func() bool { return localCreates.Add(1) > 1 })
+	fra := newHistoryPool(t, "fra", always(false))
+	rig := newRegionRig(t, local.regionPool, fra.regionPool)
+	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	conn := dialRegionWebSocket(t, proxy.URL, "desktop-prewarm", false)
+	if turn, code := sendRegionTurn(t, conn, `{"type":"response.create","model":"gpt-6-astra","generate":false,"input":[`+userOne+`]}`); code != 0 || !strings.Contains(turn, "resp_local_1") {
+		t.Fatalf("prewarm=%q close=%d", turn, code)
+	}
+	if turn, code := sendRegionTurn(t, conn, chainedCreate("resp_local_1", "")); code != 0 || !strings.Contains(turn, "served-from-fra") {
+		t.Fatalf("chained turn=%q close=%d, want it served from Frankfurt", turn, code)
+	}
+	items, selfContained := fullInputOf(t, fra.lastBody())
+	if !selfContained || len(items) != 1 || !strings.Contains(items[0], `"one"`) {
+		t.Fatalf("Frankfurt got %s, want the prewarm input only", fra.lastBody())
+	}
+}
+
+// A turn chained on a response the relay has no history for (not the last
+// completed one) keeps the same-socket resend.
+func TestCodexRegionsChainedTurnWithoutHistoryResendsOnSameSocket(t *testing.T) {
+	var localCreates atomic.Int32
+	local := newHistoryPool(t, "local", func() bool { return localCreates.Add(1) == 3 })
+	fra := newHistoryPool(t, "fra", always(false))
+	rig := newRegionRig(t, local.regionPool, fra.regionPool)
+	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	conn := dialRegionWebSocket(t, proxy.URL, "desktop-no-history", false)
+	for _, create := range []string{
+		`{"type":"response.create","model":"gpt-6-astra","input":[` + userOne + `]}`,
+		`{"type":"response.create","model":"gpt-6-astra","input":[` + userTwo + `]}`,
+	} {
+		if turn, code := sendRegionTurn(t, conn, create); code != 0 || !strings.Contains(turn, "response.completed") {
+			t.Fatalf("turn=%q close=%d", turn, code)
+		}
+	}
+	if turn, code := sendRegionTurn(t, conn, chainedCreate("resp_local_1", userThree)); code != 0 || !strings.Contains(turn, "served-from-local") {
+		t.Fatalf("chained turn=%q close=%d, want the resend served on the same socket", turn, code)
+	}
+	if fra.creates.Load() != 0 || !strings.Contains(local.lastBody(), `"previous_response_id":"resp_local_1"`) {
+		t.Fatalf("fra=%d local last=%s, want the chained body resent on local", fra.creates.Load(), local.lastBody())
+	}
+}
+
+// A rebuilt turn the next region rejects for another reason ends in the
+// 1012 reconnect a chained resend gets, never in an error event: Codex then
+// sends its own full request.
+func TestCodexRegionsRebuiltTurnRejectionBecomesReconnect(t *testing.T) {
+	var localCreates atomic.Int32
+	local := newHistoryPool(t, "local", func() bool { return localCreates.Add(1) > 1 })
+	fra := newHistoryPool(t, "fra", always(true))
+	fra.failWith = `{"type":"error","error":{"type":"invalid_request_error","code":"invalid_encrypted_content","message":"The encrypted content could not be verified."}}`
+	rig := newRegionRig(t, local.regionPool, fra.regionPool)
+	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	conn := dialRegionWebSocket(t, proxy.URL, "desktop-rebuild-rejected", false)
+	if turn, code := sendRegionTurn(t, conn, `{"type":"response.create","model":"gpt-6-astra","input":[`+userOne+`]}`); code != 0 || !strings.Contains(turn, "resp_local_1") {
+		t.Fatalf("first turn=%q close=%d", turn, code)
+	}
+	turn, code := sendRegionTurn(t, conn, chainedCreate("resp_local_1", userTwo))
+	if code != websocket.CloseServiceRestart || strings.Contains(turn, `"error"`) {
+		t.Fatalf("turn=%q close=%d, want a 1012 and no error event", turn, code)
+	}
+	if fra.creates.Load() != 1 {
+		t.Fatalf("fra creates=%d, want the one rebuilt send", fra.creates.Load())
+	}
+}
+
+// An autonomous turn whose account sheds in two regions used to switch
+// account at once: a 1012 its client sees as a reconnect. It now tries the
+// rest of the region budget on the same account first.
+func TestCodexRegionsAutonomousTurnTriesRegionsBeforeAccountSwitch(t *testing.T) {
+	local := newRegionPool(t, "local", always(true))
+	fra := newRegionPool(t, "fra", always(true))
+	ams := newRegionPool(t, "ams", always(false))
+	rig := newRegionRig(t, local, fra, ams)
+	proxies := make([]*url.URL, 0, 2)
+	for _, region := range []*regionPool{fra, ams} {
+		proxies = append(proxies, regionProxy(t, region.name, region.url, &atomic.Int32{}))
+	}
+	rig.server = codexEgressServer(t, local.url, proxies, 2)
+	rig.server.CodexEgress.PinStorePath = ""
+	rig.server.CodexCapacityEventsPath = filepath.Join(t.TempDir(), "codex-capacity-events.jsonl")
+	rig.server.CodexOverloadFailover = &CodexOverloadFailoverConfig{Enabled: true}
+	fastCapacityGaps(rig.server.CodexOverloadFailover, time.Millisecond)
+	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+	proxy := httptest.NewServer(rig.server.Handler())
+	defer proxy.Close()
+
+	conn := dialRegionWebSocket(t, proxy.URL, "auto-regions-first", true)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+	if code != 0 || !strings.Contains(turn, "served-from-ams") {
+		t.Fatalf("turn=%q close=%d, want Amsterdam on the open socket", turn, code)
+	}
+	events := readCapacityEvents(t, rig.server.CodexCapacityEventsPath)
+	if countEvents(events, codexCapacityOutcomeClientVisible, "") != 0 {
+		t.Fatalf("events=%+v, want no client-visible failure", events)
+	}
+}
+
+// The region budget is bounded: when every region sheds, the autonomous
+// turn switches account (1012) after the budget, and an autonomous
+// connection's chained turn with no history switches at the second failure.
+func TestCodexRegionsAutonomousAccountSwitchIsBounded(t *testing.T) {
+	for name, tc := range map[string]struct {
+		create string
+		want   int32
+	}{
+		"self-contained":      {`{"type":"response.create","model":"gpt-6-astra","input":[]}`, 1 + codexWebSocketRegionRetries},
+		"chained, no history": {`{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_unknown","input":[]}`, 1 + codexCapacitySameAccountRetries},
+	} {
+		t.Run(name, func(t *testing.T) {
+			local := newRegionPool(t, "local", always(true))
+			fra := newRegionPool(t, "fra", always(true))
+			ams := newRegionPool(t, "ams", always(true))
+			proxies := make([]*url.URL, 0, 2)
+			for _, region := range []*regionPool{fra, ams} {
+				proxies = append(proxies, regionProxy(t, region.name, region.url, &atomic.Int32{}))
+			}
+			server := codexEgressServer(t, local.url, proxies, 2)
+			server.CodexEgress.PinStorePath = ""
+			server.CodexCapacityEventsPath = filepath.Join(t.TempDir(), "codex-capacity-events.jsonl")
+			server.CodexOverloadFailover = &CodexOverloadFailoverConfig{Enabled: true}
+			fastCapacityGaps(server.CodexOverloadFailover, time.Millisecond)
+			server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
+			proxy := httptest.NewServer(server.Handler())
+			defer proxy.Close()
+
+			conn := dialRegionWebSocket(t, proxy.URL, "auto-bounded-"+strings.ReplaceAll(name, " ", ""), true)
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(tc.create)); err != nil {
+				t.Fatal(err)
+			}
+			turn, code := readWebSocketUntilCloseOrTurn(t, conn)
+			if code != websocket.CloseServiceRestart {
+				t.Fatalf("turn=%q close=%d, want the account switch 1012", turn, code)
+			}
+			if got := local.creates.Load() + fra.creates.Load() + ams.creates.Load(); got != tc.want {
+				t.Fatalf("creates=%d (local=%d fra=%d ams=%d), want %d", got, local.creates.Load(), fra.creates.Load(), ams.creates.Load(), tc.want)
+			}
+		})
 	}
 }
