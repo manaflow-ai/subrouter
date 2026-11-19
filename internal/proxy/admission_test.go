@@ -145,6 +145,23 @@ func TestAdmissionClaudeUsageDoesNotClearStaleOrOtherModelPause(t *testing.T) {
 	}
 }
 
+func TestAdmissionClaudeUsageDoesNotClearObservationOlderThanPause(t *testing.T) {
+	control := testAdmissionControl(1, 2)
+	key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus")
+	now := time.Now()
+	control.pause(key, now.Add(time.Hour))
+	control.reconcileClaudeUsage([]selectacct.Score{{
+		AccountID: "account-a", Provider: accounts.ProviderClaude, Fresh: true,
+		UsageObservedAt: now.Add(-time.Second),
+		ModelScores: map[string]selectacct.Score{
+			"claudeopus": {Headroom: 0.9, WeeklyHeadroom: 0.9, WeeklyHeadroomKnown: true, ModelQuotaKnown: true},
+		},
+	}}, now)
+	if _, err := control.acquire(context.Background(), key); !errors.Is(err, errAdmissionPaused) {
+		t.Fatalf("usage observed before the request-time pause cleared it: %v", err)
+	}
+}
+
 func TestAdmissionClaudeUsagePreservesLongerTransientHold(t *testing.T) {
 	control := testAdmissionControl(1, 2)
 	key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus")
