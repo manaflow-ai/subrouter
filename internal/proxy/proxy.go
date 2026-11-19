@@ -9186,6 +9186,20 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		picked, placementReservation, err = pickAndReserveRoutingAccount(r.Context(), scheduler, s.SchedulerRef, candidates)
 		return picked, err
 	}
+	filterPausedClaude := func(candidates []accounts.Account) []accounts.Account {
+		if provider != accounts.ProviderClaude || s.admission == nil {
+			return candidates
+		}
+		now := time.Now()
+		filtered := make([]accounts.Account, 0, len(candidates))
+		for _, candidate := range candidates {
+			if candidate.AuthMode == accounts.AuthModeOAuth && s.admission.paused(admissionKeyFor(candidate.Provider, candidate.ID, poolModel), now) {
+				continue
+			}
+			filtered = append(filtered, candidate)
+		}
+		return filtered
+	}
 	// picked carries a placement decided inside the sticky branch (the
 	// constrained account's replacement) into the shared assignment tail, so
 	// the account that was judged materially better is the one assigned.
@@ -9229,7 +9243,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			// account can serve this model; an explicit account selector returned
 			// above and remains pinned for that request.
 			if provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeAPIKey {
-				subscriptions := claudeSubscriptionCandidatesFromScores(base, scheduler, availableAccounts, poolModel)
+				subscriptions := filterPausedClaude(claudeSubscriptionCandidatesFromScores(base, scheduler, availableAccounts, poolModel))
 				if len(subscriptions) > 0 {
 					if candidate, pickErr := pickPlacement(subscriptions); pickErr == nil {
 						if s.Logger != nil {
@@ -9242,7 +9256,9 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 					}
 				}
 			}
-			if picked == nil && s.reuseStickyAssignment(agentType, sessionID, account, stickyScheduler) {
+			pausedSticky := provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth &&
+				s.admission != nil && s.admission.paused(admissionKeyFor(account.Provider, account.ID, poolModel), time.Now())
+			if picked == nil && !pausedSticky && s.reuseStickyAssignment(agentType, sessionID, account, stickyScheduler) {
 				s.logStickyReuse(agentType, sessionID, account, stickyScheduler)
 				s.touchSessionBestEffort(agentType, sessionID)
 				return account, sessionID, userEmail, nil
@@ -9254,7 +9270,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 				placementCandidates := availableAccounts
 				if provider == accounts.ProviderClaude {
 					if subscriptions := claudeSubscriptionCandidatesFromScores(base, scheduler, availableAccounts, poolModel); len(subscriptions) > 0 {
-						placementCandidates = subscriptions
+						placementCandidates = filterPausedClaude(subscriptions)
 					}
 				}
 				candidate, pickErr := pickPlacement(placementCandidates)
@@ -9322,7 +9338,8 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		// account disappeared after the picker ran or is already known exhausted,
 		// start on the scheduler's current recommendation instead of failing the
 		// pooled launch before a request.
-		if ok && !scheduler.Exhausted(schedulerAccountProvider(preferred.Provider), preferred.ID) {
+		if ok && !scheduler.Exhausted(schedulerAccountProvider(preferred.Provider), preferred.ID) &&
+			!(provider == accounts.ProviderClaude && preferred.AuthMode == accounts.AuthModeOAuth && s.admission != nil && s.admission.paused(admissionKeyFor(preferred.Provider, preferred.ID, poolModel), time.Now())) {
 			picked = &preferred
 		}
 	}
@@ -9335,7 +9352,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			// Use the quota information already in the scheduler for NEW
 			// sessions. Preserve forced/preferred picks and all sticky
 			// reassignment decisions made above.
-			placementCandidates = claudeNewSessionCandidatesFromScores(base, scheduler, availableAccounts, poolModel)
+			placementCandidates = filterPausedClaude(claudeNewSessionCandidatesFromScores(base, scheduler, availableAccounts, poolModel))
 		}
 		account, err = pickPlacement(placementCandidates)
 		if err != nil {

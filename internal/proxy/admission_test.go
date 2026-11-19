@@ -145,6 +145,27 @@ func TestAdmissionClaudeUsageDoesNotClearStaleOrOtherModelPause(t *testing.T) {
 	}
 }
 
+func TestAdmissionClaudeUsagePreservesLongerTransientHold(t *testing.T) {
+	control := testAdmissionControl(1, 2)
+	key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus")
+	now := time.Now()
+	control.pauseWithRecovery(key, now.Add(10*time.Hour), true)
+	control.pauseWithRecovery(key, now.Add(time.Hour), false)
+	control.reconcileClaudeUsage([]selectacct.Score{{
+		AccountID: "account-a", Provider: accounts.ProviderClaude, Fresh: true,
+		UsageObservedAt: now.Add(time.Minute),
+		ModelScores: map[string]selectacct.Score{
+			"claudeopus": {Headroom: 0.9, WeeklyHeadroom: 0.9, WeeklyHeadroomKnown: true, ModelQuotaKnown: true},
+		},
+	}}, now.Add(2*time.Minute))
+	control.mu.Lock()
+	got := control.buckets[key].pausedTil
+	control.mu.Unlock()
+	if got.Before(now.Add(9 * time.Hour)) {
+		t.Fatalf("clearing quota hold discarded longer transient hold: paused until %v", got)
+	}
+}
+
 func TestUsageStatusRefreshReconcilesClaudeAdmissionPause(t *testing.T) {
 	control := testAdmissionControl(1, 2)
 	key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus")

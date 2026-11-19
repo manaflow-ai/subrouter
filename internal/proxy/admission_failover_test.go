@@ -125,7 +125,10 @@ func TestAdmissionRejectionFailsOverToAnotherAccount(t *testing.T) {
 			}
 			mu.Unlock()
 			report := events.Query(ErrorEventQuery{Provider: "claude"})
-			if len(report.Events) == 0 || report.Events[0].ErrorClass != tc.wantClass || report.Events[0].Account != "pinned@example.com" {
+			// Paused buckets are filtered before pooled placement, so this case
+			// can fail over without attempting the known-bad account. Queue-full
+			// still reaches admission and must emit its rejection event.
+			if tc.name == "queue full" && (len(report.Events) == 0 || report.Events[0].ErrorClass != tc.wantClass || report.Events[0].Account != "pinned@example.com") {
 				t.Fatalf("error log = %+v, want a %s event on pinned@example.com", report.Events, tc.wantClass)
 			}
 			if assignment, ok := store.Get("claude", "session-pinned"); !ok || assignment.AccountID != tc.wantSession {

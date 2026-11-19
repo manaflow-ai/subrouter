@@ -165,11 +165,13 @@ const (
 )
 
 type admissionBucket struct {
-	active     int
-	waiters    []*admissionWaiter
-	pausedTil  time.Time
-	pausedAt   time.Time
-	quotaPause bool
+	active       int
+	waiters      []*admissionWaiter
+	pausedTil    time.Time
+	pausedAt     time.Time
+	quotaPause   bool
+	quotaTil     time.Time
+	transientTil time.Time
 	// changed wakes waiters that queued before a pause was applied, so they
 	// arm an expiry timer even if every active stream closes during the pause.
 	changed chan struct{}
@@ -620,18 +622,19 @@ func (a *admissionControl) pauseWithRecovery(key admissionKey, until time.Time, 
 	a.mu.Lock()
 	bucket := a.bucketLocked(key)
 	bucket.throttled++
-	if until.After(bucket.pausedTil) {
-		bucket.pausedTil = until
-		bucket.recoverSlowly = recoverSlowly
-		bucket.pausedAt = time.Now()
-		bucket.quotaPause = !recoverSlowly
-	} else if !recoverSlowly {
-		// A shorter transient hint cannot change an authoritative quota
-		// pause into transient recovery. A quota response still wins when
-		// its deadline is shorter than an existing transient pause.
-		bucket.recoverSlowly = false
-		bucket.quotaPause = true
+	if recoverSlowly {
+		if until.After(bucket.transientTil) {
+			bucket.transientTil = until
+		}
+	} else {
+		if until.After(bucket.quotaTil) {
+			bucket.quotaTil = until
+			bucket.pausedAt = time.Now()
+		}
 	}
+	bucket.pausedTil = maxTime(bucket.quotaTil, bucket.transientTil)
+	bucket.recoverSlowly = bucket.transientTil.After(bucket.quotaTil)
+	bucket.quotaPause = bucket.quotaTil.After(time.Now())
 	// Requests already queued would otherwise sit out the whole pause. Turn
 	// them away like new attempts so their callers can fail over.
 	if bucket.pausedTil.Sub(time.Now()) > admissionPauseWaitMax {
@@ -651,6 +654,13 @@ func (a *admissionControl) pauseWithRecovery(key admissionKey, until time.Time, 
 	close(bucket.changed)
 	bucket.changed = make(chan struct{})
 	a.mu.Unlock()
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 func (a *admissionControl) observe(key admissionKey, status int, header http.Header, now time.Time) {
@@ -720,8 +730,10 @@ func (a *admissionControl) reconcileClaudeUsage(scores []selectacct.Score, now t
 					!score.UsageObservedAt.After(bucket.pausedAt) || !modelScore.ModelQuotaKnown {
 					continue
 				}
-				bucket.pausedTil = time.Time{}
-				bucket.recoverSlowly = false
+				bucket.quotaTil = time.Time{}
+				bucket.pausedTil = bucket.transientTil
+				bucket.recoverSlowly = bucket.transientTil.After(now)
+				bucket.quotaPause = false
 				close(bucket.changed)
 				bucket.changed = make(chan struct{})
 			}
