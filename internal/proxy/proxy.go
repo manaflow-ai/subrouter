@@ -2847,7 +2847,7 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 			// A null model bucket is represented as a synthetic zero window so
 			// routing can still consider an unused model. It is not provider
 			// evidence that can clear a request-time model pause.
-			if window.UsedPercent != 0 || window.LimitWindowSeconds != 0 || window.ResetAfterSeconds != 0 || !window.ResetAt.IsZero() {
+			if window.UsedPercent != 0 || window.ResetAfterSeconds != 0 || !window.ResetAt.IsZero() {
 				if modelScore, ok := score.ModelScores[selectacct.ModelKey(window.Feature)]; ok {
 					modelScore.ModelQuotaKnown = true
 					score.ModelScores[selectacct.ModelKey(window.Feature)] = modelScore
