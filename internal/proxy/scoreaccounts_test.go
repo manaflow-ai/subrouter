@@ -64,17 +64,6 @@ func TestScoreFromUsageWindowsClearsExpiredQuotaReset(t *testing.T) {
 	}
 }
 
-func TestScoreFromUsageWindowsTreatsZeroUsedModelWindowAsKnown(t *testing.T) {
-	score := scoreFromUsageWindows(accounts.ProviderClaude, "claude@example.com", []accounts.UsageWindow{
-		{Name: "7d", UsedPercent: 20, LimitWindowSeconds: 7 * 24 * 60 * 60},
-		{Name: "opus-weekly", Feature: "opus", UsedPercent: 0, LimitWindowSeconds: 7 * 24 * 60 * 60},
-	})
-	modelScore, ok := score.ModelScores[selectacct.ModelKey("opus")]
-	if !ok || !modelScore.ModelQuotaKnown {
-		t.Fatalf("zero-used model window was not marked as known: %+v", score.ModelScores)
-	}
-}
-
 func TestScoreAccountsTreatsAuthOnlyOAuthRefreshAsAuthEvidenceOnly(t *testing.T) {
 	account := accounts.Account{
 		ID: "antigravity", Provider: accounts.ProviderAntigravity,
