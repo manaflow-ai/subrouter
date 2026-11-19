@@ -891,13 +891,20 @@ func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context,
 	if entryMatchesCredential && now.Sub(entry.at) < usageWindowsTTL {
 		windows := append([]accounts.UsageWindow(nil), entry.windows...)
 		supplementalFresh := entry.supplementalFresh
+		observedAt := entry.at
 		if account.Provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth {
-			if supplemental, _, ok := r.cachedClaudeSupplementalWithObservation(account, now); ok {
+			if supplemental, supplementalObservedAt, ok := r.cachedClaudeSupplementalWithObservation(account, now); ok {
 				windows = mergeUsageWindows(windows, supplemental)
 				supplementalFresh = true
+				if claudeSupplementalHasQuotaEvidence(supplemental) && !supplementalObservedAt.IsZero() && (observedAt.IsZero() || supplementalObservedAt.Before(observedAt)) {
+					// A composite result carries two provider observations. Keep
+					// the older real model evidence as its admission provenance;
+					// synthetic zero-used placeholders do not move the timestamp.
+					observedAt = supplementalObservedAt
+				}
 			}
 		}
-		return windows, supplementalFresh, entry.at, false, nil
+		return windows, supplementalFresh, observedAt, false, nil
 	}
 	// A quota-status poll should never turn one upstream 429 into a storm of
 	// identical follow-up 429s. No waiting: serve last-good or return the
