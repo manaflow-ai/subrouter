@@ -9193,7 +9193,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		now := time.Now()
 		filtered := make([]accounts.Account, 0, len(candidates))
 		for _, candidate := range candidates {
-			if candidate.AuthMode == accounts.AuthModeOAuth && s.admission.paused(admissionKeyFor(candidate.Provider, candidate.ID, poolModel), now) {
+			if s.admission.paused(admissionKeyFor(candidate.Provider, candidate.ID, poolModel), now) {
 				continue
 			}
 			filtered = append(filtered, candidate)
@@ -9256,7 +9256,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 					}
 				}
 			}
-			pausedSticky := provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth &&
+			pausedSticky := provider == accounts.ProviderClaude &&
 				s.admission != nil && s.admission.paused(admissionKeyFor(account.Provider, account.ID, poolModel), time.Now())
 			if picked == nil && !pausedSticky && s.reuseStickyAssignment(agentType, sessionID, account, stickyScheduler) {
 				s.logStickyReuse(agentType, sessionID, account, stickyScheduler)
@@ -9274,7 +9274,13 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 					}
 				}
 				candidate, pickErr := pickPlacement(placementCandidates)
-				if pickErr != nil || s.keepConstrainedStickyAssignment(stickyScheduler, account, candidate) {
+				if pickErr != nil {
+					if pausedSticky {
+						return accounts.Account{}, sessionID, userEmail, s.poolExhaustedError(provider, availableAccounts, poolModel)
+					}
+					candidate = account
+				}
+				if s.keepConstrainedStickyAssignment(stickyScheduler, account, candidate) {
 					if s.Logger != nil {
 						s.Logger.Info("keeping sticky session on constrained account; no materially better account",
 							"agent", agentType,
@@ -9339,7 +9345,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		// start on the scheduler's current recommendation instead of failing the
 		// pooled launch before a request.
 		if ok && !scheduler.Exhausted(schedulerAccountProvider(preferred.Provider), preferred.ID) &&
-			!(provider == accounts.ProviderClaude && preferred.AuthMode == accounts.AuthModeOAuth && s.admission != nil && s.admission.paused(admissionKeyFor(preferred.Provider, preferred.ID, poolModel), time.Now())) {
+			!(provider == accounts.ProviderClaude && s.admission != nil && s.admission.paused(admissionKeyFor(preferred.Provider, preferred.ID, poolModel), time.Now())) {
 			picked = &preferred
 		}
 	}
