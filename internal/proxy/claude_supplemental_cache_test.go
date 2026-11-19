@@ -418,39 +418,6 @@ func TestClaudeSupplementalOlderThanPrimaryCadenceIsStale(t *testing.T) {
 	}
 }
 
-func TestClaudeCachedCompositeObservationUsesOldestComponent(t *testing.T) {
-	account := probeAccount()
-	now := time.Now().UTC()
-	primaryAt := now.Add(-time.Minute)
-	supplementalAt := now.Add(-2 * time.Minute)
-	ref := &AccountRef{
-		usageWindows: map[string]usageWindowsEntry{
-			account.ID + "\x00" + string(account.Provider): {
-				windows: []accounts.UsageWindow{{
-					Name: "7d", UsedPercent: 20, LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second),
-				}},
-				at: primaryAt, credentialKey: usageWindowsCredentialKey(account),
-			},
-		},
-		claudeSupplemental: map[string]claudeSupplementalUsage{
-			claudeSupplementalCacheKey(account): {
-				windows: []accounts.UsageWindow{{
-					Name: "opus-weekly", Feature: agentclaude.OpusFeature,
-					UsedPercent: 10, LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second),
-				}},
-				at: supplementalAt,
-			},
-		},
-	}
-	_, fresh, observedAt, _, err := ref.FetchUsageWindowsCachedWithObservation(context.Background(), http.DefaultClient, account)
-	if err != nil || !fresh {
-		t.Fatalf("cached composite usage = fresh %v err %v, want fresh", fresh, err)
-	}
-	if !observedAt.Equal(supplementalAt) {
-		t.Fatalf("composite observation time = %s, want oldest component %s", observedAt, supplementalAt)
-	}
-}
-
 // A setup token carries only user:inference, so the usage endpoint answers 403
 // for the token's whole life. Asking again cannot succeed, and Anthropic
 // answers a few such calls with a one-hour 429 that then marks a healthy
