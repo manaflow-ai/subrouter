@@ -891,23 +891,13 @@ func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context,
 	if entryMatchesCredential && now.Sub(entry.at) < usageWindowsTTL {
 		windows := append([]accounts.UsageWindow(nil), entry.windows...)
 		supplementalFresh := entry.supplementalFresh
-		observedAt := entry.at
 		if account.Provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth {
-			if supplemental, supplementalObservedAt, ok := r.cachedClaudeSupplementalWithObservation(account, now); ok {
+			if supplemental, _, ok := r.cachedClaudeSupplementalWithObservation(account, now); ok {
 				windows = mergeUsageWindows(windows, supplemental)
 				supplementalFresh = true
-				// The merged result contains observations from two provider
-				// requests. A single completion timestamp must not make an older
-				// model bucket look newer than it is: admission reconciliation
-				// compares this timestamp with the request-time rejection that it
-				// may clear. Use the oldest component as the conservative
-				// observation time.
-				if !supplementalObservedAt.IsZero() && (observedAt.IsZero() || supplementalObservedAt.Before(observedAt)) {
-					observedAt = supplementalObservedAt
-				}
 			}
 		}
-		return windows, supplementalFresh, observedAt, false, nil
+		return windows, supplementalFresh, entry.at, false, nil
 	}
 	// A quota-status poll should never turn one upstream 429 into a storm of
 	// identical follow-up 429s. No waiting: serve last-good or return the
@@ -2847,7 +2837,7 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 			// A null model bucket is represented as a synthetic zero window so
 			// routing can still consider an unused model. It is not provider
 			// evidence that can clear a request-time model pause.
-			if window.UsedPercent != 0 || window.LimitWindowSeconds != 0 || window.ResetAfterSeconds != 0 || !window.ResetAt.IsZero() {
+			if window.UsedPercent != 0 || window.ResetAfterSeconds != 0 || !window.ResetAt.IsZero() {
 				if modelScore, ok := score.ModelScores[selectacct.ModelKey(window.Feature)]; ok {
 					modelScore.ModelQuotaKnown = true
 					score.ModelScores[selectacct.ModelKey(window.Feature)] = modelScore
