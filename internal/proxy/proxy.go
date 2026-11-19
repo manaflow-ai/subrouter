@@ -9204,6 +9204,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	// constrained account's replacement) into the shared assignment tail, so
 	// the account that was judged materially better is the one assigned.
 	var picked *accounts.Account
+	pausedSticky := false
 	if assignment, ok := s.Sessions.Get(agentType, sessionID); ok {
 		if userEmail != "" && userEmail != assignment.UserEmail {
 			updated, err := s.Sessions.Put(agentType, sessionID, assignment.AccountID, userEmail)
@@ -9256,9 +9257,9 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 					}
 				}
 			}
-			pausedSticky := provider == accounts.ProviderClaude &&
+			pausedSticky = provider == accounts.ProviderClaude &&
 				s.admission != nil && s.admission.paused(admissionKeyFor(account.Provider, account.ID, poolModel), time.Now())
-			if picked == nil && !pausedSticky && s.reuseStickyAssignment(agentType, sessionID, account, stickyScheduler) {
+			if picked == nil && s.reuseStickyAssignment(agentType, sessionID, account, stickyScheduler) {
 				s.logStickyReuse(agentType, sessionID, account, stickyScheduler)
 				s.touchSessionBestEffort(agentType, sessionID)
 				return account, sessionID, userEmail, nil
@@ -9269,6 +9270,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			} else {
 				placementCandidates := availableAccounts
 				if provider == accounts.ProviderClaude {
+					placementCandidates = filterPausedClaude(placementCandidates)
 					if subscriptions := claudeSubscriptionCandidatesFromScores(base, scheduler, availableAccounts, poolModel); len(subscriptions) > 0 {
 						placementCandidates = filterPausedClaude(subscriptions)
 					}
@@ -9280,7 +9282,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 					}
 					candidate = account
 				}
-				if s.keepConstrainedStickyAssignment(stickyScheduler, account, candidate) {
+				if !pausedSticky && s.keepConstrainedStickyAssignment(stickyScheduler, account, candidate) {
 					if s.Logger != nil {
 						s.Logger.Info("keeping sticky session on constrained account; no materially better account",
 							"agent", agentType,

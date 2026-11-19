@@ -175,6 +175,9 @@ func TestQueueFullAfterPausedFailoverStillMovesSession(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if !control.paused(admissionKeyFor(accounts.ProviderClaude, "pinned@example.com", "claude-opus"), time.Now()) {
+		t.Fatal("test setup did not pause pinned Opus bucket")
+	}
 	handler := Server{
 		ClaudeUpstream: upstreamURL,
 		Accounts: []accounts.Account{
