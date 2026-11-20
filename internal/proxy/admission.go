@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 const (
@@ -164,9 +165,13 @@ const (
 )
 
 type admissionBucket struct {
-	active    int
-	waiters   []*admissionWaiter
-	pausedTil time.Time
+	active       int
+	waiters      []*admissionWaiter
+	pausedTil    time.Time
+	pausedAt     time.Time
+	quotaPause   bool
+	quotaTil     time.Time
+	transientTil time.Time
 	// changed wakes waiters that queued before a pause was applied, so they
 	// arm an expiry timer even if every active stream closes during the pause.
 	changed chan struct{}
@@ -617,15 +622,19 @@ func (a *admissionControl) pauseWithRecovery(key admissionKey, until time.Time, 
 	a.mu.Lock()
 	bucket := a.bucketLocked(key)
 	bucket.throttled++
-	if until.After(bucket.pausedTil) {
-		bucket.pausedTil = until
-		bucket.recoverSlowly = recoverSlowly
-	} else if !recoverSlowly {
-		// A shorter transient hint cannot change an authoritative quota
-		// pause into transient recovery. A quota response still wins when
-		// its deadline is shorter than an existing transient pause.
-		bucket.recoverSlowly = false
+	if recoverSlowly {
+		if until.After(bucket.transientTil) {
+			bucket.transientTil = until
+		}
+	} else {
+		if until.After(bucket.quotaTil) {
+			bucket.quotaTil = until
+			bucket.pausedAt = time.Now()
+		}
 	}
+	bucket.pausedTil = maxTime(bucket.quotaTil, bucket.transientTil)
+	bucket.recoverSlowly = bucket.transientTil.After(bucket.quotaTil)
+	bucket.quotaPause = bucket.quotaTil.After(time.Now())
 	// Requests already queued would otherwise sit out the whole pause. Turn
 	// them away like new attempts so their callers can fail over.
 	if bucket.pausedTil.Sub(time.Now()) > admissionPauseWaitMax {
@@ -645,6 +654,13 @@ func (a *admissionControl) pauseWithRecovery(key admissionKey, until time.Time, 
 	close(bucket.changed)
 	bucket.changed = make(chan struct{})
 	a.mu.Unlock()
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 func (a *admissionControl) observe(key admissionKey, status int, header http.Header, now time.Time) {
@@ -683,6 +699,46 @@ func (a *admissionControl) paused(key admissionKey, now time.Time) bool {
 	defer a.mu.Unlock()
 	bucket := a.buckets[key]
 	return bucket != nil && bucket.pausedTil.After(now)
+}
+
+// reconcileClaudeUsage clears only model-pool pauses contradicted by a fresh,
+// positive usage score. Admission pauses are request-time evidence from
+// Anthropic; usage refreshes are the authoritative recovery signal after a
+// credential reset or quota reset. Stale, zero, or account-only scores do not
+// clear a pause, so a genuine upstream rejection remains fail-closed.
+func (a *admissionControl) reconcileClaudeUsage(scores []selectacct.Score, now time.Time) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, score := range scores {
+		if score.Provider != accounts.ProviderClaude || !score.Fresh || score.AccountID == "" {
+			continue
+		}
+		for model, modelScore := range score.ModelScores {
+			if modelScore.Headroom <= 0 || modelScore.WeeklyCooked() {
+				continue
+			}
+			// Scheduler model keys are normalized (claudeopus), while admission
+			// buckets retain the canonical pool name (claude-opus). Match through
+			// ModelKey so a fresh score can clear the actual bucket.
+			for key, bucket := range a.buckets {
+				if key.provider != accounts.ProviderClaude || key.account != score.AccountID ||
+					selectacct.ModelKey(key.model) != model || !bucket.pausedTil.After(now) ||
+					!bucket.quotaPause || score.UsageObservedAt.IsZero() ||
+					!score.UsageObservedAt.After(bucket.pausedAt) || !modelScore.ModelQuotaKnown {
+					continue
+				}
+				bucket.quotaTil = time.Time{}
+				bucket.pausedTil = bucket.transientTil
+				bucket.recoverSlowly = bucket.transientTil.After(now)
+				bucket.quotaPause = false
+				close(bucket.changed)
+				bucket.changed = make(chan struct{})
+			}
+		}
+	}
 }
 
 func (l *admissionLease) release() {

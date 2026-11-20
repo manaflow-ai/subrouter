@@ -891,13 +891,20 @@ func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context,
 	if entryMatchesCredential && now.Sub(entry.at) < usageWindowsTTL {
 		windows := append([]accounts.UsageWindow(nil), entry.windows...)
 		supplementalFresh := entry.supplementalFresh
+		observedAt := entry.at
 		if account.Provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth {
-			if supplemental, _, ok := r.cachedClaudeSupplementalWithObservation(account, now); ok {
+			if supplemental, supplementalObservedAt, ok := r.cachedClaudeSupplementalWithObservation(account, now); ok {
 				windows = mergeUsageWindows(windows, supplemental)
 				supplementalFresh = true
+				if claudeSupplementalHasQuotaEvidence(supplemental) && !supplementalObservedAt.IsZero() && (observedAt.IsZero() || supplementalObservedAt.Before(observedAt)) {
+					// A composite result carries two provider observations. Keep
+					// the older real model evidence as its admission provenance;
+					// synthetic zero-used placeholders do not move the timestamp.
+					observedAt = supplementalObservedAt
+				}
 			}
 		}
-		return windows, supplementalFresh, entry.at, false, nil
+		return windows, supplementalFresh, observedAt, false, nil
 	}
 	// A quota-status poll should never turn one upstream 429 into a storm of
 	// identical follow-up 429s. No waiting: serve last-good or return the
@@ -2830,6 +2837,22 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 	score := selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)
 	score.Provider = provider
 	if provider == accounts.ProviderClaude {
+		for _, window := range windows {
+			if window.Feature == "" {
+				continue
+			}
+			// A null model bucket is represented as a synthetic zero window so
+			// routing can still consider an unused model. It is not provider
+			// evidence that can clear a request-time model pause.
+			if window.UsedPercent != 0 || window.ResetAfterSeconds != 0 || !window.ResetAt.IsZero() {
+				if modelScore, ok := score.ModelScores[selectacct.ModelKey(window.Feature)]; ok {
+					modelScore.ModelQuotaKnown = true
+					score.ModelScores[selectacct.ModelKey(window.Feature)] = modelScore
+				}
+			}
+		}
+	}
+	if provider == accounts.ProviderClaude {
 		if extra := extraUsageFromWindows(windows); extra != nil {
 			applyExtra := func(target *selectacct.Score) {
 				target.ClaudeExtraUsageEnabled = extra.IsEnabled
@@ -3599,6 +3622,7 @@ func (s Server) updateSchedulerFromUsageStatusesAtScoreRevision(
 		if idx, ok := scoreByID[selectacct.ScoreKey(statusProvider, status.ID)]; ok {
 			next := scoreFromUsageWindows(statusProvider, status.ID, status.Windows)
 			next.Fresh = true
+			next.UsageObservedAt = status.UsageFetchedAt
 			scores[idx] = next
 			scored++
 		}
@@ -3610,7 +3634,9 @@ func (s Server) updateSchedulerFromUsageStatusesAtScoreRevision(
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
 	}
-	s.SchedulerRef.SetForAccountGenerationAtScoreRevision(scheduler, accountGeneration, scoreRevision)
+	if s.SchedulerRef.SetForAccountGenerationAtScoreRevision(scheduler, accountGeneration, scoreRevision) && s.admission != nil {
+		s.admission.reconcileClaudeUsage(scores, time.Now())
+	}
 }
 
 func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) []AccountUsageStatus {
@@ -5117,14 +5143,18 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			}
 			var windows []accounts.UsageWindow
 			var fresh bool
+			var observedAt time.Time
 			if reverifyClaudeQuota {
 				windows, err = s.AccountRef.claudeFableProbe(sweepCtx, client, refreshed)
 				fresh = err == nil && fableProbeHasPrimaryWindows(windows)
+				if fresh {
+					observedAt = time.Now().UTC()
+				}
 				if err == nil && !fresh {
 					return
 				}
 			} else {
-				windows, fresh, err = s.fetchAccountUsageWindows(sweepCtx, client, refreshed)
+				windows, fresh, observedAt, err = s.fetchAccountUsageWindows(sweepCtx, client, refreshed)
 			}
 			if err != nil {
 				if s.Logger != nil {
@@ -5150,6 +5180,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			if idx, ok := scoreByID[selectacct.ScoreKey(scoreProvider, account.ID)]; ok {
 				next := scoreFromUsageWindows(scoreProvider, account.ID, windows)
 				next.Fresh = true
+				next.UsageObservedAt = observedAt
 				scores[idx] = next
 				scored++
 			}
@@ -5161,12 +5192,13 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 
 // fetchAccountUsageWindows returns an account's usage windows and whether they
 // are fresh (a recent successful fetch) versus a stale last-known-good fallback.
-func (s Server) fetchAccountUsageWindows(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, error) {
+func (s Server) fetchAccountUsageWindows(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, time.Time, error) {
 	if s.AccountRef != nil {
-		return s.AccountRef.FetchUsageWindowsCached(ctx, client, account)
+		windows, fresh, observedAt, _, err := s.AccountRef.FetchUsageWindowsCachedWithObservation(ctx, client, account)
+		return windows, fresh, observedAt, err
 	}
 	windows, err := fetchAccountUsageWindowsLive(ctx, client, account)
-	return windows, err == nil, err
+	return windows, err == nil, time.Now().UTC(), err
 }
 
 func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
@@ -9161,10 +9193,25 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		picked, placementReservation, err = pickAndReserveRoutingAccount(r.Context(), scheduler, s.SchedulerRef, candidates)
 		return picked, err
 	}
+	filterPausedClaude := func(candidates []accounts.Account) []accounts.Account {
+		if provider != accounts.ProviderClaude || s.admission == nil {
+			return candidates
+		}
+		now := time.Now()
+		filtered := make([]accounts.Account, 0, len(candidates))
+		for _, candidate := range candidates {
+			if s.admission.paused(admissionKeyFor(candidate.Provider, candidate.ID, poolModel), now) {
+				continue
+			}
+			filtered = append(filtered, candidate)
+		}
+		return filtered
+	}
 	// picked carries a placement decided inside the sticky branch (the
 	// constrained account's replacement) into the shared assignment tail, so
 	// the account that was judged materially better is the one assigned.
 	var picked *accounts.Account
+	pausedSticky := false
 	if assignment, ok := s.Sessions.Get(agentType, sessionID); ok {
 		if userEmail != "" && userEmail != assignment.UserEmail {
 			updated, err := s.Sessions.Put(agentType, sessionID, assignment.AccountID, userEmail)
@@ -9204,7 +9251,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			// account can serve this model; an explicit account selector returned
 			// above and remains pinned for that request.
 			if provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeAPIKey {
-				subscriptions := claudeSubscriptionCandidatesFromScores(base, scheduler, availableAccounts, poolModel)
+				subscriptions := filterPausedClaude(claudeSubscriptionCandidatesFromScores(base, scheduler, availableAccounts, poolModel))
 				if len(subscriptions) > 0 {
 					if candidate, pickErr := pickPlacement(subscriptions); pickErr == nil {
 						if s.Logger != nil {
@@ -9217,6 +9264,8 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 					}
 				}
 			}
+			pausedSticky = provider == accounts.ProviderClaude &&
+				s.admission != nil && s.admission.paused(admissionKeyFor(account.Provider, account.ID, poolModel), time.Now())
 			if picked == nil && s.reuseStickyAssignment(agentType, sessionID, account, stickyScheduler) {
 				s.logStickyReuse(agentType, sessionID, account, stickyScheduler)
 				s.touchSessionBestEffort(agentType, sessionID)
@@ -9228,12 +9277,19 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			} else {
 				placementCandidates := availableAccounts
 				if provider == accounts.ProviderClaude {
+					placementCandidates = filterPausedClaude(placementCandidates)
 					if subscriptions := claudeSubscriptionCandidatesFromScores(base, scheduler, availableAccounts, poolModel); len(subscriptions) > 0 {
-						placementCandidates = subscriptions
+						placementCandidates = filterPausedClaude(subscriptions)
 					}
 				}
 				candidate, pickErr := pickPlacement(placementCandidates)
-				if pickErr != nil || s.keepConstrainedStickyAssignment(stickyScheduler, account, candidate) {
+				if pickErr != nil {
+					if pausedSticky {
+						return accounts.Account{}, sessionID, userEmail, s.poolExhaustedError(provider, availableAccounts, poolModel)
+					}
+					candidate = account
+				}
+				if !pausedSticky && s.keepConstrainedStickyAssignment(stickyScheduler, account, candidate) {
 					if s.Logger != nil {
 						s.Logger.Info("keeping sticky session on constrained account; no materially better account",
 							"agent", agentType,
@@ -9297,7 +9353,8 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		// account disappeared after the picker ran or is already known exhausted,
 		// start on the scheduler's current recommendation instead of failing the
 		// pooled launch before a request.
-		if ok && !scheduler.Exhausted(schedulerAccountProvider(preferred.Provider), preferred.ID) {
+		if ok && !scheduler.Exhausted(schedulerAccountProvider(preferred.Provider), preferred.ID) &&
+			!(provider == accounts.ProviderClaude && s.admission != nil && s.admission.paused(admissionKeyFor(preferred.Provider, preferred.ID, poolModel), time.Now())) {
 			picked = &preferred
 		}
 	}
@@ -9310,7 +9367,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			// Use the quota information already in the scheduler for NEW
 			// sessions. Preserve forced/preferred picks and all sticky
 			// reassignment decisions made above.
-			placementCandidates = claudeNewSessionCandidatesFromScores(base, scheduler, availableAccounts, poolModel)
+			placementCandidates = filterPausedClaude(claudeNewSessionCandidatesFromScores(base, scheduler, availableAccounts, poolModel))
 		}
 		account, err = pickPlacement(placementCandidates)
 		if err != nil {
@@ -9901,6 +9958,9 @@ func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []a
 			s.Logger.Debug("usage score refresh discarded after account reload")
 		}
 		return
+	}
+	if s.admission != nil {
+		s.admission.reconcileClaudeUsage(scores, time.Now())
 	}
 	if s.AccountRef != nil {
 		// The score sweep already fetched these windows. Publish the same

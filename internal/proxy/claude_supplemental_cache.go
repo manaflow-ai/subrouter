@@ -113,6 +113,20 @@ func supplementalClaudeWindows(windows []accounts.UsageWindow) []accounts.UsageW
 	return out
 }
 
+// claudeSupplementalHasQuotaEvidence distinguishes a model bucket returned
+// by Anthropic from the zero-used placeholder emitted when that bucket is
+// absent from the usage response. Placeholders help routing discover a model
+// pool, but they must not re-date a status observation or clear an admission
+// pause.
+func claudeSupplementalHasQuotaEvidence(windows []accounts.UsageWindow) bool {
+	for _, window := range windows {
+		if window.UsedPercent != 0 || window.ResetAfterSeconds != 0 || !window.ResetAt.IsZero() {
+			return true
+		}
+	}
+	return false
+}
+
 // An authoritative exhausted model bucket needs no synthetic Messages probe
 // before its reported reset. Healthy/unknown buckets keep a short freshness
 // TTL because their utilization may continue changing.

@@ -125,7 +125,10 @@ func TestAdmissionRejectionFailsOverToAnotherAccount(t *testing.T) {
 			}
 			mu.Unlock()
 			report := events.Query(ErrorEventQuery{Provider: "claude"})
-			if len(report.Events) == 0 || report.Events[0].ErrorClass != tc.wantClass || report.Events[0].Account != "pinned@example.com" {
+			// Paused buckets are filtered before pooled placement, so this case
+			// can fail over without attempting the known-bad account. Queue-full
+			// still reaches admission and must emit its rejection event.
+			if tc.name == "queue full" && (len(report.Events) == 0 || report.Events[0].ErrorClass != tc.wantClass || report.Events[0].Account != "pinned@example.com") {
 				t.Fatalf("error log = %+v, want a %s event on pinned@example.com", report.Events, tc.wantClass)
 			}
 			if assignment, ok := store.Get("claude", "session-pinned"); !ok || assignment.AccountID != tc.wantSession {
@@ -171,6 +174,9 @@ func TestQueueFullAfterPausedFailoverStillMovesSession(t *testing.T) {
 		if _, err := control.acquire(context.Background(), admissionKeyFor(accounts.ProviderClaude, "busy@example.com", model)); err != nil && !admissionRejected(err) {
 			t.Fatal(err)
 		}
+	}
+	if !control.paused(admissionKeyFor(accounts.ProviderClaude, "pinned@example.com", "claude-opus"), time.Now()) {
+		t.Fatal("test setup did not pause pinned Opus bucket")
 	}
 	handler := Server{
 		ClaudeUpstream: upstreamURL,

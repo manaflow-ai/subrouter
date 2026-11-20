@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 func testAdmissionControl(limit, queueCap int) *admissionControl {
@@ -96,6 +98,119 @@ func TestAdmissionPauseUsesClaudeQuotaReset(t *testing.T) {
 	if err != nil || got.Before(now.Add(90*time.Second)) {
 		t.Fatalf("paused until %q, parse error=%v", paused, err)
 	}
+}
+
+func TestAdmissionClaudeUsageReconcilesExactModelPause(t *testing.T) {
+	control := testAdmissionControl(1, 2)
+	key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus")
+	pausedAt := time.Now()
+	control.pause(key, pausedAt.Add(time.Hour))
+	control.reconcileClaudeUsage([]selectacct.Score{{
+		AccountID: "account-a", Provider: accounts.ProviderClaude, Fresh: true,
+		UsageObservedAt: pausedAt.Add(time.Second),
+		ModelScores: map[string]selectacct.Score{
+			"claudeopus": {Headroom: 0.97, WeeklyHeadroom: 0.97, WeeklyHeadroomKnown: true, ModelQuotaKnown: true},
+		},
+	}}, time.Now())
+	lease, err := control.acquire(context.Background(), key)
+	if err != nil {
+		t.Fatalf("fresh positive Opus usage did not clear pause: %v", err)
+	}
+	lease.release()
+}
+
+func TestAdmissionClaudeUsageDoesNotClearStaleOrOtherModelPause(t *testing.T) {
+	control := testAdmissionControl(1, 2)
+	opus := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus")
+	control.pause(opus, time.Now().Add(time.Hour))
+	control.reconcileClaudeUsage([]selectacct.Score{{
+		AccountID: "account-a", Provider: accounts.ProviderClaude,
+		// A stale score and a fresh Sonnet score must not clear Opus.
+		ModelScores: map[string]selectacct.Score{
+			"claudeopus":    {Headroom: 0.97, WeeklyHeadroom: 0.97, WeeklyHeadroomKnown: true},
+			"claude-sonnet": {Headroom: 0.97, WeeklyHeadroom: 0.97, WeeklyHeadroomKnown: true},
+		},
+	}}, time.Now())
+	if _, err := control.acquire(context.Background(), opus); !errors.Is(err, errAdmissionPaused) {
+		t.Fatalf("stale/other-model score cleared Opus pause: %v", err)
+	}
+	control.reconcileClaudeUsage([]selectacct.Score{{
+		AccountID: "account-a", Provider: accounts.ProviderClaude, Fresh: true,
+		ModelScores: map[string]selectacct.Score{
+			"claudeopus": {Headroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true},
+		},
+	}}, time.Now())
+	if _, err := control.acquire(context.Background(), opus); !errors.Is(err, errAdmissionPaused) {
+		t.Fatalf("zero fresh Opus score cleared genuine pause: %v", err)
+	}
+}
+
+func TestAdmissionClaudeUsageDoesNotClearObservationOlderThanPause(t *testing.T) {
+	control := testAdmissionControl(1, 2)
+	key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus")
+	now := time.Now()
+	control.pause(key, now.Add(time.Hour))
+	control.reconcileClaudeUsage([]selectacct.Score{{
+		AccountID: "account-a", Provider: accounts.ProviderClaude, Fresh: true,
+		UsageObservedAt: now.Add(-time.Second),
+		ModelScores: map[string]selectacct.Score{
+			"claudeopus": {Headroom: 0.9, WeeklyHeadroom: 0.9, WeeklyHeadroomKnown: true, ModelQuotaKnown: true},
+		},
+	}}, now)
+	if _, err := control.acquire(context.Background(), key); !errors.Is(err, errAdmissionPaused) {
+		t.Fatalf("usage observed before the request-time pause cleared it: %v", err)
+	}
+}
+
+func TestAdmissionClaudeUsagePreservesLongerTransientHold(t *testing.T) {
+	control := testAdmissionControl(1, 2)
+	key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus")
+	now := time.Now()
+	control.pauseWithRecovery(key, now.Add(10*time.Hour), true)
+	control.pauseWithRecovery(key, now.Add(time.Hour), false)
+	control.reconcileClaudeUsage([]selectacct.Score{{
+		AccountID: "account-a", Provider: accounts.ProviderClaude, Fresh: true,
+		UsageObservedAt: now.Add(time.Minute),
+		ModelScores: map[string]selectacct.Score{
+			"claudeopus": {Headroom: 0.9, WeeklyHeadroom: 0.9, WeeklyHeadroomKnown: true, ModelQuotaKnown: true},
+		},
+	}}, now.Add(2*time.Minute))
+	control.mu.Lock()
+	got := control.buckets[key].pausedTil
+	control.mu.Unlock()
+	if got.Before(now.Add(9 * time.Hour)) {
+		t.Fatalf("clearing quota hold discarded longer transient hold: paused until %v", got)
+	}
+}
+
+func TestUsageStatusRefreshReconcilesClaudeAdmissionPause(t *testing.T) {
+	control := testAdmissionControl(1, 2)
+	key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus")
+	control.pause(key, time.Now().Add(time.Hour))
+	server := Server{
+		Accounts: []accounts.Account{{
+			ID: "account-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth,
+		}},
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+			AccountID: "account-a", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
+		}})),
+		admission: control,
+	}
+	server.updateSchedulerFromUsageStatuses([]AccountUsageStatus{{
+		AccountStatus:  AccountStatus{ID: "account-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		UsageFresh:     true,
+		UsageFetchedAt: time.Now().Add(time.Minute),
+		Windows: []accounts.UsageWindow{
+			{Name: "5h", UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60},
+			{Name: "7d", UsedPercent: 40, LimitWindowSeconds: 7 * 24 * 60 * 60},
+			{Name: "opus-weekly", Feature: agentclaude.OpusFeature, UsedPercent: 20, LimitWindowSeconds: 7 * 24 * 60 * 60},
+		},
+	}})
+	lease, err := control.acquire(context.Background(), key)
+	if err != nil {
+		t.Fatalf("fresh usage-status refresh left Claude admission paused: %v", err)
+	}
+	lease.release()
 }
 
 func TestInflightAttemptTransportGatesResponseLifetime(t *testing.T) {

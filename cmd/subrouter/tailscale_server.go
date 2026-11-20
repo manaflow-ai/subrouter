@@ -244,6 +244,13 @@ func healTailscaleServer(
 	}
 	data, err := load(ctx)
 	if err != nil {
+		// Tailscale status is only needed to repair a moved endpoint. After a
+		// reboot its CLI can briefly be unavailable even though the stored
+		// Subrouter URL is already healthy. Keep restore usable in that case;
+		// a later invocation can repair the URL once Tailscale settles.
+		if healthy, _ := probeServerHealth(ctx, client, server.URL); healthy {
+			return server, nil
+		}
 		return tailscaleRepairError(warn, server, err)
 	}
 	node, ok, err := tailscaleNodeByID(data, server.TailscaleNodeID)
