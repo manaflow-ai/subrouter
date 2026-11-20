@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -164,6 +165,34 @@ func TestHealTailscaleServerRepairsExactHealthyNode(t *testing.T) {
 	}
 	if !strings.Contains(warnings.String(), "updated") || !strings.Contains(warnings.String(), "node-stable") {
 		t.Fatalf("warning = %q", warnings.String())
+	}
+}
+
+func TestHealTailscaleServerKeepsHealthyStoredURLWhenStatusUnavailable(t *testing.T) {
+	t.Parallel()
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/_subrouter/health" {
+			t.Errorf("health path = %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(healthy.Close)
+	server := srServerConfig{
+		Name: "team", URL: healthy.URL, TailscaleNodeID: "node-stable",
+	}
+	var warnings bytes.Buffer
+	got, err := healTailscaleServer(
+		context.Background(), srServerStore{}, server, healthy.Client(), &warnings,
+		func(context.Context) ([]byte, error) { return nil, errors.New("tailscale status: signal: killed") },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != server {
+		t.Fatalf("server = %+v, want unchanged %+v", got, server)
+	}
+	if warnings.Len() != 0 {
+		t.Fatalf("warnings = %q, want empty", warnings.String())
 	}
 }
 
